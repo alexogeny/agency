@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 import struct
@@ -10,12 +11,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORT_BUILD = ROOT / "Tools/report-build"
-SCRATCH = Path.home() / "Scratch"
+SCRATCH = Path(os.environ.get("AGENCY_TEST_SCRATCH", ROOT / ".cache/tests"))
 
 
 class ReportBuildApaTests(unittest.TestCase):
     def setUp(self):
-        SCRATCH.mkdir(exist_ok=True)
+        SCRATCH.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=SCRATCH)
         self.project = Path(self.temporary.name)
         (self.project / "sections").mkdir()

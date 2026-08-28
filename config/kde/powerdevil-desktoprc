@@ -1,5 +1,5 @@
 # 🎀 Stay awake, soften after 15 minutes, and rest displays after 30.
-# Brightness is hardware-dependent and is applied by configure-power.sh.
+# Brightness is applied by configure-power.sh only on desktop hardware.
 
 [AC][Display]
 DimDisplayWhenIdle=true
