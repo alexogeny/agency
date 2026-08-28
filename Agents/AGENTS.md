@@ -34,8 +34,8 @@ provides project-specific guidance.
 - Put all temporary and exploratory work under `~/Scratch`, never `/tmp`.
 - Create task-specific temporary directories with `mktemp -d -p "$HOME/Scratch"`.
 - When scratch work becomes reusable and machine-agnostic, graduate it into
-  `~/Code/Dots/Tools` with concise documentation.
-- Keep personal, durable agent preferences here in `~/Code/Dots/Agents/AGENTS.md`
+  `~/Code/agency/Tools` with concise documentation.
+- Keep personal, durable agent preferences here in `~/Code/agency/Agents/AGENTS.md`
   so they survive a clean installation.
 
 ## Package and runtime defaults
