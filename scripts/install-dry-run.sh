@@ -116,6 +116,7 @@ agency_plan_user_links() {
     repo-map
     report-build
     system-context
+    sudo-gui
     web-research
   )
 

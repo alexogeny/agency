@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: sudo-gui [--prompt TEXT] [-- COMMAND [ARG...]]
+
+Authorize sudo through one KDE password dialog, then run COMMAND in the same
+process and authorization context. On cancellation, failure, or active PAM
+lockout, stop without retrying.
+EOF
+}
+
+config_value() {
+  local key=$1
+  local fallback=$2
+  local config=$3
+  local value
+  value=$(awk -F= -v key="$key" '
+    /^[[:space:]]*#/ { next }
+    {
+      name=$1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name == key) {
+        value=$2
+        sub(/[[:space:]]*#.*/, "", value)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        print value
+      }
+    }
+  ' "$config" 2>/dev/null | tail -n 1)
+  printf '%s\n' "${value:-$fallback}"
+}
+
+active_lock_remaining() {
+  local faillock=$1
+  local config=$2
+  local user=$3
+  local deny unlock_time count=0 last_failure=0
+  local day time rest epoch now
+  deny=$(config_value deny 3 "$config")
+  unlock_time=$(config_value unlock_time 600 "$config")
+  now=$(date +%s)
+
+  while read -r day time rest; do
+    [[ $day =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+    [[ $time =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || continue
+    [[ $rest =~ [[:space:]]V$ ]] || continue
+    epoch=$(date -d "$day $time" +%s 2>/dev/null || true)
+    [[ -n $epoch ]] || continue
+    (( count += 1 ))
+    (( epoch <= last_failure )) || last_failure=$epoch
+  done < <("$faillock" --user "$user" 2>/dev/null || true)
+
+  (( count >= deny )) || return 1
+  if (( unlock_time == 0 )); then
+    printf 'indefinite\n'
+    return
+  fi
+  (( now - last_failure < unlock_time )) || return 1
+  printf '%d\n' "$(( unlock_time - (now - last_failure) ))"
+}
+
+prompt="Administrator authorization is required for the approved task."
+while (( $# )); do
+  case $1 in
+    --prompt)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      prompt=$2
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    --help|-h)
+      usage
+      exit
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+sudo_command=${SUDO_GUI_SUDO:-sudo}
+kdialog_command=${SUDO_GUI_KDIALOG:-kdialog}
+faillock_command=${SUDO_GUI_FAILLOCK:-faillock}
+faillock_config=${SUDO_GUI_FAILLOCK_CONFIG:-/etc/security/faillock.conf}
+user=$(id -un)
+
+if (( EUID == 0 )) || "$sudo_command" -n true 2>/dev/null; then
+  if (( $# )); then
+    exec "$@"
+  fi
+  printf 'sudo authorization is already available in this session.\n'
+  exit
+fi
+
+command -v "$kdialog_command" >/dev/null || {
+  printf 'KDE kdialog is unavailable; use sudo in a visible terminal.\n' >&2
+  exit 69
+}
+
+if command -v "$faillock_command" >/dev/null; then
+  if remaining=$(active_lock_remaining \
+    "$faillock_command" "$faillock_config" "$user"); then
+    if [[ $remaining == indefinite ]]; then
+      message="sudo authentication is locked until an administrator resets faillock."
+    else
+      message="sudo authentication is locked for about $remaining more seconds."
+    fi
+    printf '%s Do not retry yet.\n' "$message" >&2
+    exit 75
+  fi
+fi
+
+password=""
+if ! password=$("$kdialog_command" \
+  --title "Administrator authorization" \
+  --password "$prompt"); then
+  unset password
+  printf 'sudo authorization was cancelled.\n' >&2
+  exit 130
+fi
+
+if [[ -z $password ]]; then
+  unset password
+  printf 'sudo authorization was cancelled before a password was entered.\n' >&2
+  exit 130
+fi
+
+set +e
+printf '%s\n' "$password" | "$sudo_command" -S -p '' -v 2>/dev/null
+status=$?
+set -e
+password=""
+unset password
+
+if (( status != 0 )); then
+  "$kdialog_command" --error \
+    "Authorization failed. No retry was attempted; check faillock before trying again." \
+    --title "Administrator authorization" >/dev/null 2>&1 || true
+  printf 'sudo authorization failed after one password attempt; not retrying.\n' >&2
+  exit "$status"
+fi
+
+if (( $# )); then
+  exec "$@"
+fi
+printf 'sudo authorization is available in this process context.\n'

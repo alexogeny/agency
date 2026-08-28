@@ -13,6 +13,10 @@ agency_ensure_backup_root() {
     AGENCY_BACKUP_ROOT="$HOME/.local/state/agency/backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
     export AGENCY_BACKUP_ROOT
   fi
+
+  # Create the run root as the invoking user before a privileged backup creates
+  # any descendants. This keeps later home-directory backups writable.
+  mkdir -p "$AGENCY_BACKUP_ROOT"
 }
 
 agency_backup_path() {

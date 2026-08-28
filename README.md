@@ -73,6 +73,7 @@ npm is not used.
   and LAVD automatic scheduling for responsive mixed workloads
 - Codex CLI, Claude Code, and Pi, with one portable global guidance file
 - Session-start hardware and battery guidance for Codex and Claude Code
+- Single-attempt KDE sudo authorization for approved agent-run local workflows
 - Legible Git defaults and a soft pink command-line colour palette
 - A symlinked global Git ignore file and weekly discard through `fstrim.timer`
 - Shared agent rules and a Git hook preventing AI attribution trailers
