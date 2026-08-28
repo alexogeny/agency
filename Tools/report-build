@@ -1,0 +1,3939 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# ///
+
+import argparse
+import html
+import json
+import os
+import re
+import struct
+import sys
+import zlib
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
+from pathlib import Path
+
+import tomllib
+
+PURPLE = "\033[1;35m"
+PINK = "\033[38;5;183m"
+RED = "\033[1;31m"
+YELLOW = "\033[1;33m"
+RESET = "\033[0m"
+WORD_RE = re.compile(r"[^\W_]+(?:['’\-][^\W_]+)*", re.UNICODE)
+REFERENCE_BLOCK_RE = re.compile(
+    r"^```(?P<format>toml|yaml)\s*$\n(?P<body>.*?)^```\s*$",
+    re.MULTILINE | re.DOTALL,
+)
+FIGURE_RE = re.compile(
+    r"^!\[(?P<caption>.+?)\]\((?P<path>.+?)\)(?:\{#(?P<label>fig:[A-Za-z0-9_.:-]+)(?:\s+width=(?P<width>[0-9]{1,3})%)?\})?$"
+)
+TABLE_CAPTION_RE = re.compile(
+    r"^Table:\s+(?P<caption>.+?)\s+\{#(?P<label>tbl:[A-Za-z0-9_.:-]+)\}$"
+)
+CITATION_GROUP_RE = re.compile(
+    r"\[((?:@[A-Za-z][A-Za-z0-9_.:-]*(?:\s*,\s*[^;\]@]+)?)(?:\s*;\s*@[A-Za-z][A-Za-z0-9_.:-]*(?:\s*,\s*[^;\]@]+)?)*)\]"
+)
+NARRATIVE_RE = re.compile(r"(?<![\w/@{])@([A-Za-z][A-Za-z0-9_.:-]*)")
+CROSS_REFERENCE_RE = re.compile(r"\{@((?:fig|tbl):[A-Za-z0-9_.:-]+)\}")
+CURLY_CITATION_RE = re.compile(r"\{cite:\s*\{(?P<body>[^{}]+)\}\}")
+PLACEHOLDER_RE = re.compile(
+    r"\b(?:TODO|TBD|PLACEHOLDER)\b|\[(?:add|insert|replace)[^\]]*\]", re.IGNORECASE
+)
+SUPPORTED_CITATION_STYLES = {"apa-7"}
+MONTH_NAMES = (
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+APA_JOURNAL_TYPES = {"journal_article"}
+APA_REPORT_TYPES = {
+    "government_report",
+    "government_guide",
+    "government_framework",
+    "report",
+    "guide",
+    "standalone_report",
+}
+APA_WEBPAGE_TYPES = {
+    "webpage",
+    "standalone_webpage",
+    "corporate_author_webpage",
+    "regulator_guidance_webpage",
+}
+
+
+@dataclass
+class Issue:
+    level: str
+    message: str
+    path: str | None = None
+
+
+@dataclass
+class Reference:
+    key: str
+    author: str
+    year: str
+    citation: str
+    bibliography: str
+    verified: bool
+    source: str
+    record: dict
+    sort_key: tuple = field(default_factory=tuple)
+    audit_preview: str = ""
+
+
+@dataclass
+class Block:
+    kind: str
+    data: dict
+
+
+@dataclass
+class Section:
+    kind: str
+    path: str
+    title: str
+    blocks: list[Block]
+    words: int
+    count_words: bool
+    max_words: int | None
+    page_break_before: bool
+
+
+@dataclass
+class Project:
+    root: Path
+    index: Path
+    metadata: dict
+    references: dict[str, Reference]
+    sections: list[Section]
+    labels: dict[str, tuple[str, int]]
+    citations: set[str]
+    cross_references: set[str]
+    issues: list[Issue] = field(default_factory=list)
+
+
+def fail(message, code=1):
+    print(f"{RED}error:{RESET} {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def safe_path(root, value):
+    path = (root / value).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        fail(f"path escapes the report project: {value}", 2)
+    return path
+
+
+class YamlError(ValueError):
+    pass
+
+
+def yaml_scalar(value):
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as error:
+            raise YamlError(str(error)) from error
+    if value.startswith("'"):
+        if not value.endswith("'"):
+            raise YamlError("unterminated single-quoted scalar")
+        return value[1:-1].replace("''", "'")
+    lowered = value.casefold()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "~"}:
+        return None
+    if re.fullmatch(r"[-+]?\d+", value):
+        return int(value)
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)(?:e[-+]?\d+)?", value, re.IGNORECASE):
+        return float(value)
+    return value
+
+
+class YamlFlowParser:
+    def __init__(self, source):
+        self.source = source
+        self.position = 0
+
+    def skip_space(self):
+        while self.position < len(self.source) and self.source[self.position].isspace():
+            self.position += 1
+
+    def parse(self):
+        value = self.value()
+        self.skip_space()
+        if self.position != len(self.source):
+            raise YamlError(f"unexpected flow content at column {self.position + 1}")
+        return value
+
+    def value(self):
+        self.skip_space()
+        if self.position >= len(self.source):
+            return ""
+        character = self.source[self.position]
+        if character == "{":
+            return self.mapping()
+        if character == "[":
+            return self.sequence()
+        if character in {'"', "'"}:
+            return self.quoted()
+        start = self.position
+        while self.position < len(self.source) and self.source[self.position] not in ",]}":
+            self.position += 1
+        return yaml_scalar(self.source[start : self.position])
+
+    def quoted(self):
+        quote = self.source[self.position]
+        start = self.position
+        self.position += 1
+        while self.position < len(self.source):
+            character = self.source[self.position]
+            if quote == '"' and character == "\\":
+                self.position += 2
+                continue
+            if character == quote:
+                if quote == "'" and self.position + 1 < len(self.source) and self.source[self.position + 1] == "'":
+                    self.position += 2
+                    continue
+                self.position += 1
+                return yaml_scalar(self.source[start : self.position])
+            self.position += 1
+        raise YamlError("unterminated quoted scalar")
+
+    def key(self):
+        self.skip_space()
+        if self.position < len(self.source) and self.source[self.position] in {'"', "'"}:
+            return str(self.quoted())
+        start = self.position
+        while self.position < len(self.source) and self.source[self.position] != ":":
+            self.position += 1
+        return self.source[start : self.position].strip()
+
+    def mapping(self):
+        result = {}
+        self.position += 1
+        self.skip_space()
+        if self.position < len(self.source) and self.source[self.position] == "}":
+            self.position += 1
+            return result
+        while True:
+            key = self.key()
+            if not key or self.position >= len(self.source) or self.source[self.position] != ":":
+                raise YamlError("flow mapping requires key: value")
+            self.position += 1
+            result[key] = self.value()
+            self.skip_space()
+            if self.position >= len(self.source):
+                raise YamlError("unterminated flow mapping")
+            delimiter = self.source[self.position]
+            self.position += 1
+            if delimiter == "}":
+                return result
+            if delimiter != ",":
+                raise YamlError("flow mapping entries require commas")
+
+    def sequence(self):
+        result = []
+        self.position += 1
+        self.skip_space()
+        if self.position < len(self.source) and self.source[self.position] == "]":
+            self.position += 1
+            return result
+        while True:
+            result.append(self.value())
+            self.skip_space()
+            if self.position >= len(self.source):
+                raise YamlError("unterminated flow sequence")
+            delimiter = self.source[self.position]
+            self.position += 1
+            if delimiter == "]":
+                return result
+            if delimiter != ",":
+                raise YamlError("flow sequence entries require commas")
+
+
+def yaml_line_content(value):
+    quote = ""
+    escaped = False
+    for position, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            escaped = True
+            continue
+        if character in {'"', "'"}:
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            continue
+        if character == "#" and not quote and (
+            position == 0 or value[position - 1].isspace()
+        ):
+            return value[:position].rstrip()
+    return value.rstrip()
+
+
+def yaml_mapping_split(value):
+    quote = ""
+    escaped = False
+    depth = 0
+    for position, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            escaped = True
+            continue
+        if character in {'"', "'"}:
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            continue
+        if quote:
+            continue
+        if character in "[{":
+            depth += 1
+        elif character in "]}":
+            depth -= 1
+        elif character == ":" and depth == 0:
+            return value[:position].strip(), value[position + 1 :].strip()
+    return None
+
+
+def yaml_value(value):
+    value = value.strip()
+    if value.startswith(("{", "[")):
+        return YamlFlowParser(value).parse()
+    return yaml_scalar(value)
+
+
+class YamlBlockParser:
+    def __init__(self, source):
+        self.lines = []
+        for number, raw in enumerate(source.splitlines(), 1):
+            if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+                raise YamlError(f"tabs are not allowed for indentation at line {number}")
+            content = yaml_line_content(raw)
+            if not content.strip():
+                continue
+            indent = len(content) - len(content.lstrip(" "))
+            self.lines.append((indent, content.strip(), number))
+
+    def parse(self):
+        if not self.lines:
+            return {}
+        value, position = self.block(0, self.lines[0][0])
+        if position != len(self.lines):
+            raise YamlError(f"unexpected content at line {self.lines[position][2]}")
+        return value
+
+    def block(self, position, indent):
+        if self.lines[position][0] != indent:
+            raise YamlError(f"invalid indentation at line {self.lines[position][2]}")
+        if self.lines[position][1] == "-" or self.lines[position][1].startswith("- "):
+            return self.sequence(position, indent)
+        return self.mapping(position, indent)
+
+    def nested(self, position, indent):
+        if position >= len(self.lines) or self.lines[position][0] <= indent:
+            return {}, position
+        return self.block(position, self.lines[position][0])
+
+    def mapping_entry(self, text, position, indent, line_number):
+        split = yaml_mapping_split(text)
+        if not split or not split[0]:
+            raise YamlError(f"mapping requires key: value at line {line_number}")
+        key, raw_value = split
+        if raw_value in {"|", ">"}:
+            values = []
+            while position < len(self.lines) and self.lines[position][0] > indent:
+                values.append(self.lines[position][1])
+                position += 1
+            separator = "\n" if raw_value == "|" else " "
+            return key, separator.join(values), position
+        if raw_value:
+            return key, yaml_value(raw_value), position
+        value, position = self.nested(position, indent)
+        return key, value, position
+
+    def mapping(self, position, indent):
+        result = {}
+        while position < len(self.lines):
+            line_indent, text, line_number = self.lines[position]
+            if line_indent < indent:
+                break
+            if line_indent != indent or text == "-" or text.startswith("- "):
+                break
+            position += 1
+            key, value, position = self.mapping_entry(
+                text, position, indent, line_number
+            )
+            if key in result:
+                raise YamlError(f"duplicate key {key!r} at line {line_number}")
+            result[key] = value
+        return result, position
+
+    def sequence(self, position, indent):
+        result = []
+        while position < len(self.lines):
+            line_indent, text, line_number = self.lines[position]
+            if line_indent < indent:
+                break
+            if line_indent != indent or not (text == "-" or text.startswith("- ")):
+                break
+            raw_value = text[1:].strip()
+            position += 1
+            if not raw_value:
+                value, position = self.nested(position, indent)
+                result.append(value)
+                continue
+            split = yaml_mapping_split(raw_value)
+            if split and not raw_value.startswith(("{", "[", '"', "'")):
+                key, value, position = self.mapping_entry(
+                    raw_value, position, indent, line_number
+                )
+                item = {key: value}
+                if position < len(self.lines) and self.lines[position][0] > indent:
+                    extra, position = self.mapping(position, self.lines[position][0])
+                    item.update(extra)
+                result.append(item)
+            else:
+                result.append(yaml_value(raw_value))
+        return result, position
+
+
+def parse_yaml(source):
+    return YamlBlockParser(source).parse()
+
+
+def read_frontmatter(path):
+    try:
+        text = path.read_text()
+    except OSError as error:
+        fail(f"cannot read {path}: {error}", 2)
+    if text.startswith("+++\n"):
+        delimiter = "+++"
+        decoder = "toml"
+    elif text.startswith("---\n"):
+        delimiter = "---"
+        decoder = "yaml"
+    else:
+        fail(f"{path} must start with TOML +++ or YAML --- front matter", 2)
+    boundary = text.find(f"\n{delimiter}\n", 4)
+    if boundary < 0:
+        fail(f"{path} has no closing {delimiter} front matter delimiter", 2)
+    try:
+        metadata = (
+            tomllib.loads(text[4:boundary])
+            if decoder == "toml"
+            else parse_yaml(text[4:boundary])
+        )
+    except (tomllib.TOMLDecodeError, YamlError) as error:
+        fail(f"invalid {decoder.upper()} front matter in {path}: {error}", 2)
+    if not isinstance(metadata, dict):
+        fail(f"{path} front matter must be a mapping", 2)
+    return metadata, text[boundary + 5 :]
+
+
+def resolve_index(value):
+    path = Path(value).resolve()
+    return path / "index.md" if path.is_dir() else path
+
+
+def author_forms(record):
+    authors = record.get("authors")
+    if not isinstance(authors, list) or not authors:
+        return "", ""
+    names = []
+    for author in authors:
+        if not isinstance(author, dict):
+            return "", ""
+        name = author.get("literal") or author.get("family")
+        if not isinstance(name, str) or not name.strip():
+            return "", ""
+        names.append(name.strip())
+    if len(names) == 1:
+        return names[0], names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}", f"{names[0]} & {names[1]}"
+    return f"{names[0]} et al.", f"{names[0]} et al."
+
+
+def reference_year(record):
+    value = record.get("year")
+    if value is None:
+        issued = record.get("issued")
+        value = issued.get("year") if isinstance(issued, dict) else None
+    return str(value).strip() if value is not None else "n.d."
+
+
+def apa_initials(value):
+    groups = []
+    for word in re.findall(r"[^\W\d_]+(?:-[^\W\d_]+)*", value, re.UNICODE):
+        groups.append("-".join(f"{part[0].upper()}." for part in word.split("-")))
+    return " ".join(groups)
+
+
+def apa_author_name(author):
+    literal = author.get("literal")
+    if isinstance(literal, str) and literal.strip():
+        return literal.strip()
+    family = author.get("family")
+    given = author.get("given")
+    if not isinstance(family, str) or not family.strip():
+        raise ValueError("author is missing family or literal")
+    initials = apa_initials(given) if isinstance(given, str) else ""
+    return f"{family.strip()}, {initials}" if initials else family.strip()
+
+
+def apa_authors(record):
+    authors = record.get("authors")
+    if not isinstance(authors, list) or not authors:
+        author = record.get("author")
+        if isinstance(author, str) and author.strip():
+            return author.strip()
+        raise ValueError("reference is missing authors")
+    names = [apa_author_name(author) for author in authors if isinstance(author, dict)]
+    if len(names) != len(authors):
+        raise ValueError("authors must be mappings")
+    if len(names) == 1:
+        return names[0]
+    if len(names) <= 20:
+        return f"{', '.join(names[:-1])}, & {names[-1]}"
+    return f"{', '.join(names[:19])}, … {names[-1]}"
+
+
+def apa_author_key(record):
+    authors = record.get("authors")
+    if isinstance(authors, list) and authors:
+        values = []
+        for author in authors:
+            if not isinstance(author, dict):
+                continue
+            literal = author.get("literal")
+            family = author.get("family")
+            given = author.get("given")
+            values.append(
+                "\x1f".join(
+                    str(value).strip().casefold()
+                    for value in (literal or family or "", given or "")
+                )
+            )
+        return "\x1e".join(values)
+    return str(record.get("author", "")).strip().casefold()
+
+
+def apa_title_key(value):
+    title = re.sub(r"^[^\w]+", "", str(value).casefold())
+    return re.sub(r"^(?:a|an|the)\s+", "", title)
+
+
+def apa_year_key(value):
+    match = re.match(r"\d{4}", value)
+    return (0, int(match.group(0))) if match else (1, value.casefold())
+
+
+def alpha_suffix(position):
+    value = position + 1
+    result = ""
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(97 + remainder) + result
+    return result
+
+
+def issued_date(record, detailed, rendered_year):
+    if not detailed:
+        return rendered_year
+    issued = record.get("issued")
+    if not isinstance(issued, dict):
+        return rendered_year
+    month = issued.get("month")
+    day = issued.get("day")
+    month_name = (
+        MONTH_NAMES[month]
+        if isinstance(month, int) and 1 <= month <= 12
+        else str(month).strip()
+        if month
+        else ""
+    )
+    if month_name and isinstance(day, int):
+        return f"{rendered_year}, {month_name} {day}"
+    if month_name:
+        return f"{rendered_year}, {month_name}"
+    return rendered_year
+
+
+def retrieval_date(value):
+    if not isinstance(value, dict):
+        return ""
+    year = value.get("year")
+    month = value.get("month")
+    day = value.get("day")
+    if not isinstance(year, int):
+        return ""
+    month_name = MONTH_NAMES[month] if isinstance(month, int) and 1 <= month <= 12 else ""
+    if month_name and isinstance(day, int):
+        return f"{month_name} {day}, {year}"
+    if month_name:
+        return f"{month_name} {year}"
+    return str(year)
+
+
+def stable_link(record):
+    doi = record.get("doi")
+    if isinstance(doi, str) and doi.strip():
+        value = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", doi.strip(), flags=re.IGNORECASE)
+        return f"https://doi.org/{value}"
+    url = record.get("url")
+    return url.strip() if isinstance(url, str) else ""
+
+
+def terminal_punctuation(value):
+    value = value.strip()
+    return value if value.endswith((".", "?", "!")) else f"{value}."
+
+
+def same_organisation(left, right):
+    normalise = lambda value: re.sub(r"[.\s]+", " ", value.strip()).casefold().strip()
+    return normalise(left) == normalise(right)
+
+
+def corporate_author(record):
+    authors = record.get("authors")
+    if not isinstance(authors, list) or len(authors) != 1:
+        return ""
+    literal = authors[0].get("literal") if isinstance(authors[0], dict) else None
+    return literal.strip() if isinstance(literal, str) else ""
+
+
+def journal_location(record):
+    pages = record.get("pages")
+    if isinstance(pages, dict):
+        first = pages.get("first")
+        last = pages.get("last")
+        if first is not None and last is not None:
+            return f"{first}–{last}"
+        if first is not None:
+            return str(first)
+    if isinstance(pages, str) and pages.strip():
+        return re.sub(r"(?<=\d)-(?=\d)", "–", pages.strip())
+    article_number = record.get("article_number")
+    return f"Article {article_number}" if article_number is not None else ""
+
+
+def apa7_bibliography(reference):
+    record = reference.record
+    if record.get("bibliography_fallback") == "apa7_plain":
+        if reference.audit_preview:
+            return reference.audit_preview
+        raise ValueError("apa7_plain fallback requested without apa7_plain")
+    source_type = record.get("type")
+    if source_type not in APA_JOURNAL_TYPES | APA_REPORT_TYPES | APA_WEBPAGE_TYPES:
+        raise ValueError(f"unsupported APA source type: {source_type}")
+    title = record.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("reference is missing title")
+    author_text = apa_authors(record)
+    detailed_date = source_type in APA_WEBPAGE_TYPES
+    date = issued_date(record, detailed_date, reference.year)
+    lead = f"{terminal_punctuation(author_text)} ({date})."
+    link = stable_link(record)
+    if source_type in APA_JOURNAL_TYPES:
+        container = record.get("container_title")
+        volume = record.get("volume")
+        if not isinstance(container, str) or not container.strip():
+            raise ValueError("journal article is missing container_title")
+        if volume is None or not str(volume).strip():
+            raise ValueError("journal article is missing volume")
+        source = f"*{container.strip()}*, *{str(volume).strip()}*"
+        issue = record.get("issue")
+        if issue is not None and str(issue).strip():
+            source += f"({str(issue).strip()})"
+        location = journal_location(record)
+        if location:
+            source += f", {location}"
+        parts = [lead, terminal_punctuation(title), terminal_punctuation(source)]
+    else:
+        rendered_title = title.strip()
+        descriptor = record.get("report_number") or record.get("number")
+        version = record.get("version")
+        qualifier = ""
+        if descriptor:
+            qualifier = f"Report No. {str(descriptor).strip()}"
+        elif version:
+            value = str(version).strip()
+            qualifier = (
+                value
+                if value.casefold().startswith("version ")
+                else f"Version {value}"
+            )
+        if rendered_title.endswith("."):
+            rendered_title = rendered_title[:-1].rstrip()
+        if qualifier:
+            rendered_title += f" ({qualifier})"
+        title_part = (
+            f"*{rendered_title}*"
+            if rendered_title.endswith(("?", "!")) and not qualifier
+            else f"*{rendered_title}*."
+        )
+        parts = [lead, title_part]
+        publisher = record.get("publisher")
+        organisation = corporate_author(record)
+        if isinstance(publisher, str) and publisher.strip() and not (
+            organisation and same_organisation(publisher, organisation)
+        ):
+            parts.append(terminal_punctuation(publisher))
+    if source_type in APA_WEBPAGE_TYPES:
+        retrieved = retrieval_date(record.get("retrieved"))
+        if retrieved and link:
+            parts.append(f"Retrieved {retrieved}, from {link}")
+            link = ""
+    if link:
+        parts.append(link)
+    return " ".join(parts)
+
+
+def resolve_references(references, citations, citation_style, issues):
+    if citation_style != "apa-7":
+        return
+    for reference in references.values():
+        reference.year = reference_year(reference.record)
+    groups = {}
+    for key in citations & references.keys():
+        reference = references[key]
+        identity = (apa_author_key(reference.record), reference.year)
+        groups.setdefault(identity, []).append(reference)
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        for position, reference in enumerate(
+            sorted(group, key=lambda item: (apa_title_key(item.record.get("title", "")), item.key.casefold()))
+        ):
+            reference.year += alpha_suffix(position)
+    for reference in references.values():
+        narrative_author, parenthetical_author = author_forms(reference.record)
+        reference.author = narrative_author or str(reference.record.get("author", "")).strip()
+        reference.citation = f"{parenthetical_author or reference.author}, {reference.year}"
+        reference.sort_key = (
+            apa_author_key(reference.record),
+            apa_year_key(reference.year),
+            apa_title_key(reference.record.get("title", "")),
+            reference.key.casefold(),
+        )
+        try:
+            reference.bibliography = apa7_bibliography(reference)
+        except ValueError as error:
+            issues.append(Issue("error", str(error), reference.source))
+
+
+def load_references(root, value, issues, citation_style):
+    path = safe_path(root, value)
+    try:
+        reference_metadata, text = read_frontmatter(path)
+    except (OSError, SystemExit) as error:
+        issues.append(Issue("error", f"cannot read reference database: {error}", value))
+        return {}, {}
+    reference_style = reference_metadata.get("citation_style")
+    if not isinstance(reference_style, str) or not reference_style.strip():
+        issues.append(Issue("error", "reference database is missing citation_style", value))
+    elif reference_style.strip().lower() != citation_style:
+        issues.append(
+            Issue(
+                "error",
+                f"conflicting citation_style: index uses {citation_style}, reference database uses {reference_style}",
+                value,
+            )
+        )
+    references = {}
+    for position, match in enumerate(REFERENCE_BLOCK_RE.finditer(text), 1):
+        encoding = match.group("format")
+        try:
+            record = (
+                tomllib.loads(match.group("body"))
+                if encoding == "toml"
+                else parse_yaml(match.group("body"))
+            )
+        except (tomllib.TOMLDecodeError, YamlError) as error:
+            issues.append(
+                Issue(
+                    "error",
+                    f"invalid {encoding.upper()} reference record {position}: {error}",
+                    value,
+                )
+            )
+            continue
+        if not isinstance(record, dict):
+            issues.append(
+                Issue("error", f"reference record {position} must be a mapping", value)
+            )
+            continue
+        key = record.get("key") or record.get("id") or record.get("citation_key")
+        narrative_author, parenthetical_author = author_forms(record)
+        author = record.get("author") or narrative_author
+        year = reference_year(record)
+        title = record.get("title")
+        fallback = record.get("bibliography_fallback") == "apa7_plain"
+        preview = record.get("apa7_plain") or record.get("bibliography") or ""
+        values = {
+            "key or id": key,
+            "author or authors": author,
+            "title": title if not fallback else preview,
+        }
+        missing = [
+            name
+            for name, field_value in values.items()
+            if not isinstance(field_value, str) or not field_value.strip()
+        ]
+        if missing:
+            issues.append(
+                Issue(
+                    "error",
+                    f"reference record {position} is missing fields: {', '.join(missing)}",
+                    value,
+                )
+            )
+            continue
+        if key in references:
+            issues.append(Issue("error", f"duplicate reference key: {key}", value))
+            continue
+        references[key] = Reference(
+            key=key,
+            author=author,
+            year=year,
+            citation=f"{parenthetical_author or author}, {year}",
+            bibliography="",
+            verified=record.get("verified") is True,
+            source=value,
+            record=record,
+            audit_preview=preview if isinstance(preview, str) else "",
+        )
+    if re.search(r"^```(?:toml|yaml)\s*$", text, re.MULTILINE) and not references:
+        issues.append(Issue("error", "no valid reference records found", value))
+    return references, reference_metadata
+
+
+def split_table_row(line):
+    content = line.strip().strip("|")
+    cells = re.split(r"(?<!\\)\|", content)
+    return [cell.strip().replace(r"\|", "|") for cell in cells]
+
+
+def is_table_separator(line):
+    cells = split_table_row(line)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+
+def is_block_start(lines, index):
+    line = lines[index]
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if re.match(r"^#{1,6}\s+", stripped):
+        return True
+    if stripped.startswith("```") or stripped == "$$":
+        return True
+    if FIGURE_RE.match(stripped) or stripped.startswith("!["):
+        return True
+    if (
+        stripped.startswith("|")
+        and index + 1 < len(lines)
+        and is_table_separator(lines[index + 1])
+    ):
+        return True
+    if re.match(r"^(?:[-*+] |\d+\. )", stripped):
+        return True
+    return stripped.startswith("> ") or stripped in {"---", "***"}
+
+
+def parse_blocks(text, source, root, issues):
+    lines = text.splitlines()
+    blocks = []
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not stripped:
+            index += 1
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if heading:
+            blocks.append(
+                Block(
+                    "heading",
+                    {"level": len(heading.group(1)), "text": heading.group(2)},
+                )
+            )
+            index += 1
+            continue
+        if stripped.startswith("```"):
+            language = stripped[3:].strip()
+            index += 1
+            body = []
+            while index < len(lines) and not lines[index].strip().startswith("```"):
+                body.append(lines[index])
+                index += 1
+            if index == len(lines):
+                issues.append(Issue("error", "unclosed code fence", source))
+            else:
+                index += 1
+            blocks.append(
+                Block("code", {"language": language, "text": "\n".join(body)})
+            )
+            continue
+        if stripped == "$$":
+            index += 1
+            body = []
+            while index < len(lines) and lines[index].strip() != "$$":
+                body.append(lines[index])
+                index += 1
+            if index == len(lines):
+                issues.append(Issue("error", "unclosed display-math block", source))
+            else:
+                index += 1
+            blocks.append(Block("math", {"text": "\n".join(body)}))
+            continue
+        if stripped.startswith("!["):
+            figure = FIGURE_RE.match(stripped)
+            if not figure or not figure.group("label"):
+                issues.append(
+                    Issue(
+                        "error",
+                        "figures require a caption and {#fig:label}; use ![Caption](assets/file.png){#fig:name}",
+                        source,
+                    )
+                )
+                index += 1
+                continue
+            width = int(figure.group("width") or 100)
+            if not 1 <= width <= 100:
+                issues.append(
+                    Issue("error", f"figure width must be 1–100: {width}", source)
+                )
+            figure_path = safe_path(root, figure.group("path"))
+            if not figure_path.is_file():
+                issues.append(
+                    Issue(
+                        "error",
+                        f"figure does not exist: {figure.group('path')}",
+                        source,
+                    )
+                )
+            blocks.append(
+                Block(
+                    "figure",
+                    {
+                        "caption": figure.group("caption"),
+                        "path": figure.group("path"),
+                        "label": figure.group("label"),
+                        "width": width,
+                    },
+                )
+            )
+            index += 1
+            continue
+        if (
+            stripped.startswith("|")
+            and index + 1 < len(lines)
+            and is_table_separator(lines[index + 1])
+        ):
+            headers = split_table_row(lines[index])
+            alignments = split_table_row(lines[index + 1])
+            index += 2
+            rows = []
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                rows.append(split_table_row(lines[index]))
+                index += 1
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+            caption = (
+                TABLE_CAPTION_RE.match(lines[index].strip())
+                if index < len(lines)
+                else None
+            )
+            if caption:
+                index += 1
+                caption_text = caption.group("caption")
+                label = caption.group("label")
+            else:
+                caption_text = "Untitled table"
+                label = f"tbl:missing-{len(blocks) + 1}"
+                issues.append(
+                    Issue(
+                        "error",
+                        "tables require `Table: Caption {#tbl:label}` immediately after the rows",
+                        source,
+                    )
+                )
+            if len(alignments) != len(headers):
+                issues.append(
+                    Issue(
+                        "error",
+                        "table separator column count differs from its header",
+                        source,
+                    )
+                )
+            for row_number, row in enumerate(rows, 1):
+                if len(row) != len(headers):
+                    issues.append(
+                        Issue(
+                            "error",
+                            f"table row {row_number} has {len(row)} cells; expected {len(headers)}",
+                            source,
+                        )
+                    )
+            blocks.append(
+                Block(
+                    "table",
+                    {
+                        "headers": headers,
+                        "rows": rows,
+                        "caption": caption_text,
+                        "label": label,
+                    },
+                )
+            )
+            continue
+        list_match = re.match(r"^(?P<marker>[-*+]|\d+\.)\s+(?P<text>.+)$", stripped)
+        if list_match:
+            ordered = list_match.group("marker")[0].isdigit()
+            items = []
+            while index < len(lines):
+                item = re.match(
+                    r"^(?P<marker>[-*+]|\d+\.)\s+(?P<text>.+)$", lines[index].strip()
+                )
+                if not item or item.group("marker")[0].isdigit() != ordered:
+                    break
+                items.append(item.group("text"))
+                index += 1
+            blocks.append(Block("list", {"ordered": ordered, "items": items}))
+            continue
+        if stripped.startswith("> "):
+            parts = []
+            while index < len(lines) and lines[index].strip().startswith("> "):
+                parts.append(lines[index].strip()[2:])
+                index += 1
+            blocks.append(Block("quote", {"text": " ".join(parts)}))
+            continue
+        if stripped in {"---", "***"}:
+            blocks.append(Block("rule", {}))
+            index += 1
+            continue
+        paragraph = [stripped]
+        index += 1
+        while index < len(lines) and not is_block_start(lines, index):
+            paragraph.append(lines[index].strip())
+            index += 1
+        blocks.append(Block("paragraph", {"text": " ".join(paragraph)}))
+    return blocks
+
+
+def strip_for_word_count(text):
+    text = re.sub(r"^(?:\+\+\+|---)\n.*?\n(?:\+\+\+|---)\n", "", text, flags=re.DOTALL)
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = CURLY_CITATION_RE.sub("", text)
+    text = re.sub(
+        r"\[@[^\]]+\]|\{@[^}]+\}|(?<![\w/@])@[A-Za-z][A-Za-z0-9_.:-]*", "", text
+    )
+    text = re.sub(r"!\[([^]]+)\]\([^)]+\)(?:\{[^}]+\})?", r"\1", text)
+    text = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"[*_`|]", " ", text)
+    return text
+
+
+def collect_citations(text):
+    citations = set()
+    for match in CURLY_CITATION_RE.finditer(text):
+        citations.update(curly_citation_parts(match)[0])
+    for match in CITATION_GROUP_RE.finditer(text):
+        citations.update(re.findall(r"@([A-Za-z][A-Za-z0-9_.:-]*)", match.group(1)))
+    without_groups = CURLY_CITATION_RE.sub("", text)
+    without_groups = CITATION_GROUP_RE.sub("", without_groups)
+    without_groups = CROSS_REFERENCE_RE.sub("", without_groups)
+    citations.update(NARRATIVE_RE.findall(without_groups))
+    return citations
+
+
+def collect_cross_references(text):
+    return set(CROSS_REFERENCE_RE.findall(text))
+
+
+def curly_citation_parts(match):
+    body = match.group("body")
+    ids_match = re.search(r"(?:^|,)\s*ids:\s*\[([^]]*)\]", body)
+    mode_match = re.search(r"(?:^|,)\s*mode:\s*([A-Za-z_-]+)", body)
+    locator_match = re.search(
+        r'(?:^|,)\s*locator:\s*(?:"([^"]+)"|\'([^\']+)\'|([^,]+))', body
+    )
+    keys = []
+    if ids_match:
+        keys = [
+            value.strip().strip("\"'")
+            for value in ids_match.group(1).split(",")
+            if value.strip()
+        ]
+    mode = mode_match.group(1).lower() if mode_match else "parenthetical"
+    locator = (
+        next((value.strip() for value in locator_match.groups() if value), "")
+        if locator_match
+        else ""
+    )
+    return keys, mode, locator
+
+
+def nested_value(mapping, path):
+    value = mapping
+    for component in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(component)
+    return value
+
+
+def normalise_metadata(metadata):
+    result = dict(metadata)
+    result["schema"] = metadata.get("schema", metadata.get("schema_version"))
+    identities = metadata.get("identities")
+    if isinstance(identities, list):
+        result["identities"] = identities
+    student = metadata.get("student")
+    if "identities" not in result and isinstance(student, dict):
+        result["identities"] = [
+            {
+                "name": student.get("name"),
+                "identifier": student.get("number"),
+                "role": student.get("role"),
+            }
+        ]
+    if isinstance(student, dict):
+        result.setdefault("author", student.get("name"))
+        result.setdefault("identifier", student.get("number"))
+    elif (
+        isinstance(identities, list) and identities and isinstance(identities[0], dict)
+    ):
+        result.setdefault("author", identities[0].get("name"))
+        result.setdefault("identifier", identities[0].get("identifier"))
+    presentation = metadata.get("presentation")
+    if isinstance(presentation, dict):
+        result.setdefault("font_size_pt", presentation.get("font_size_pt"))
+    word_count = metadata.get("word_count")
+    if isinstance(word_count, dict):
+        result.setdefault("word_limit", word_count.get("limit"))
+        result.setdefault(
+            "word_tolerance_percent", word_count.get("tolerance_percent", 0)
+        )
+    result.setdefault(
+        "required_fields",
+        metadata.get("required_user_fields", metadata.get("required_fields", [])),
+    )
+    if not result.get("references"):
+        citation_markup = metadata.get("citation_markup")
+        id_source = (
+            citation_markup.get("id_source")
+            if isinstance(citation_markup, dict)
+            else None
+        )
+        if isinstance(id_source, dict) and isinstance(id_source.get("path"), str):
+            result["references"] = id_source["path"]
+        else:
+            for section in metadata.get("sections", []):
+                if isinstance(section, dict) and section.get("id") == "references":
+                    result["references"] = section.get("path")
+                    break
+    sections = metadata.get("sections", [])
+    if isinstance(sections, list):
+        sections = sorted(
+            sections,
+            key=lambda item: item.get("order", 0) if isinstance(item, dict) else 0,
+        )
+        result["sections"] = [
+            {
+                **section,
+                "count_words": section.get(
+                    "count_words", section.get("include_in_word_count", True)
+                ),
+            }
+            for section in sections
+            if isinstance(section, dict)
+            and section.get("include_in_submission", True) is not False
+            and section.get("id") != "title_and_details"
+        ]
+    return result
+
+
+def load_project(value):
+    index = resolve_index(value)
+    root = index.parent.resolve()
+    source_metadata, _ = read_frontmatter(index)
+    metadata = normalise_metadata(source_metadata)
+    issues = []
+    raw_citation_style = source_metadata.get("citation_style")
+    citation_style = (
+        raw_citation_style.strip().lower()
+        if isinstance(raw_citation_style, str)
+        else ""
+    )
+    metadata["citation_style"] = citation_style
+    if not citation_style:
+        issues.append(Issue("error", "index is missing citation_style", index.name))
+    elif citation_style not in SUPPORTED_CITATION_STYLES:
+        issues.append(
+            Issue(
+                "error",
+                f"unsupported citation_style: {raw_citation_style}",
+                index.name,
+            )
+        )
+    if not isinstance(metadata.get("schema"), int) or metadata["schema"] < 1:
+        issues.append(
+            Issue("error", "index schema must be a positive integer", index.name)
+        )
+    for field_name in ("title", "sections"):
+        if not metadata.get(field_name):
+            issues.append(Issue("error", f"index is missing {field_name}", index.name))
+    references, reference_metadata = load_references(
+        root,
+        metadata.get("references", "references.md"),
+        issues,
+        citation_style,
+    )
+    sections = []
+    labels = {}
+    citations = set()
+    cross_references = set()
+    figure_number = 0
+    table_number = 0
+    configured_sections = metadata.get("sections", [])
+    if not isinstance(configured_sections, list):
+        fail("index sections must be an array of mappings", 2)
+    for record in configured_sections:
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            issues.append(Issue("error", "each section needs a path", index.name))
+            continue
+        if record.get("id") == "references":
+            sections.append(
+                Section(
+                    kind="references",
+                    path=record["path"],
+                    title=record.get("title")
+                    or reference_metadata.get("title")
+                    or metadata.get("bibliography_title", "References"),
+                    blocks=[],
+                    words=0,
+                    count_words=False,
+                    max_words=None,
+                    page_break_before=True,
+                )
+            )
+            continue
+        section_path = safe_path(root, record["path"])
+        try:
+            section_text = section_path.read_text()
+        except OSError as error:
+            issues.append(
+                Issue("error", f"cannot read section: {error}", record["path"])
+            )
+            continue
+        if PLACEHOLDER_RE.search(section_text):
+            issues.append(Issue("error", "unresolved placeholder", record["path"]))
+        citation_objects = list(CURLY_CITATION_RE.finditer(section_text))
+        if section_text.count("{cite:") != len(citation_objects):
+            issues.append(
+                Issue("error", "malformed structured citation object", record["path"])
+            )
+        for citation_object in citation_objects:
+            keys, mode, _ = curly_citation_parts(citation_object)
+            if not keys:
+                issues.append(
+                    Issue("error", "structured citation has no ids", record["path"])
+                )
+            if mode not in {"narrative", "parenthetical"}:
+                issues.append(
+                    Issue(
+                        "error",
+                        f"structured citation has unsupported mode: {mode}",
+                        record["path"],
+                    )
+                )
+        blocks = parse_blocks(section_text, record["path"], root, issues)
+        for block in blocks:
+            if block.kind == "figure":
+                figure_number += 1
+                label = block.data["label"]
+                target = ("Figure", figure_number)
+            elif block.kind == "table":
+                table_number += 1
+                label = block.data["label"]
+                target = ("Table", table_number)
+            else:
+                continue
+            if label in labels:
+                issues.append(
+                    Issue("error", f"duplicate label: {label}", record["path"])
+                )
+            else:
+                labels[label] = target
+        section_citations = collect_citations(section_text)
+        section_cross_references = collect_cross_references(section_text)
+        citations.update(section_citations)
+        cross_references.update(section_cross_references)
+        words = len(WORD_RE.findall(strip_for_word_count(section_text)))
+        max_words = record.get("max_words")
+        count_words = record.get("count_words", True)
+        if max_words is not None and (not isinstance(max_words, int) or max_words < 1):
+            issues.append(
+                Issue("error", "max_words must be a positive integer", record["path"])
+            )
+            max_words = None
+        if count_words and max_words and words > max_words:
+            issues.append(
+                Issue(
+                    "error",
+                    f"word count {words} exceeds section limit {max_words}",
+                    record["path"],
+                )
+            )
+        title = record.get("title") or next(
+            (block.data["text"] for block in blocks if block.kind == "heading"),
+            Path(record["path"]).stem,
+        )
+        sections.append(
+            Section(
+                kind="content",
+                path=record["path"],
+                title=title,
+                blocks=blocks,
+                words=words,
+                count_words=count_words,
+                max_words=max_words,
+                page_break_before=record.get("page_break_before", False) is True,
+            )
+        )
+    if not any(section.kind == "references" for section in sections):
+        sections.append(
+            Section(
+                kind="references",
+                path=metadata.get("references", "references.md"),
+                title=metadata.get("bibliography_title", "References"),
+                blocks=[],
+                words=0,
+                count_words=False,
+                max_words=None,
+                page_break_before=True,
+            )
+        )
+    resolve_references(references, citations, citation_style, issues)
+    unknown_citations = citations - references.keys()
+    for key in sorted(unknown_citations):
+        issues.append(Issue("error", f"citation has no reference record: {key}"))
+    require_verified = metadata.get("require_verified_references", True) is not False
+    for key in sorted(citations & references.keys()):
+        if not references[key].verified:
+            level = "error" if require_verified else "warning"
+            issues.append(
+                Issue(
+                    level,
+                    f"cited reference is not verified: {key}",
+                    references[key].source,
+                )
+            )
+    for key in sorted(references.keys() - citations):
+        issues.append(
+            Issue("warning", f"reference is not cited: {key}", references[key].source)
+        )
+    if not citations:
+        sections = [section for section in sections if section.kind != "references"]
+    for label in sorted(cross_references - labels.keys()):
+        issues.append(
+            Issue("error", f"cross-reference has no labelled figure or table: {label}")
+        )
+    for label in sorted(labels.keys() - cross_references):
+        issues.append(Issue("warning", f"label is never referenced: {label}"))
+    total_words = sum(section.words for section in sections if section.count_words)
+    word_limit = metadata.get("word_limit")
+    tolerance = metadata.get("word_tolerance_percent", 0)
+    if word_limit is not None:
+        if not isinstance(word_limit, int) or word_limit < 1:
+            issues.append(
+                Issue("error", "word_limit must be a positive integer", index.name)
+            )
+        elif not isinstance(tolerance, int | float) or tolerance < 0:
+            issues.append(
+                Issue(
+                    "error", "word_tolerance_percent must be non-negative", index.name
+                )
+            )
+        elif total_words > word_limit * (1 + tolerance / 100):
+            ceiling = int(word_limit * (1 + tolerance / 100))
+            issues.append(
+                Issue(
+                    "error",
+                    f"counted words {total_words} exceed allowed ceiling {ceiling}",
+                    index.name,
+                )
+            )
+    for field_name in metadata.get("required_fields", []):
+        value = nested_value(source_metadata, field_name)
+        if value is None:
+            value = nested_value(metadata, field_name)
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or PLACEHOLDER_RE.search(value)
+        ):
+            issues.append(
+                Issue(
+                    "error",
+                    f"required index field is incomplete: {field_name}",
+                    index.name,
+                )
+            )
+    identities = source_metadata.get("identities")
+    if identities is not None:
+        if not isinstance(identities, list) or not identities:
+            issues.append(
+                Issue("error", "identities must be a non-empty array", index.name)
+            )
+        else:
+            required_identity_fields = source_metadata.get(
+                "required_identity_fields", ["name"]
+            )
+            if not isinstance(required_identity_fields, list) or not all(
+                isinstance(field_name, str) and field_name
+                for field_name in required_identity_fields
+            ):
+                issues.append(
+                    Issue(
+                        "error",
+                        "required_identity_fields must be an array of field names",
+                        index.name,
+                    )
+                )
+                required_identity_fields = ["name"]
+            for position, identity in enumerate(identities, 1):
+                if not isinstance(identity, dict):
+                    issues.append(
+                        Issue(
+                            "error",
+                            f"identity {position} must be a mapping",
+                            index.name,
+                        )
+                    )
+                    continue
+                for field_name in required_identity_fields:
+                    value = identity.get(field_name)
+                    if (
+                        not isinstance(value, str)
+                        or not value.strip()
+                        or PLACEHOLDER_RE.search(value)
+                    ):
+                        issues.append(
+                            Issue(
+                                "error",
+                                f"identity {position} field is incomplete: {field_name}",
+                                index.name,
+                            )
+                        )
+    institution = source_metadata.get("institution")
+    if institution is not None:
+        if not isinstance(institution, str | dict):
+            issues.append(
+                Issue("error", "institution must be text or a mapping", index.name)
+            )
+        elif isinstance(institution, str):
+            if not institution.strip() or PLACEHOLDER_RE.search(institution):
+                issues.append(
+                    Issue("error", "institution is incomplete", index.name)
+                )
+        else:
+            required_institution_fields = source_metadata.get(
+                "required_institution_fields", ["name"]
+            )
+            if not isinstance(required_institution_fields, list) or not all(
+                isinstance(field_name, str) and field_name
+                for field_name in required_institution_fields
+            ):
+                issues.append(
+                    Issue(
+                        "error",
+                        "required_institution_fields must be an array of field names",
+                        index.name,
+                    )
+                )
+                required_institution_fields = ["name"]
+            for field_name in required_institution_fields:
+                value = institution.get(field_name)
+                if (
+                    not isinstance(value, str)
+                    or not value.strip()
+                    or PLACEHOLDER_RE.search(value)
+                ):
+                    issues.append(
+                        Issue(
+                            "error",
+                            f"institution field is incomplete: {field_name}",
+                            index.name,
+                        )
+                    )
+    cover_page = source_metadata.get("cover_page")
+    if cover_page is not None and not isinstance(cover_page, bool | dict):
+        issues.append(
+            Issue("error", "cover_page must be true, false, or a mapping", index.name)
+        )
+    elif isinstance(cover_page, dict) and "enabled" in cover_page and not isinstance(
+        cover_page["enabled"], bool
+    ):
+        issues.append(
+            Issue("error", "cover_page.enabled must be true or false", index.name)
+        )
+    presentation = source_metadata.get("presentation")
+    if presentation is not None and not isinstance(presentation, dict):
+        issues.append(Issue("error", "presentation must be a mapping", index.name))
+    elif isinstance(presentation, dict):
+        profile = presentation.get("profile", "standard")
+        if profile not in {"standard", "compact"}:
+            issues.append(
+                Issue(
+                    "error",
+                    "presentation.profile must be standard or compact",
+                    index.name,
+                )
+            )
+
+        def valid_number(value, minimum, maximum=None):
+            return (
+                isinstance(value, int | float)
+                and not isinstance(value, bool)
+                and value >= minimum
+                and (maximum is None or value <= maximum)
+            )
+
+        numeric_fields = {
+            "font_size_pt": (6, 72),
+            "line_height": (1, 3),
+            "paragraph_spacing_pt": (0, 72),
+            "column_gap_mm": (0, 100),
+        }
+        for field_name, (minimum, maximum) in numeric_fields.items():
+            if field_name in presentation and not valid_number(
+                presentation[field_name], minimum, maximum
+            ):
+                issues.append(
+                    Issue(
+                        "error",
+                        f"presentation.{field_name} must be a number from {minimum} to {maximum}",
+                        index.name,
+                    )
+                )
+        margins = presentation.get("margins_mm")
+        if margins is not None:
+            if valid_number(margins, 5, 80):
+                pass
+            elif not isinstance(margins, dict):
+                issues.append(
+                    Issue(
+                        "error",
+                        "presentation.margins_mm must be a number or edge mapping",
+                        index.name,
+                    )
+                )
+            else:
+                for edge in ("top", "right", "bottom", "left"):
+                    if edge not in margins or not valid_number(margins[edge], 5, 80):
+                        issues.append(
+                            Issue(
+                                "error",
+                                f"presentation.margins_mm.{edge} must be a number from 5 to 80",
+                                index.name,
+                            )
+                        )
+        for field_name in ("heading_spacing_pt", "caption_spacing_pt"):
+            spacing = presentation.get(field_name)
+            if spacing is None:
+                continue
+            if not isinstance(spacing, dict):
+                issues.append(
+                    Issue(
+                        "error",
+                        f"presentation.{field_name} must be a before/after mapping",
+                        index.name,
+                    )
+                )
+                continue
+            for edge in ("before", "after"):
+                if edge not in spacing or not valid_number(spacing[edge], 0, 72):
+                    issues.append(
+                        Issue(
+                            "error",
+                            f"presentation.{field_name}.{edge} must be a number from 0 to 72",
+                            index.name,
+                        )
+                    )
+        columns = presentation.get("columns", 1)
+        if columns not in {1, 2} or isinstance(columns, bool):
+            issues.append(
+                Issue("error", "presentation.columns must be 1 or 2", index.name)
+            )
+        title_treatment = presentation.get("title")
+        if title_treatment is not None:
+            if not isinstance(title_treatment, dict):
+                issues.append(
+                    Issue(
+                        "error", "presentation.title must be a mapping", index.name
+                    )
+                )
+            else:
+                alignment = title_treatment.get("alignment", "center")
+                if alignment not in {"left", "center", "right"}:
+                    issues.append(
+                        Issue(
+                            "error",
+                            "presentation.title.alignment must be left, center, or right",
+                            index.name,
+                        )
+                    )
+                for field_name, minimum, maximum in (
+                    ("size_pt", 6, 72),
+                    ("top_margin_mm", 0, 150),
+                ):
+                    if field_name in title_treatment and not valid_number(
+                        title_treatment[field_name], minimum, maximum
+                    ):
+                        issues.append(
+                            Issue(
+                                "error",
+                                f"presentation.title.{field_name} must be a number from {minimum} to {maximum}",
+                                index.name,
+                            )
+                        )
+    return Project(
+        root=root,
+        index=index,
+        metadata=metadata,
+        references=references,
+        sections=sections,
+        labels=labels,
+        citations=citations,
+        cross_references=cross_references,
+        issues=issues,
+    )
+
+
+def stash_tokens(text, pattern, renderer):
+    existing_groups = [int(value) for value in re.findall(r"\x00T([0-9]+)-", text)]
+    group = max(existing_groups, default=-1) + 1
+    tokens = []
+
+    def replace(match):
+        tokens.append(renderer(match))
+        return f"\x00T{group}-{len(tokens) - 1}\x00"
+
+    return pattern.sub(replace, text), (group, tokens)
+
+
+def restore_tokens(text, groups):
+    for group, tokens in reversed(groups):
+        text = re.sub(
+            rf"\x00T{group}-([0-9]+)\x00",
+            lambda match, values=tokens: values[int(match.group(1))],
+            text,
+        )
+    return text
+
+
+def citation_parts(value):
+    parts = []
+    for raw in re.split(r"\s*;\s*", value):
+        match = re.fullmatch(r"@([A-Za-z][A-Za-z0-9_.:-]*)(?:\s*,\s*(.+))?", raw)
+        if match:
+            parts.append((match.group(1), match.group(2)))
+    return parts
+
+
+def citation_order(keys, project):
+    return sorted(
+        keys,
+        key=lambda key: (
+            (0, project.references[key].sort_key)
+            if key in project.references
+            else (1, key.casefold())
+        ),
+    )
+
+
+def citation_part_order(parts, project):
+    return sorted(
+        parts,
+        key=lambda part: (
+            (0, project.references[part[0]].sort_key)
+            if part[0] in project.references
+            else (1, part[0].casefold())
+        ),
+    )
+
+
+def html_curly_citation(match, project):
+    keys, mode, locator = curly_citation_parts(match)
+    if mode == "parenthetical":
+        keys = citation_order(keys, project)
+    rendered = []
+    for key in keys:
+        reference = project.references.get(key)
+        if not reference:
+            rendered.append(html.escape(key))
+            continue
+        value = (
+            f"{reference.author} ({reference.year})"
+            if mode == "narrative"
+            else reference.citation
+        )
+        rendered.append(
+            f'<a class="citation" href="#ref-{html.escape(key)}">{html.escape(value)}</a>'
+        )
+    joined = "; ".join(rendered)
+    if locator:
+        joined = f"{joined}, {html.escape(locator)}"
+    return joined if mode == "narrative" else f"({joined})"
+
+
+def latex_curly_citation(match, project):
+    keys, mode, locator = curly_citation_parts(match)
+    if mode == "parenthetical":
+        keys = citation_order(keys, project)
+    rendered = []
+    for key in keys:
+        reference = project.references.get(key)
+        if not reference:
+            rendered.append(latex_escape(key))
+            continue
+        value = (
+            f"{reference.author} ({reference.year})"
+            if mode == "narrative"
+            else reference.citation
+        )
+        rendered.append(f"\\hyperlink{{ref:{key}}}{{{latex_escape(value)}}}")
+    joined = "; ".join(rendered)
+    if locator:
+        joined = f"{joined}, {latex_escape(locator)}"
+    return joined if mode == "narrative" else f"({joined})"
+
+
+def plain_curly_citation(match, project):
+    keys, mode, locator = curly_citation_parts(match)
+    if mode == "parenthetical":
+        keys = citation_order(keys, project)
+    rendered = []
+    for key in keys:
+        reference = project.references.get(key)
+        if not reference:
+            rendered.append(key)
+            continue
+        rendered.append(
+            f"{reference.author} ({reference.year})"
+            if mode == "narrative"
+            else reference.citation
+        )
+    joined = "; ".join(rendered)
+    if locator:
+        joined = f"{joined}, {locator}"
+    return joined if mode == "narrative" else f"({joined})"
+
+
+def plain_inline(text, project):
+    text = CURLY_CITATION_RE.sub(
+        lambda match: plain_curly_citation(match, project), text
+    )
+
+    def citation(match):
+        rendered = []
+        for key, locator in citation_part_order(
+            citation_parts(match.group(1)), project
+        ):
+            reference = project.references.get(key)
+            value = reference.citation if reference else key
+            rendered.append(f"{value}, {locator}" if locator else value)
+        return f"({'; '.join(rendered)})"
+
+    text = CITATION_GROUP_RE.sub(citation, text)
+    text = NARRATIVE_RE.sub(
+        lambda match: (
+            f"{project.references[match.group(1)].author} "
+            f"({project.references[match.group(1)].year})"
+            if match.group(1) in project.references
+            else match.group(0)
+        ),
+        text,
+    )
+    text = CROSS_REFERENCE_RE.sub(
+        lambda match: (
+            f"{project.labels[match.group(1)][0]} {project.labels[match.group(1)][1]}"
+            if match.group(1) in project.labels
+            else match.group(0)
+        ),
+        text,
+    )
+    text = re.sub(r"\[([^]]+)\]\(https?://[^)]+\)", r"\1", text)
+    return re.sub(r"[*_`]", "", text)
+
+
+def html_inline(text, project, citations=True):
+    groups = []
+    text, tokens = stash_tokens(
+        text,
+        re.compile(r"`([^`\n]+)`"),
+        lambda match: f"<code>{html.escape(match.group(1))}</code>",
+    )
+    groups.append(tokens)
+    if citations:
+        text, tokens = stash_tokens(
+            text,
+            CURLY_CITATION_RE,
+            lambda match: html_curly_citation(match, project),
+        )
+        groups.append(tokens)
+
+        def citation(match):
+            rendered = []
+            for key, locator in citation_part_order(
+                citation_parts(match.group(1)), project
+            ):
+                reference = project.references.get(key)
+                value = reference.citation if reference else key
+                if locator:
+                    value = f"{value}, {locator}"
+                rendered.append(
+                    f'<a class="citation" href="#ref-{html.escape(key)}">{html.escape(value)}</a>'
+                )
+            return f"({'; '.join(rendered)})"
+
+        text, tokens = stash_tokens(text, CITATION_GROUP_RE, citation)
+        groups.append(tokens)
+        text, tokens = stash_tokens(
+            text,
+            NARRATIVE_RE,
+            lambda match: (
+                f'<a class="citation" href="#ref-{html.escape(match.group(1))}">'
+                f"{html.escape(project.references[match.group(1)].author)} "
+                f"({html.escape(project.references[match.group(1)].year)})</a>"
+                if match.group(1) in project.references
+                else html.escape(match.group(0))
+            ),
+        )
+        groups.append(tokens)
+    text, tokens = stash_tokens(
+        text,
+        CROSS_REFERENCE_RE,
+        lambda match: (
+            f'<a href="#{html.escape(match.group(1))}">{project.labels[match.group(1)][0]} '
+            f"{project.labels[match.group(1)][1]}</a>"
+            if match.group(1) in project.labels
+            else html.escape(match.group(0))
+        ),
+    )
+    groups.append(tokens)
+    text, tokens = stash_tokens(
+        text,
+        re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)"),
+        lambda match: (
+            f'<a href="{html.escape(match.group(2), quote=True)}">{html.escape(match.group(1))}</a>'
+        ),
+    )
+    groups.append(tokens)
+    text, tokens = stash_tokens(
+        text,
+        re.compile(r"https?://[^\s<>)\]]+"),
+        lambda match: (
+            f'<a href="{html.escape(match.group(0), quote=True)}">{html.escape(match.group(0))}</a>'
+        ),
+    )
+    groups.append(tokens)
+    text = html.escape(text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", text)
+    return restore_tokens(text, groups)
+
+
+def latex_escape(text):
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "{": r"\{",
+        "}": r"\}",
+        "$": r"\$",
+        "&": r"\&",
+        "%": r"\%",
+        "#": r"\#",
+        "_": r"\_",
+        "^": r"\textasciicircum{}",
+        "~": r"\textasciitilde{}",
+    }
+    return "".join(replacements.get(character, character) for character in text)
+
+
+def latex_inline(text, project, citations=True):
+    groups = []
+    text, tokens = stash_tokens(
+        text,
+        re.compile(r"`([^`\n]+)`"),
+        lambda match: f"\\texttt{{{latex_escape(match.group(1))}}}",
+    )
+    groups.append(tokens)
+    if citations:
+        text, tokens = stash_tokens(
+            text,
+            CURLY_CITATION_RE,
+            lambda match: latex_curly_citation(match, project),
+        )
+        groups.append(tokens)
+
+        def citation(match):
+            rendered = []
+            for key, locator in citation_part_order(
+                citation_parts(match.group(1)), project
+            ):
+                reference = project.references.get(key)
+                value = reference.citation if reference else key
+                if locator:
+                    value = f"{value}, {locator}"
+                rendered.append(f"\\hyperlink{{ref:{key}}}{{{latex_escape(value)}}}")
+            return f"({'; '.join(rendered)})"
+
+        text, tokens = stash_tokens(text, CITATION_GROUP_RE, citation)
+        groups.append(tokens)
+        text, tokens = stash_tokens(
+            text,
+            NARRATIVE_RE,
+            lambda match: (
+                f"\\hyperlink{{ref:{match.group(1)}}}{{"
+                f"{latex_escape(project.references[match.group(1)].author)} "
+                f"({latex_escape(project.references[match.group(1)].year)})}}"
+                if match.group(1) in project.references
+                else latex_escape(match.group(0))
+            ),
+        )
+        groups.append(tokens)
+    text, tokens = stash_tokens(
+        text,
+        CROSS_REFERENCE_RE,
+        lambda match: (
+            f"\\hyperref[{match.group(1)}]{{{project.labels[match.group(1)][0]}~\\ref*{{{match.group(1)}}}}}"
+            if match.group(1) in project.labels
+            else latex_escape(match.group(0))
+        ),
+    )
+    groups.append(tokens)
+    text, tokens = stash_tokens(
+        text,
+        re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)"),
+        lambda match: (
+            f"\\href{{\\detokenize{{{match.group(2)}}}}}{{{latex_escape(match.group(1))}}}"
+        ),
+    )
+    groups.append(tokens)
+    text, tokens = stash_tokens(
+        text,
+        re.compile(r"https?://[^\s<>)\]]+"),
+        lambda match: f"\\url{{{match.group(0)}}}",
+    )
+    groups.append(tokens)
+    text = latex_escape(text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\\emph{\1}", text)
+    return restore_tokens(text, groups)
+
+
+def html_block(block, project):
+    data = block.data
+    if block.kind == "heading":
+        level = min(data["level"] + 1, 6)
+        return f"<h{level}>{html_inline(data['text'], project)}</h{level}>"
+    if block.kind == "paragraph":
+        return f"<p>{html_inline(data['text'], project)}</p>"
+    if block.kind == "figure":
+        source = html.escape(f"../{data['path']}", quote=True)
+        caption = html_inline(data["caption"], project)
+        number = project.labels[data["label"]][1]
+        return (
+            f'<figure id="{html.escape(data["label"])}">'
+            f'<img src="{source}" alt="{html.escape(data["caption"], quote=True)}" '
+            f'style="max-width:{data["width"]}%">'
+            f"<figcaption>Figure {number}. {caption}</figcaption></figure>"
+        )
+    if block.kind == "table":
+        number = project.labels[data["label"]][1]
+        head = "".join(
+            f"<th>{html_inline(cell, project)}</th>" for cell in data["headers"]
+        )
+        rows = "".join(
+            "<tr>"
+            + "".join(f"<td>{html_inline(cell, project)}</td>" for cell in row)
+            + "</tr>"
+            for row in data["rows"]
+        )
+        return (
+            f'<figure class="table" id="{html.escape(data["label"])}">'
+            f"<figcaption>Table {number}. {html_inline(data['caption'], project)}</figcaption>"
+            f"<table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></figure>"
+        )
+    if block.kind == "list":
+        tag = "ol" if data["ordered"] else "ul"
+        items = "".join(
+            f"<li>{html_inline(item, project)}</li>" for item in data["items"]
+        )
+        return f"<{tag}>{items}</{tag}>"
+    if block.kind == "quote":
+        return f"<blockquote>{html_inline(data['text'], project)}</blockquote>"
+    if block.kind == "code":
+        language = html.escape(data["language"], quote=True)
+        return f'<pre data-language="{language}"><code>{html.escape(data["text"])}</code></pre>'
+    if block.kind == "math":
+        return f'<pre class="math">{html.escape(data["text"])}</pre>'
+    return "<hr>"
+
+
+def latex_block(block, project):
+    data = block.data
+    if block.kind == "heading":
+        commands = {
+            1: "section",
+            2: "subsection",
+            3: "subsubsection",
+            4: "paragraph",
+            5: "subparagraph",
+            6: "subparagraph",
+        }
+        command = commands[data["level"]]
+        return f"\\{command}{{{latex_inline(data['text'], project)}}}"
+    if block.kind == "paragraph":
+        return latex_inline(data["text"], project) + "\n"
+    if block.kind == "figure":
+        width = data["width"] / 100
+        source = project.root / data["path"]
+        return "\n".join(
+            (
+                r"\begin{figure}[H]",
+                r"\centering",
+                f"\\includegraphics[width={width:.2f}\\linewidth]{{\\detokenize{{{source}}}}}",
+                f"\\caption{{{latex_inline(data['caption'], project)}}}",
+                f"\\label{{{data['label']}}}",
+                r"\end{figure}",
+            )
+        )
+    if block.kind == "table":
+        columns = "@{}" + "X" * len(data["headers"]) + "@{}"
+        header = (
+            " & ".join(
+                f"\\textbf{{{latex_inline(cell, project)}}}" for cell in data["headers"]
+            )
+            + r" \\"
+        )
+        rows = [
+            " & ".join(latex_inline(cell, project) for cell in row) + r" \\"
+            for row in data["rows"]
+        ]
+        return "\n".join(
+            (
+                r"\begin{table}[H]",
+                r"\centering",
+                f"\\caption{{{latex_inline(data['caption'], project)}}}",
+                f"\\label{{{data['label']}}}",
+                f"\\begin{{tabularx}}{{\\linewidth}}{{{columns}}}",
+                r"\toprule",
+                header,
+                r"\midrule",
+                *rows,
+                r"\bottomrule",
+                r"\end{tabularx}",
+                r"\end{table}",
+            )
+        )
+    if block.kind == "list":
+        environment = "enumerate" if data["ordered"] else "itemize"
+        items = "\n".join(
+            f"\\item {latex_inline(item, project)}" for item in data["items"]
+        )
+        return f"\\begin{{{environment}}}\n{items}\n\\end{{{environment}}}"
+    if block.kind == "quote":
+        return (
+            f"\\begin{{quote}}\n{latex_inline(data['text'], project)}\n\\end{{quote}}"
+        )
+    if block.kind == "code":
+        return f"\\begin{{verbatim}}\n{data['text']}\n\\end{{verbatim}}"
+    if block.kind == "math":
+        return f"\\[\n{data['text']}\n\\]"
+    return r"\par\medskip\hrule\medskip"
+
+
+def text_block(block, project):
+    data = block.data
+    if block.kind == "heading":
+        return plain_inline(data["text"], project)
+    if block.kind in {"paragraph", "quote"}:
+        return plain_inline(data["text"], project)
+    if block.kind == "figure":
+        number = project.labels[data["label"]][1]
+        return f"Figure {number}. {plain_inline(data['caption'], project)}"
+    if block.kind == "table":
+        number = project.labels[data["label"]][1]
+        rows = [" | ".join(data["headers"])]
+        rows.extend(" | ".join(row) for row in data["rows"])
+        rows.append(f"Table {number}. {plain_inline(data['caption'], project)}")
+        return "\n".join(rows)
+    if block.kind == "list":
+        return "\n".join(plain_inline(item, project) for item in data["items"])
+    if block.kind in {"code", "math"}:
+        return data["text"]
+    return ""
+
+
+def cited_references(project):
+    return sorted(
+        (
+            project.references[key]
+            for key in project.citations
+            if key in project.references
+        ),
+        key=lambda reference: reference.sort_key,
+    )
+
+
+def text_references(project, section):
+    entries = [
+        plain_inline(reference.bibliography, project)
+        for reference in cited_references(project)
+    ]
+    return "\n\n".join([section.title, *entries])
+
+
+def html_references(project, section, index):
+    entries = "".join(
+        f'<li id="ref-{html.escape(reference.key)}">{html_inline(reference.bibliography, project, citations=False)}</li>'
+        for reference in cited_references(project)
+    )
+    return (
+        f'<section id="section-{index}" class="references page-break">'
+        f"<h2>{html.escape(section.title)}</h2><ol>{entries}</ol></section>"
+    )
+
+
+def latex_references(project, section):
+    content = [
+        f"\\section*{{{latex_escape(section.title)}}}",
+        f"\\addcontentsline{{toc}}{{section}}{{{latex_escape(section.title)}}}",
+        r"\begin{hangparas}{1.2cm}{1}",
+    ]
+    for reference in cited_references(project):
+        content.append(
+            f"\\hypertarget{{ref:{reference.key}}}{{{latex_inline(reference.bibliography, project, citations=False)}}}\\par"
+        )
+    content.append(r"\end{hangparas}")
+    return content
+
+
+def render_text(project):
+    sections = []
+    for section in project.sections:
+        if section.kind == "references":
+            sections.append(text_references(project, section))
+            continue
+        body = "\n\n".join(
+            rendered
+            for block in section.blocks
+            if (rendered := text_block(block, project))
+        )
+        sections.append(body)
+    return "\n\n".join(sections) + "\n"
+
+
+def cover_page_options(metadata):
+    value = metadata.get("cover_page", True)
+    if value is False:
+        return None
+    if isinstance(value, dict):
+        return None if value.get("enabled") is False else value
+    return {}
+
+
+def presentation_settings(metadata):
+    presentation = metadata.get("presentation")
+    presentation = presentation if isinstance(presentation, dict) else {}
+    profile = presentation.get("profile", "standard")
+    compact = profile == "compact"
+    font_size = presentation.get(
+        "font_size_pt", metadata.get("font_size_pt", 9.2 if compact else 11)
+    )
+    if not isinstance(font_size, int | float) or isinstance(font_size, bool):
+        font_size = 9.2 if compact else 11
+    default_margin = 15 if compact else None
+    margins = {
+        "top": default_margin or 25,
+        "right": default_margin or 22,
+        "bottom": default_margin or 25,
+        "left": default_margin or 22,
+    }
+    configured_margins = presentation.get("margins_mm")
+    if isinstance(configured_margins, int | float) and not isinstance(
+        configured_margins, bool
+    ):
+        margins = dict.fromkeys(margins, configured_margins)
+    elif isinstance(configured_margins, dict):
+        margins.update(
+            {
+                edge: configured_margins[edge]
+                for edge in margins
+                if isinstance(configured_margins.get(edge), int | float)
+                and not isinstance(configured_margins.get(edge), bool)
+            }
+        )
+    heading = {
+        "before": 6 if compact else float(font_size) * 0.75,
+        "after": 3 if compact else float(font_size) * 0.5,
+    }
+    configured_heading = presentation.get("heading_spacing_pt")
+    if isinstance(configured_heading, dict):
+        heading.update(
+            {
+                edge: configured_heading[edge]
+                for edge in heading
+                if isinstance(configured_heading.get(edge), int | float)
+                and not isinstance(configured_heading.get(edge), bool)
+            }
+        )
+    caption = {
+        "before": 3 if compact else float(font_size) * 0.45,
+        "after": 3 if compact else float(font_size) * 0.65,
+    }
+    configured_caption = presentation.get("caption_spacing_pt")
+    if isinstance(configured_caption, dict):
+        caption.update(
+            {
+                edge: configured_caption[edge]
+                for edge in caption
+                if isinstance(configured_caption.get(edge), int | float)
+                and not isinstance(configured_caption.get(edge), bool)
+            }
+        )
+    title = {
+        "alignment": "center",
+        "size_pt": 16.5 if compact else 20,
+        "top_margin_mm": 20 if compact else 31,
+    }
+    configured_title = presentation.get("title")
+    if isinstance(configured_title, dict):
+        title.update(
+            {
+                key: configured_title[key]
+                for key in title
+                if key in configured_title
+            }
+        )
+    return {
+        "profile": profile,
+        "font_size_pt": float(font_size),
+        "margins_mm": margins,
+        "line_height": presentation.get("line_height", 1.25 if compact else 1.48),
+        "paragraph_spacing_pt": presentation.get(
+            "paragraph_spacing_pt", 3 if compact else float(font_size) * 0.65
+        ),
+        "heading_spacing_pt": heading,
+        "caption_spacing_pt": caption,
+        "title": title,
+        "columns": presentation.get("columns", 1),
+        "column_gap_mm": presentation.get("column_gap_mm", 7 if compact else 8),
+    }
+
+
+def cover_identities(metadata):
+    identities = [
+        identity
+        for identity in metadata.get("identities") or []
+        if isinstance(identity, dict)
+    ]
+    if identities:
+        return identities
+    if metadata.get("author") or metadata.get("identifier"):
+        return [
+            {
+                "name": metadata.get("author"),
+                "identifier": metadata.get("identifier"),
+            }
+        ]
+    return []
+
+
+def institution_details(metadata):
+    institution = metadata.get("institution")
+    if isinstance(institution, str):
+        return [institution] if institution.strip() else []
+    if not isinstance(institution, dict):
+        return []
+    return [
+        str(institution[field])
+        for field in ("name", "course", "faculty", "department")
+        if institution.get(field)
+    ]
+
+
+def render_html_cover(metadata):
+    options = cover_page_options(metadata)
+    if options is None:
+        return ""
+    title = html.escape(str(metadata["title"]))
+    subtitle = metadata.get("subtitle")
+    assessment = metadata.get("assessment")
+    date = metadata.get("date")
+    identities = cover_identities(metadata)
+    institution = institution_details(metadata)
+    pieces = ['<section class="cover-page">', f'<h1 class="cover-title">{title}</h1>']
+    if subtitle:
+        pieces.append(
+            f'<p class="cover-subtitle">{html.escape(str(subtitle))}</p>'
+        )
+    if assessment:
+        pieces.append(
+            f'<p class="cover-assessment">{html.escape(str(assessment))}</p>'
+        )
+    pieces.append('<div class="cover-details">')
+    if identities:
+        heading = options.get(
+            "author_heading", "Author" if len(identities) == 1 else "Authors"
+        )
+        pieces.append(
+            f'<section class="cover-author"><h2 class="cover-label cover-author-label">{html.escape(str(heading))}</h2>'
+        )
+        for identity in identities:
+            details = " · ".join(
+                html.escape(str(value))
+                for value in (
+                    identity.get("name"),
+                    identity.get("identifier"),
+                    identity.get("role"),
+                )
+                if value
+            )
+            if details:
+                pieces.append(f'<p class="cover-detail">{details}</p>')
+        pieces.append("</section>")
+    if institution:
+        heading = options.get("institution_heading", "Institution")
+        pieces.append(
+            f'<section class="cover-institution"><h2 class="cover-label">{html.escape(str(heading))}</h2>'
+        )
+        pieces.extend(
+            f'<p class="cover-detail">{html.escape(value)}</p>'
+            for value in institution
+        )
+        pieces.append("</section>")
+    if date:
+        pieces.append(f'<p class="cover-date">{html.escape(str(date))}</p>')
+    pieces.extend(("</div>", "</section>"))
+    return "\n".join(pieces)
+
+
+def render_html(project):
+    metadata = project.metadata
+    title = html.escape(metadata["title"])
+    subtitle = metadata.get("subtitle")
+    date = metadata.get("date")
+    settings = presentation_settings(metadata)
+    font_size = settings["font_size_pt"]
+    margins = settings["margins_mm"]
+    heading_spacing = settings["heading_spacing_pt"]
+    caption_spacing = settings["caption_spacing_pt"]
+    title_treatment = settings["title"]
+    cover = render_html_cover(metadata)
+    pieces = [cover] if cover else [f"<h1>{title}</h1>"]
+    if not cover:
+        if subtitle:
+            pieces.append(f'<p class="subtitle">{html.escape(subtitle)}</p>')
+        for identity in cover_identities(metadata):
+            details = " · ".join(
+                html.escape(str(value))
+                for value in (
+                    identity.get("name"),
+                    identity.get("identifier"),
+                    identity.get("role"),
+                )
+                if value
+            )
+            if details:
+                pieces.append(f'<p class="byline">{details}</p>')
+        if date:
+            pieces.append(f'<p class="byline">{html.escape(str(date))}</p>')
+    if metadata.get("table_of_contents") is True:
+        items = "".join(
+            f'<li><a href="#section-{index}">{html.escape(section.title)}</a></li>'
+            for index, section in enumerate(project.sections, 1)
+        )
+        pieces.append(f'<nav class="toc"><h2>Contents</h2><ol>{items}</ol></nav>')
+    previous_was_references = False
+    for index, section in enumerate(project.sections, 1):
+        if section.kind == "references":
+            pieces.append(html_references(project, section, index))
+            previous_was_references = True
+            continue
+        css_class = (
+            "section page-break"
+            if section.page_break_before or previous_was_references
+            else "section"
+        )
+        body = "\n".join(html_block(block, project) for block in section.blocks)
+        pieces.append(
+            f'<section id="section-{index}" class="{css_class}">{body}</section>'
+        )
+        previous_was_references = False
+    language = html.escape(metadata.get("language", "en"), quote=True)
+    body = "\n".join(pieces)
+    return f"""<!doctype html>
+<html lang="{language}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+@page {{ size: A4; margin: {margins['top']}mm {margins['right']}mm {margins['bottom']}mm {margins['left']}mm; }}
+:root {{ color: #000; background: #fff; font: {font_size:g}pt/{settings['line_height']:g} "CMU Serif", "Computer Modern", serif; }}
+body {{ box-sizing: border-box; max-width: 190mm; margin: 2rem auto; padding: 18mm 20mm; background: #fff; }}
+h1, h2, h3, h4 {{ color: #000; line-height: 1.2; break-after: avoid; }}
+h1 {{ margin-bottom: {heading_spacing['after']:g}pt; font-size: {title_treatment['size_pt']:g}pt; text-align: {title_treatment['alignment']}; }}
+h2, h3, h4 {{ margin-top: {heading_spacing['before']:g}pt; margin-bottom: {heading_spacing['after']:g}pt; }}
+h2 {{ border-bottom: 1px solid #999; padding-bottom: .25rem; }}
+.subtitle {{ color: #222; font-size: 1.15rem; margin-top: 0; }}
+.byline {{ color: #333; }}
+.cover-page {{ min-height: 248mm; display: flex; flex-direction: column; text-align: center; break-after: page; }}
+.cover-title {{ max-width: 155mm; margin: {title_treatment['top_margin_mm']:g}mm auto 0; font-size: {title_treatment['size_pt']:g}pt; text-align: {title_treatment['alignment']}; }}
+.cover-subtitle {{ margin: 1rem auto 0; font-size: 1.2rem; text-align: center; }}
+.cover-assessment {{ margin: 1.25rem auto 0; font-size: 1.1rem; text-align: center; }}
+.cover-details {{ margin: auto 0 31mm; }}
+.cover-page h2 {{ border: 0; margin: 1.6rem 0 .4rem; padding: 0; font-size: 1rem; letter-spacing: .06em; }}
+.cover-page p {{ margin: .3rem 0; text-align: center; }}
+.cover-date {{ margin-top: 1.6rem !important; }}
+a {{ color: inherit; text-decoration-thickness: .06em; text-underline-offset: .12em; }}
+section p {{ margin: 0 0 {settings['paragraph_spacing_pt']:g}pt; text-align: justify; text-justify: inter-word; hyphens: auto; widows: 3; orphans: 3; }}
+.section {{ column-count: {settings['columns']}; column-gap: {settings['column_gap_mm']:g}mm; }}
+.section h1, .section h2, .section h3, .section h4, figure, table {{ break-inside: avoid; }}
+figure {{ margin: {caption_spacing['before']:g}pt auto {caption_spacing['after']:g}pt; break-inside: avoid; text-align: center; }}
+figure img {{ height: auto; }}
+figcaption {{ margin: {caption_spacing['before']:g}pt 0 {caption_spacing['after']:g}pt; font-size: .92rem; color: #222; }}
+figure.table {{ text-align: left; }}
+table {{ width: 100%; border-collapse: collapse; font-size: .92rem; }}
+th {{ color: #000; background: #f2f2f2; }}
+th, td {{ padding: .45rem .55rem; border-bottom: 1px solid #aaa; vertical-align: top; }}
+blockquote {{ border-left: 3px solid #777; margin-left: 0; padding-left: 1rem; color: #222; }}
+pre {{ white-space: pre-wrap; background: #f4f4f4; padding: .8rem; overflow-wrap: anywhere; }}
+.references ol {{ padding-left: 0; list-style: none; }}
+.references li {{ margin: 0 0 .8rem 1.2cm; text-indent: -1.2cm; }}
+.toc {{ break-after: page; }}
+.page-break {{ break-before: page; }}
+@media print {{ body {{ margin: 0; padding: 0; max-width: none; }} }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+def render_latex(project):
+    metadata = project.metadata
+    settings = presentation_settings(metadata)
+    font_size = settings["font_size_pt"]
+    class_size = min((10, 11, 12), key=lambda value: abs(value - font_size))
+    baseline = font_size * settings["line_height"]
+    margins = settings["margins_mm"]
+    heading_spacing = settings["heading_spacing_pt"]
+    caption_spacing = settings["caption_spacing_pt"]
+    title_treatment = settings["title"]
+    title = latex_escape(metadata["title"])
+    subtitle = metadata.get("subtitle")
+    date = metadata.get("date", "")
+    assessment = metadata.get("assessment")
+    identities = cover_identities(metadata)
+    author_lines = []
+    for identity in identities:
+        author_lines.append(
+            r" \,\textperiodcentered\, ".join(
+                latex_escape(str(value))
+                for value in (
+                    identity.get("name"),
+                    identity.get("identifier"),
+                    identity.get("role"),
+                )
+                if value
+            )
+        )
+    institution = [latex_escape(value) for value in institution_details(metadata)]
+    alignment = {
+        "left": "flushleft",
+        "center": "center",
+        "right": "flushright",
+    }[title_treatment["alignment"]]
+    title_block = [
+        f"\\begin{{{alignment}}}",
+        f"{{\\fontsize{{{title_treatment['size_pt']:g}}}{{{title_treatment['size_pt'] * 1.2:g}}}\\selectfont\\bfseries {title}\\par}}",
+    ]
+    if subtitle:
+        title_block.extend(
+            (r"\vspace{0.8em}", f"{{\\large {latex_escape(str(subtitle))}\\par}}")
+        )
+    if assessment:
+        title_block.extend(
+            (r"\vspace{1em}", f"{{\\large {latex_escape(str(assessment))}\\par}}")
+        )
+    title_block.append(f"\\end{{{alignment}}}")
+    cover_options = cover_page_options(metadata)
+    if cover_options is not None:
+        cover = [
+            r"\begin{titlepage}",
+            r"\thispagestyle{empty}",
+            f"\\vspace*{{{title_treatment['top_margin_mm']:g}mm}}",
+            *title_block,
+            r"\vfill",
+        ]
+        if author_lines:
+            author_heading = cover_options.get(
+                "author_heading", "Author" if len(author_lines) == 1 else "Authors"
+            )
+            cover.extend(
+                (
+                    f"{{\\bfseries {latex_escape(str(author_heading))}\\par}}",
+                    r"\vspace{0.45em}",
+                    *(f"{line}\\par" for line in author_lines if line),
+                )
+            )
+        if institution:
+            institution_heading = cover_options.get(
+                "institution_heading", "Institution"
+            )
+            cover.extend(
+                (
+                    r"\vspace{1.6em}",
+                    f"{{\\bfseries {latex_escape(str(institution_heading))}\\par}}",
+                    r"\vspace{0.45em}",
+                    *(f"{line}\\par" for line in institution),
+                )
+            )
+        if date:
+            cover.extend((r"\vspace{1.6em}", f"{latex_escape(str(date))}\\par"))
+        cover.extend((r"\vspace*{20mm}", r"\end{titlepage}", r"\setcounter{page}{1}"))
+    else:
+        cover = title_block
+    content = []
+    for position, section in enumerate(project.sections):
+        if section.kind == "references":
+            if content and content[-1] != r"\clearpage":
+                content.append(r"\clearpage")
+            if settings["columns"] == 2:
+                content.append(r"\onecolumn")
+            content.extend(latex_references(project, section))
+            if position < len(project.sections) - 1:
+                content.append(r"\clearpage")
+                if settings["columns"] == 2:
+                    content.append(r"\twocolumn")
+            continue
+        if section.page_break_before:
+            content.append(r"\clearpage")
+        content.extend(latex_block(block, project) for block in section.blocks)
+    toc = (
+        r"\tableofcontents\clearpage"
+        if metadata.get("table_of_contents") is True
+        else ""
+    )
+    column_command = r"\twocolumn" if settings["columns"] == 2 else ""
+    if cover_options is None and settings["columns"] == 2:
+        cover = [r"\twocolumn[", *cover, r"\vspace{1em}]"]
+        column_command = ""
+    return "\n".join(
+        (
+            f"\\documentclass[{class_size}pt,a4paper]{{article}}",
+            r"\usepackage[T1]{fontenc}",
+            r"\usepackage{lmodern}",
+            f"\\usepackage[top={margins['top']:g}mm,right={margins['right']:g}mm,bottom={margins['bottom']:g}mm,left={margins['left']:g}mm]{{geometry}}",
+            r"\usepackage{microtype}",
+            r"\usepackage{graphicx}",
+            r"\usepackage{booktabs}",
+            r"\usepackage{tabularx}",
+            r"\usepackage{float}",
+            r"\usepackage{hanging}",
+            r"\usepackage{titlesec}",
+            r"\usepackage{caption}",
+            r"\usepackage[hidelinks]{hyperref}",
+            r"\setlength{\parindent}{0pt}",
+            f"\\setlength{{\\parskip}}{{{settings['paragraph_spacing_pt']:g}pt}}",
+            f"\\setlength{{\\columnsep}}{{{settings['column_gap_mm']:g}mm}}",
+            f"\\setlength{{\\abovecaptionskip}}{{{caption_spacing['before']:g}pt}}",
+            f"\\setlength{{\\belowcaptionskip}}{{{caption_spacing['after']:g}pt}}",
+            f"\\titlespacing*{{\\section}}{{0pt}}{{{heading_spacing['before']:g}pt}}{{{heading_spacing['after']:g}pt}}",
+            f"\\titlespacing*{{\\subsection}}{{0pt}}{{{heading_spacing['before']:g}pt}}{{{heading_spacing['after']:g}pt}}",
+            f"\\titlespacing*{{\\subsubsection}}{{0pt}}{{{heading_spacing['before']:g}pt}}{{{heading_spacing['after']:g}pt}}",
+            r"\begin{document}",
+            f"\\fontsize{{{font_size:g}}}{{{baseline:g}}}\\selectfont",
+            *cover,
+            column_command,
+            toc,
+            *content,
+            r"\end{document}",
+            "",
+        )
+    )
+
+
+class TrueTypeFont:
+    def __init__(self, path, name, italic=False):
+        self.data = path.read_bytes()
+        self.name = re.sub(r"[^A-Za-z0-9-]", "", name)
+        self.italic = italic
+        self.tables = {}
+        table_count = struct.unpack_from(">H", self.data, 4)[0]
+        for position in range(table_count):
+            offset = 12 + position * 16
+            tag, _, table_offset, length = struct.unpack_from(
+                ">4sIII", self.data, offset
+            )
+            self.tables[tag.decode("ascii")] = (table_offset, length)
+        head = self.table("head")
+        hhea = self.table("hhea")
+        maxp = self.table("maxp")
+        self.units = struct.unpack_from(">H", head, 18)[0]
+        self.bbox = struct.unpack_from(">hhhh", head, 36)
+        self.ascent, self.descent = struct.unpack_from(">hh", hhea, 4)
+        self.metric_count = struct.unpack_from(">H", hhea, 34)[0]
+        self.glyph_count = struct.unpack_from(">H", maxp, 4)[0]
+        hmtx = self.table("hmtx")
+        self.widths = [
+            struct.unpack_from(">H", hmtx, position * 4)[0]
+            for position in range(self.metric_count)
+        ]
+        if self.metric_count < self.glyph_count:
+            self.widths.extend(
+                [self.widths[-1]] * (self.glyph_count - self.metric_count)
+            )
+        self.cmap_format, self.cmap = self.read_cmap()
+        self.used = {}
+
+    def table(self, name):
+        offset, length = self.tables[name]
+        return memoryview(self.data)[offset : offset + length]
+
+    def read_cmap(self):
+        cmap = self.table("cmap")
+        count = struct.unpack_from(">H", cmap, 2)[0]
+        candidates = []
+        for position in range(count):
+            platform, encoding, offset = struct.unpack_from(">HHI", cmap, 4 + position * 8)
+            format_number = struct.unpack_from(">H", cmap, offset)[0]
+            score = (
+                4
+                if format_number == 12 and platform == 3 and encoding == 10
+                else 3
+                if format_number == 12
+                else 2
+                if format_number == 4 and platform == 3
+                else 1
+                if format_number == 4
+                else 0
+            )
+            if score:
+                candidates.append((score, format_number, cmap[offset:]))
+        if not candidates:
+            raise ValueError(f"font has no Unicode cmap: {self.name}")
+        _, format_number, selected = max(candidates, key=lambda item: item[0])
+        if format_number == 12:
+            group_count = struct.unpack_from(">I", selected, 12)[0]
+            groups = [
+                struct.unpack_from(">III", selected, 16 + position * 12)
+                for position in range(group_count)
+            ]
+            return 12, groups
+        segment_count = struct.unpack_from(">H", selected, 6)[0] // 2
+        end_offset = 14
+        start_offset = end_offset + segment_count * 2 + 2
+        delta_offset = start_offset + segment_count * 2
+        range_offset = delta_offset + segment_count * 2
+        segments = []
+        for position in range(segment_count):
+            end = struct.unpack_from(">H", selected, end_offset + position * 2)[0]
+            start = struct.unpack_from(">H", selected, start_offset + position * 2)[0]
+            delta = struct.unpack_from(">h", selected, delta_offset + position * 2)[0]
+            range_value_offset = range_offset + position * 2
+            range_value = struct.unpack_from(">H", selected, range_value_offset)[0]
+            segments.append(
+                (start, end, delta, range_value, range_value_offset, selected)
+            )
+        return 4, segments
+
+    def glyph(self, codepoint):
+        if self.cmap_format == 12:
+            low = 0
+            high = len(self.cmap)
+            while low < high:
+                middle = (low + high) // 2
+                start, end, first = self.cmap[middle]
+                if codepoint < start:
+                    high = middle
+                elif codepoint > end:
+                    low = middle + 1
+                else:
+                    return first + codepoint - start
+            return 0
+        if codepoint > 0xFFFF:
+            return 0
+        for start, end, delta, range_value, range_offset, selected in self.cmap:
+            if not start <= codepoint <= end:
+                continue
+            if range_value == 0:
+                return (codepoint + delta) & 0xFFFF
+            glyph_offset = range_offset + range_value + 2 * (codepoint - start)
+            if glyph_offset + 2 > len(selected):
+                return 0
+            glyph = struct.unpack_from(">H", selected, glyph_offset)[0]
+            return (glyph + delta) & 0xFFFF if glyph else 0
+        return 0
+
+    def width(self, text, size):
+        total = sum(self.widths[self.glyph(ord(character))] for character in text)
+        return total * size / self.units
+
+    def encode(self, text):
+        encoded = bytearray()
+        for character in text:
+            codepoint = ord(character)
+            glyph = self.glyph(codepoint)
+            if glyph == 0 and character != "\0":
+                glyph = self.glyph(ord("?"))
+            self.used.setdefault(glyph, codepoint)
+            encoded.extend(struct.pack(">H", glyph))
+        return encoded.hex().upper()
+
+    def scaled(self, value):
+        return round(value * 1000 / self.units)
+
+    def pdf_objects(self, document):
+        font_file = document.stream(
+            {"Length1": len(self.data)}, self.data, compress=True
+        )
+        descriptor = document.add(
+            (
+                f"<< /Type /FontDescriptor /FontName /{self.name} "
+                f"/Flags {98 if self.italic else 34} /FontBBox "
+                f"[{' '.join(str(self.scaled(value)) for value in self.bbox)}] "
+                f"/ItalicAngle {-12 if self.italic else 0} /Ascent {self.scaled(self.ascent)} "
+                f"/Descent {self.scaled(self.descent)} /CapHeight {self.scaled(self.ascent)} "
+                f"/StemV 80 /FontFile2 {font_file} 0 R >>"
+            ).encode()
+        )
+        widths = " ".join(
+            f"{glyph} [{self.scaled(self.widths[glyph])}]"
+            for glyph in sorted(self.used)
+        )
+        descendant = document.add(
+            (
+                f"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{self.name} "
+                "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> "
+                f"/FontDescriptor {descriptor} 0 R /DW 1000 /W [{widths}] "
+                "/CIDToGIDMap /Identity >>"
+            ).encode()
+        )
+        mappings = [
+            f"<{glyph:04X}> <{chr(codepoint).encode('utf-16-be').hex().upper()}>"
+            for glyph, codepoint in sorted(self.used.items())
+        ]
+        cmap_lines = [
+            "/CIDInit /ProcSet findresource begin",
+            "12 dict begin",
+            "begincmap",
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+            f"/CMapName /{self.name}-UCS def",
+            "/CMapType 2 def",
+            "1 begincodespacerange",
+            "<0000> <FFFF>",
+            "endcodespacerange",
+        ]
+        for position in range(0, len(mappings), 100):
+            group = mappings[position : position + 100]
+            cmap_lines.extend([f"{len(group)} beginbfchar", *group, "endbfchar"])
+        cmap_lines.extend(
+            ["endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end"]
+        )
+        to_unicode = document.stream({}, "\n".join(cmap_lines).encode(), compress=True)
+        return document.add(
+            (
+                f"<< /Type /Font /Subtype /Type0 /BaseFont /{self.name} "
+                f"/Encoding /Identity-H /DescendantFonts [{descendant} 0 R] "
+                f"/ToUnicode {to_unicode} 0 R >>"
+            ).encode()
+        )
+
+
+class PdfDocument:
+    def __init__(self):
+        self.objects = [None]
+
+    def reserve(self):
+        self.objects.append(None)
+        return len(self.objects) - 1
+
+    def set(self, identifier, value):
+        self.objects[identifier] = value
+
+    def add(self, value):
+        identifier = self.reserve()
+        self.set(identifier, value)
+        return identifier
+
+    def stream(self, attributes, data, compress=False):
+        if compress:
+            data = zlib.compress(data, 9)
+            attributes = {**attributes, "Filter": "/FlateDecode"}
+        entries = " ".join(
+            f"/{key} {value if isinstance(value, str) and value.startswith('/') else value}"
+            for key, value in attributes.items()
+        )
+        header = f"<< {entries} /Length {len(data)} >>\nstream\n".encode()
+        return self.add(header + data + b"\nendstream")
+
+    def build(self, root):
+        output = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+        offsets = [0]
+        for identifier, value in enumerate(self.objects[1:], 1):
+            if value is None:
+                raise ValueError(f"unresolved PDF object {identifier}")
+            offsets.append(len(output))
+            output.extend(f"{identifier} 0 obj\n".encode())
+            output.extend(value)
+            output.extend(b"\nendobj\n")
+        xref = len(output)
+        output.extend(f"xref\n0 {len(self.objects)}\n".encode())
+        output.extend(b"0000000000 65535 f \n")
+        for offset in offsets[1:]:
+            output.extend(f"{offset:010d} 00000 n \n".encode())
+        output.extend(
+            (
+                f"trailer\n<< /Size {len(self.objects)} /Root {root} 0 R >>\n"
+                f"startxref\n{xref}\n%%EOF\n"
+            ).encode()
+        )
+        return bytes(output)
+
+
+@dataclass
+class HtmlNode:
+    tag: str
+    attrs: dict
+    children: list = field(default_factory=list)
+
+
+class ReportHtmlParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = HtmlNode("document", {})
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = HtmlNode(tag, dict(attrs))
+        self.stack[-1].children.append(node)
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "wbr"}:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if self.stack[-1].tag == tag:
+            self.stack.pop()
+
+    def handle_endtag(self, tag):
+        for position in range(len(self.stack) - 1, 0, -1):
+            if self.stack[position].tag == tag:
+                del self.stack[position:]
+                return
+
+    def handle_data(self, data):
+        self.stack[-1].children.append(data)
+
+
+class PdfImage:
+    def __init__(self, path):
+        self.path = path
+        data = path.read_bytes()
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            self.read_png(data)
+        elif data.startswith(b"\xff\xd8"):
+            self.read_jpeg(data)
+        else:
+            raise ValueError(f"native PDF figures require PNG or JPEG: {path.name}")
+
+    def read_png(self, data):
+        position = 8
+        chunks = {}
+        while position + 12 <= len(data):
+            length = struct.unpack_from(">I", data, position)[0]
+            kind = data[position + 4 : position + 8]
+            value = data[position + 8 : position + 8 + length]
+            chunks.setdefault(kind, []).append(value)
+            position += length + 12
+            if kind == b"IEND":
+                break
+        header = chunks.get(b"IHDR", [b""])[0]
+        if len(header) != 13:
+            raise ValueError(f"invalid PNG header: {self.path.name}")
+        self.width, self.height, depth, colour_type, compression, filtering, interlace = struct.unpack(
+            ">IIBBBBB", header
+        )
+        if depth != 8 or compression != 0 or filtering != 0 or interlace != 0:
+            raise ValueError(
+                f"native PDF supports non-interlaced 8-bit PNG figures: {self.path.name}"
+            )
+        channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(colour_type)
+        if not channels:
+            raise ValueError(f"unsupported PNG colour type: {self.path.name}")
+        compressed = b"".join(chunks.get(b"IDAT", []))
+        decoded = zlib.decompress(compressed)
+        stride = self.width * channels
+        rows = []
+        previous = bytearray(stride)
+        offset = 0
+        for _ in range(self.height):
+            filter_type = decoded[offset]
+            source = decoded[offset + 1 : offset + 1 + stride]
+            offset += stride + 1
+            row = bytearray(stride)
+            for column, value in enumerate(source):
+                left = row[column - channels] if column >= channels else 0
+                above = previous[column]
+                upper_left = previous[column - channels] if column >= channels else 0
+                if filter_type == 0:
+                    result = value
+                elif filter_type == 1:
+                    result = value + left
+                elif filter_type == 2:
+                    result = value + above
+                elif filter_type == 3:
+                    result = value + ((left + above) // 2)
+                elif filter_type == 4:
+                    prediction = left + above - upper_left
+                    distances = (
+                        abs(prediction - left),
+                        abs(prediction - above),
+                        abs(prediction - upper_left),
+                    )
+                    predictor = (left, above, upper_left)[distances.index(min(distances))]
+                    result = value + predictor
+                else:
+                    raise ValueError(f"invalid PNG row filter: {self.path.name}")
+                row[column] = result & 0xFF
+            rows.append(row)
+            previous = row
+        palette = b"".join(chunks.get(b"PLTE", []))
+        transparency = b"".join(chunks.get(b"tRNS", []))
+        rgb = bytearray()
+        alpha = bytearray()
+        for row in rows:
+            for column in range(self.width):
+                start = column * channels
+                if colour_type == 0:
+                    value = row[start]
+                    rgb.extend((value, value, value))
+                elif colour_type == 2:
+                    rgb.extend(row[start : start + 3])
+                elif colour_type == 3:
+                    index = row[start]
+                    palette_start = index * 3
+                    if palette_start + 3 > len(palette):
+                        raise ValueError(f"invalid PNG palette: {self.path.name}")
+                    rgb.extend(palette[palette_start : palette_start + 3])
+                    alpha.append(transparency[index] if index < len(transparency) else 255)
+                elif colour_type == 4:
+                    value = row[start]
+                    rgb.extend((value, value, value))
+                    alpha.append(row[start + 1])
+                else:
+                    rgb.extend(row[start : start + 3])
+                    alpha.append(row[start + 3])
+        self.colour_space = "/DeviceRGB"
+        self.bits = 8
+        self.data = bytes(rgb)
+        self.alpha = bytes(alpha) if alpha and any(value != 255 for value in alpha) else b""
+        self.filter = "/FlateDecode"
+
+    def read_jpeg(self, data):
+        position = 2
+        width = height = components = 0
+        while position + 4 <= len(data):
+            if data[position] != 0xFF:
+                position += 1
+                continue
+            marker = data[position + 1]
+            position += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            length = struct.unpack_from(">H", data, position)[0]
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}:
+                _, height, width, components = struct.unpack_from(">BHHB", data, position + 2)
+                break
+            position += length
+        if not width or not height:
+            raise ValueError(f"invalid JPEG dimensions: {self.path.name}")
+        self.width = width
+        self.height = height
+        self.colour_space = "/DeviceGray" if components == 1 else "/DeviceRGB"
+        self.bits = 8
+        self.data = data
+        self.alpha = b""
+        self.filter = "/DCTDecode"
+
+    def pdf_object(self, document):
+        alpha_object = 0
+        if self.alpha:
+            alpha_object = document.stream(
+                {
+                    "Type": "/XObject",
+                    "Subtype": "/Image",
+                    "Width": self.width,
+                    "Height": self.height,
+                    "ColorSpace": "/DeviceGray",
+                    "BitsPerComponent": 8,
+                },
+                self.alpha,
+                compress=True,
+            )
+        attributes = {
+            "Type": "/XObject",
+            "Subtype": "/Image",
+            "Width": self.width,
+            "Height": self.height,
+            "ColorSpace": self.colour_space,
+            "BitsPerComponent": self.bits,
+        }
+        if alpha_object:
+            attributes["SMask"] = f"{alpha_object} 0 R"
+        return document.stream(
+            attributes,
+            self.data,
+            compress=self.filter == "/FlateDecode",
+        ) if self.filter == "/FlateDecode" else document.stream(
+            {**attributes, "Filter": self.filter}, self.data
+        )
+
+
+class NativePdfRenderer:
+    width = 595.276
+    height = 841.89
+
+    def __init__(self, project):
+        self.project = project
+        self.settings = presentation_settings(project.metadata)
+        self.base_size = self.settings["font_size_pt"]
+        points_per_mm = 72 / 25.4
+        margins = self.settings["margins_mm"]
+        self.margin_top = margins["top"] * points_per_mm
+        self.margin_right = margins["right"] * points_per_mm
+        self.margin_bottom = margins["bottom"] * points_per_mm
+        self.margin_left = margins["left"] * points_per_mm
+        self.column_count = self.settings["columns"]
+        self.column_gap = self.settings["column_gap_mm"] * points_per_mm
+        self.column = 0
+        self.in_cover = False
+        self.full_width = False
+        self.fonts = self.load_fonts()
+        self.images = {}
+        self.pages = []
+        self.destinations = {}
+        self.new_page()
+
+    def font_path(self, filename):
+        configured = os.environ.get("REPORT_BUILD_FONT_DIR")
+        roots = [
+            *([Path(configured)] if configured else []),
+            Path("/usr/share/fonts"),
+            Path("/usr/local/share/fonts"),
+            Path.home() / ".local/share/fonts",
+        ]
+        for root in roots:
+            if not root.is_dir():
+                continue
+            match = next(root.rglob(filename), None)
+            if match:
+                return match
+        fail(
+            f"native PDF output requires {filename}; run "
+            "scripts/install-report-fonts.sh or set REPORT_BUILD_FONT_DIR",
+            2,
+        )
+
+    def load_fonts(self):
+        definitions = {
+            "regular": (
+                "cmunrm.ttf",
+                "CMUSerif-Roman",
+                False,
+            ),
+            "bold": (
+                "cmunbx.ttf",
+                "CMUSerif-Bold",
+                False,
+            ),
+            "italic": (
+                "cmunti.ttf",
+                "CMUSerif-Italic",
+                True,
+            ),
+            "bolditalic": (
+                "cmunbi.ttf",
+                "CMUSerif-BoldItalic",
+                True,
+            ),
+        }
+        return {
+            style: TrueTypeFont(self.font_path(filename), name, italic)
+            for style, (filename, name, italic) in definitions.items()
+        }
+
+    def new_page(self):
+        self.pages.append(
+            {
+                "commands": [],
+                "links": [],
+                "images": [],
+                "lines": [],
+                "numbered": True,
+            }
+        )
+        self.page = len(self.pages) - 1
+        self.column = 0
+        self.y = self.height - self.margin_top
+
+    def page_number_command(self, page_number):
+        text = str(page_number)
+        size = max(9, self.base_size - 2)
+        x = (self.width - self.measure(text, "regular", size)) / 2
+        return ("regular", size, x, self.margin_bottom / 2, text, (0, 0, 0))
+
+    def active_column_count(self):
+        return 1 if self.in_cover or self.full_width else self.column_count
+
+    def content_width(self):
+        width = self.width - self.margin_left - self.margin_right
+        columns = self.active_column_count()
+        return (width - self.column_gap * (columns - 1)) / columns
+
+    def content_left(self):
+        return self.margin_left + self.column * (self.content_width() + self.column_gap)
+
+    def page_break(self):
+        if self.pages[self.page]["commands"]:
+            self.new_page()
+
+    def ensure_space(self, height):
+        if self.y - height >= self.margin_bottom:
+            return
+        if not self.in_cover and self.column < self.column_count - 1:
+            self.column += 1
+            self.y = self.height - self.margin_top
+            return
+        self.new_page()
+
+    def measure(self, text, style, size):
+        return self.fonts[style].width(text, size)
+
+    def add_command(self, text, style, size, x, colour, link=None):
+        if not text:
+            return
+        width = self.measure(text, style, size)
+        self.pages[self.page]["commands"].append(
+            (style, size, x, self.y, text, colour)
+        )
+        if link and text.strip():
+            self.pages[self.page]["links"].append(
+                (x, self.y - size * 0.22, x + width, self.y + size, link)
+            )
+
+    def compact_spans(self, spans):
+        compact = []
+        for span in spans:
+            text = re.sub(r"\s+", " ", span["text"])
+            if not text:
+                continue
+            value = {**span, "text": text}
+            if compact and all(
+                compact[-1].get(key) == value.get(key)
+                for key in ("style", "link")
+            ):
+                compact[-1]["text"] += text
+            else:
+                compact.append(value)
+        return compact
+
+    def span_units(self, spans):
+        units = []
+        for span in self.compact_spans(spans):
+            for value in re.findall(r"\s+|\S+", span["text"]):
+                if value.isspace():
+                    if units and not units[-1]["text"].endswith(" "):
+                        units[-1]["text"] += " "
+                    continue
+                units.append({**span, "text": value})
+        return units
+
+    def append_line_span(self, line, span):
+        if line and all(
+            line[-1].get(key) == span.get(key) for key in ("style", "link")
+        ):
+            line[-1]["text"] += span["text"]
+        else:
+            line.append(dict(span))
+
+    def wrapped_lines(self, spans, size, first_width, later_width):
+        lines = []
+        line = []
+        line_width = 0
+        limit = first_width
+        for unit in self.span_units(spans):
+            value = unit["text"]
+            unit_width = self.measure(value, unit["style"], size)
+            if line and line_width + unit_width > limit:
+                if value[0] in ".,;:!?)]}":
+                    self.append_line_span(line, unit)
+                    line_width += unit_width
+                    continue
+                carry = []
+                if line[-1]["text"].endswith(("(", "[", "{", "“")):
+                    opener = line[-1]["text"][-1]
+                    carry.append({**line[-1], "text": opener})
+                    line[-1]["text"] = line[-1]["text"][:-1].rstrip()
+                    if not line[-1]["text"]:
+                        line.pop()
+                lines.append(line)
+                line = carry
+                line_width = sum(
+                    self.measure(span["text"], span["style"], size)
+                    for span in line
+                )
+                limit = later_width
+            if unit_width <= limit:
+                self.append_line_span(line, unit)
+                line_width += unit_width
+                continue
+            for character in value:
+                character_width = self.measure(character, unit["style"], size)
+                if line and line_width + character_width > limit:
+                    line[-1]["text"] = line[-1]["text"].rstrip()
+                    lines.append(line)
+                    line = []
+                    line_width = 0
+                    limit = later_width
+                self.append_line_span(line, {**unit, "text": character})
+                line_width += character_width
+        if line:
+            line[-1]["text"] = line[-1]["text"].rstrip()
+            lines.append(line)
+        return lines
+
+    def write_spans(
+        self,
+        spans,
+        size=None,
+        left=0,
+        right=0,
+        hanging=0,
+        before=0,
+        after=None,
+        colour=(0, 0, 0),
+        destination=None,
+        justify=False,
+        align="left",
+    ):
+        size = size or self.base_size
+        after = (
+            self.settings["paragraph_spacing_pt"] if after is None else after
+        )
+        line_height = size * self.settings["line_height"]
+        available = self.content_width() - left - right
+        lines = self.wrapped_lines(spans, size, available, available - hanging)
+        self.ensure_space(before + line_height)
+        self.y -= before
+        if destination:
+            self.destinations[destination] = (self.page, self.y + size)
+        for position, line in enumerate(lines):
+            self.ensure_space(line_height)
+            indent = hanging if position else 0
+            x = self.content_left() + left + indent
+            target_width = available - indent
+            line_width = sum(
+                self.measure(span["text"], span["style"], size) for span in line
+            )
+            if align == "center":
+                x += max(0, target_width - line_width) / 2
+            elif align == "right":
+                x += max(0, target_width - line_width)
+            spaces = sum(span["text"].count(" ") for span in line)
+            extra_space = (
+                max(0, target_width - line_width) / spaces
+                if justify and align == "left" and position < len(lines) - 1 and spaces
+                else 0
+            )
+            for span in line:
+                fragments = (
+                    re.findall(r" +|[^ ]+", span["text"])
+                    if extra_space
+                    else [span["text"]]
+                )
+                for fragment in fragments:
+                    self.add_command(
+                        fragment,
+                        span["style"],
+                        size,
+                        x,
+                        colour,
+                        span.get("link"),
+                    )
+                    x += self.measure(fragment, span["style"], size)
+                    if fragment.isspace():
+                        x += extra_space * len(fragment)
+            self.y -= line_height
+        self.y -= after
+
+    def inline_spans(self, node, style="regular", link=None):
+        spans = []
+        for child in node.children:
+            if isinstance(child, str):
+                spans.append({"text": child, "style": style, "link": link})
+                continue
+            child_style = style
+            if child.tag in {"strong", "b"}:
+                child_style = "bolditalic" if style == "italic" else "bold"
+            elif child.tag in {"em", "i"}:
+                child_style = "bolditalic" if style == "bold" else "italic"
+            child_link = child.attrs.get("href", link) if child.tag == "a" else link
+            if child.tag == "br":
+                spans.append({"text": " ", "style": style, "link": link})
+            else:
+                spans.extend(self.inline_spans(child, child_style, child_link))
+        return self.compact_spans(spans)
+
+    def text_content(self, node):
+        return "".join(
+            child if isinstance(child, str) else self.text_content(child)
+            for child in node.children
+        ).strip()
+
+    def render_list(self, node, ordered=False):
+        items = [child for child in node.children if isinstance(child, HtmlNode) and child.tag == "li"]
+        references = bool(items) and all(
+            item.attrs.get("id", "").startswith("ref-") for item in items
+        )
+        for position, item in enumerate(items, 1):
+            destination = item.attrs.get("id")
+            if references:
+                self.write_spans(
+                    self.inline_spans(item),
+                    hanging=34,
+                    destination=destination,
+                    after=self.base_size * 0.8,
+                )
+                continue
+            marker = f"{position}. " if ordered else "• "
+            spans = [
+                {"text": marker, "style": "regular", "link": None},
+                *self.inline_spans(item),
+            ]
+            self.write_spans(spans, left=18, hanging=14, after=self.base_size * 0.3)
+
+    def render_table(self, node):
+        rows = []
+        for row in self.find_all(node, "tr"):
+            cells = [
+                self.inline_spans(child)
+                for child in row.children
+                if isinstance(child, HtmlNode) and child.tag in {"th", "td"}
+            ]
+            if cells:
+                rows.append(cells)
+        if not rows:
+            return
+        column_count = max(len(row) for row in rows)
+        table_width = self.content_width()
+        gap = 10
+        column_width = (table_width - gap * (column_count - 1)) / column_count
+        size = max(8, self.base_size - 2)
+        line_height = size * 1.35
+
+        def prepare_row(row, header=False):
+            cells = [
+                self.wrapped_lines(
+                    [
+                        {
+                            **span,
+                            "style": "bold" if header else span["style"],
+                        }
+                        for span in cell
+                    ],
+                    size,
+                    column_width,
+                    column_width,
+                )
+                for cell in row
+            ]
+            row_height = max((len(cell) for cell in cells), default=1) * line_height + 8
+            return cells, row_height
+
+        def draw_row(cells, row_height, header=False):
+            top = self.y
+            if header:
+                self.pages[self.page]["lines"].append(
+                    (
+                        self.content_left(),
+                        top + 3,
+                        self.content_left() + table_width,
+                        top + 3,
+                        0.8,
+                    )
+                )
+            for column, cell in enumerate(cells):
+                x_origin = self.content_left() + column * (column_width + gap)
+                for line_number, line in enumerate(cell):
+                    x = x_origin
+                    baseline = top - 3 - size - line_number * line_height
+                    previous_y = self.y
+                    self.y = baseline
+                    for span in line:
+                        self.add_command(
+                            span["text"],
+                            span["style"],
+                            size,
+                            x,
+                            (0, 0, 0),
+                            span.get("link"),
+                        )
+                        x += self.measure(span["text"], span["style"], size)
+                    self.y = previous_y
+            self.y = top - row_height
+            self.pages[self.page]["lines"].append(
+                (
+                    self.content_left(),
+                    self.y + 3,
+                    self.content_left() + table_width,
+                    self.y + 3,
+                    0.8 if header else 0.35,
+                )
+            )
+
+        prepared_rows = [
+            prepare_row(row, header=position == 0)
+            for position, row in enumerate(rows)
+        ]
+        header_cells, header_height = prepared_rows[0]
+        self.ensure_space(header_height)
+        draw_row(header_cells, header_height, header=True)
+        for cells, row_height in prepared_rows[1:]:
+            if self.y - row_height < self.margin_bottom:
+                self.ensure_space(header_height + row_height)
+                draw_row(header_cells, header_height, header=True)
+            draw_row(cells, row_height)
+        self.y -= self.base_size * 0.7
+
+    def render_image(self, node):
+        source = node.attrs.get("src", "")
+        relative = source[3:] if source.startswith("../") else source
+        path = safe_path(self.project.root, relative)
+        if not path.is_file():
+            raise ValueError(f"figure does not exist: {relative}")
+        key = str(path)
+        if key not in self.images:
+            self.images[key] = PdfImage(path)
+        image = self.images[key]
+        style = node.attrs.get("style", "")
+        width_match = re.search(r"max-width:\s*([0-9.]+)%", style)
+        fraction = float(width_match.group(1)) / 100 if width_match else 1
+        available_width = self.content_width() * min(1, fraction)
+        rendered_width = available_width
+        rendered_height = rendered_width * image.height / image.width
+        maximum_height = self.height - self.margin_top - self.margin_bottom
+        if rendered_height > maximum_height:
+            scale = maximum_height / rendered_height
+            rendered_width *= scale
+            rendered_height *= scale
+        self.ensure_space(rendered_height + self.base_size)
+        x = self.content_left() + (self.content_width() - rendered_width) / 2
+        bottom = self.y - rendered_height
+        self.pages[self.page]["images"].append(
+            (key, x, bottom, rendered_width, rendered_height)
+        )
+        self.y = bottom - self.base_size * 1.3
+
+    def find_all(self, node, tag):
+        found = []
+        for child in node.children:
+            if not isinstance(child, HtmlNode):
+                continue
+            if child.tag == tag:
+                found.append(child)
+            found.extend(self.find_all(child, tag))
+        return found
+
+    def render_node(self, node):
+        if isinstance(node, str):
+            return
+        classes = node.attrs.get("class", "").split()
+        if node.tag == "section" and "cover-page" in classes:
+            if self.pages[self.page]["commands"]:
+                self.new_page()
+            self.pages[self.page]["numbered"] = False
+            self.in_cover = True
+            title_margin = self.settings["title"]["top_margin_mm"] * 72 / 25.4
+            self.y = self.height - self.margin_top - title_margin
+            for child in node.children:
+                self.render_node(child)
+            self.in_cover = False
+            self.new_page()
+            return
+        if node.tag == "section" and "references" in classes:
+            self.page_break()
+            self.full_width = True
+            self.column = 0
+            for child in node.children:
+                self.render_node(child)
+            self.full_width = False
+            return
+        if node.tag == "section" and "page-break" in classes:
+            self.page_break()
+        if node.tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            level = int(node.tag[1])
+            if "cover-title" in classes:
+                size = self.settings["title"]["size_pt"]
+                before = 0
+                after = self.base_size * 1.2
+                align = self.settings["title"]["alignment"]
+            elif "cover-label" in classes:
+                size = self.base_size
+                before = (
+                    self.base_size * 6
+                    if "cover-author-label" in classes
+                    else self.base_size * 1.4
+                )
+                after = self.base_size * 0.4
+                align = "center"
+            else:
+                size = {
+                    1: self.settings["title"]["size_pt"],
+                    2: self.base_size * 1.36,
+                    3: self.base_size * 1.18,
+                    4: self.base_size * 1.09,
+                }.get(level, self.base_size)
+                before = self.settings["heading_spacing_pt"]["before"]
+                after = self.settings["heading_spacing_pt"]["after"]
+                align = "left"
+            self.write_spans(
+                self.inline_spans(node, "bold"),
+                size=size,
+                before=before,
+                after=after,
+                colour=(0, 0, 0),
+                destination=node.attrs.get("id"),
+                align=align,
+            )
+            return
+        if node.tag == "p":
+            cover_text = bool(
+                {"cover-subtitle", "cover-assessment", "cover-detail", "cover-date"}
+                & set(classes)
+            )
+            self.write_spans(
+                self.inline_spans(node),
+                justify=not cover_text
+                and not ({"subtitle", "byline"} & set(classes)),
+                align="center" if cover_text else "left",
+                after=(
+                    self.base_size * 0.35
+                    if cover_text
+                    else self.settings["paragraph_spacing_pt"]
+                ),
+            )
+            return
+        if node.tag in {"ol", "ul"}:
+            self.render_list(node, node.tag == "ol")
+            return
+        if node.tag == "blockquote":
+            self.write_spans(self.inline_spans(node, "italic"), left=22, right=12)
+            return
+        if node.tag == "pre":
+            self.write_spans(
+                [{"text": self.text_content(node), "style": "regular", "link": None}],
+                size=max(8, self.base_size - 1),
+                left=14,
+                right=14,
+            )
+            return
+        if node.tag == "table":
+            self.render_table(node)
+            return
+        if node.tag == "figcaption":
+            self.write_spans(
+                self.inline_spans(node, "italic"),
+                size=max(8, self.base_size - 1),
+                left=18,
+                right=18,
+                before=self.settings["caption_spacing_pt"]["before"],
+                after=self.settings["caption_spacing_pt"]["after"],
+            )
+            return
+        if node.tag == "img":
+            self.render_image(node)
+            return
+        for child in node.children:
+            self.render_node(child)
+
+    def render(self, source):
+        parser = ReportHtmlParser()
+        parser.feed(source)
+        body = next(
+            (node for node in self.find_all(parser.root, "body")), parser.root
+        )
+        self.render_node(body)
+
+    def pdf(self):
+        document = PdfDocument()
+        catalog = document.reserve()
+        pages_object = document.reserve()
+        page_objects = [document.reserve() for _ in self.pages]
+        displayed_page_number = 0
+        for page in self.pages:
+            for style, _, _, _, text, _ in page["commands"]:
+                self.fonts[style].encode(text)
+            if page["numbered"]:
+                displayed_page_number += 1
+                self.fonts["regular"].encode(str(displayed_page_number))
+        font_objects = {
+            style: font.pdf_objects(document) for style, font in self.fonts.items()
+        }
+        image_objects = {
+            key: image.pdf_object(document) for key, image in self.images.items()
+        }
+        image_names = {
+            key: f"Im{position}"
+            for position, key in enumerate(sorted(self.images), 1)
+        }
+        resource_names = {
+            "regular": "F1",
+            "bold": "F2",
+            "italic": "F3",
+            "bolditalic": "F4",
+        }
+        font_resources = " ".join(
+            f"/{resource_names[style]} {identifier} 0 R"
+            for style, identifier in font_objects.items()
+        )
+        displayed_page_number = 0
+        for page_index, page in enumerate(self.pages):
+            commands = []
+            page_commands = list(page["commands"])
+            if page["numbered"]:
+                displayed_page_number += 1
+                page_commands.append(self.page_number_command(displayed_page_number))
+            for style, size, x, y, text, colour in page_commands:
+                red, green, blue = colour
+                encoded = self.fonts[style].encode(text)
+                commands.append(
+                    f"BT /{resource_names[style]} {size:g} Tf {red:g} {green:g} {blue:g} rg 1 0 0 1 {x:.3f} {y:.3f} Tm <{encoded}> Tj ET"
+                )
+            for key, x, y, width, height in page["images"]:
+                commands.append(
+                    f"q {width:.3f} 0 0 {height:.3f} {x:.3f} {y:.3f} cm /{image_names[key]} Do Q"
+                )
+            for left, bottom, right, top, thickness in page["lines"]:
+                commands.append(
+                    f"q 0 0 0 RG {thickness:.3f} w {left:.3f} {bottom:.3f} m {right:.3f} {top:.3f} l S Q"
+                )
+            content = document.stream({}, "\n".join(commands).encode(), compress=True)
+            annotations = []
+            for left, bottom, right, top, target in page["links"]:
+                rectangle = f"[{left:.3f} {bottom:.3f} {right:.3f} {top:.3f}]"
+                if target.startswith("#") and target[1:] in self.destinations:
+                    destination_page, destination_y = self.destinations[target[1:]]
+                    action = f"/Dest [{page_objects[destination_page]} 0 R /XYZ null {destination_y:.3f} null]"
+                elif target.startswith(("http://", "https://")):
+                    escaped = target.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+                    action = f"/A << /S /URI /URI ({escaped}) >>"
+                else:
+                    continue
+                annotations.append(
+                    document.add(
+                        f"<< /Type /Annot /Subtype /Link /Rect {rectangle} /Border [0 0 0] {action} >>".encode()
+                    )
+                )
+            annotation_value = (
+                f"/Annots [{' '.join(f'{identifier} 0 R' for identifier in annotations)}]"
+                if annotations
+                else ""
+            )
+            page_images = " ".join(
+                f"/{image_names[key]} {image_objects[key]} 0 R"
+                for key, *_ in page["images"]
+            )
+            image_resources = f"/XObject << {page_images} >>" if page_images else ""
+            document.set(
+                page_objects[page_index],
+                (
+                    f"<< /Type /Page /Parent {pages_object} 0 R /MediaBox [0 0 {self.width:.3f} {self.height:.3f}] "
+                    f"/Resources << /Font << {font_resources} >> {image_resources} >> /Contents {content} 0 R {annotation_value} >>"
+                ).encode(),
+            )
+        document.set(
+            pages_object,
+            (
+                f"<< /Type /Pages /Count {len(page_objects)} /Kids "
+                f"[{' '.join(f'{identifier} 0 R' for identifier in page_objects)}] >>"
+            ).encode(),
+        )
+        document.set(catalog, f"<< /Type /Catalog /Pages {pages_object} 0 R >>".encode())
+        return document.build(catalog)
+
+
+def render_pdf(project):
+    renderer = NativePdfRenderer(project)
+    renderer.render(render_html(project))
+    return renderer.pdf()
+
+
+def serialise_check(project):
+    counted_words = sum(
+        section.words for section in project.sections if section.count_words
+    )
+    return {
+        "index": str(project.index),
+        "title": project.metadata.get("title"),
+        "counted_words": counted_words,
+        "sections": [
+            {
+                "path": section.path,
+                "words": section.words,
+                "count_words": section.count_words,
+                "max_words": section.max_words,
+            }
+            for section in project.sections
+        ],
+        "citations": sorted(project.citations),
+        "references": len(project.references),
+        "figures": sum(1 for kind, _ in project.labels.values() if kind == "Figure"),
+        "tables": sum(1 for kind, _ in project.labels.values() if kind == "Table"),
+        "issues": [issue.__dict__ for issue in project.issues],
+    }
+
+
+def print_check(project):
+    result = serialise_check(project)
+    print(f"{PURPLE}◇ {result['title']}{RESET}")
+    print(f"  words       {result['counted_words']:,}")
+    print(f"  sections    {len(result['sections'])}")
+    print(
+        f"  citations   {len(result['citations'])} keys · {result['references']} records"
+    )
+    print(f"  floats      {result['figures']} figures · {result['tables']} tables")
+    for section in result["sections"]:
+        if section["count_words"]:
+            limit = f" / {section['max_words']}" if section["max_words"] else ""
+            print(f"{PINK}  {section['path']:<32}{RESET} {section['words']}{limit}")
+    for issue in project.issues:
+        colour = RED if issue.level == "error" else YELLOW
+        location = f" [{issue.path}]" if issue.path else ""
+        print(f"{colour}  {issue.level}:{RESET} {issue.message}{location}")
+
+
+def ensure_valid(project, as_json=False):
+    if as_json:
+        print(json.dumps(serialise_check(project), indent=2, sort_keys=True))
+    else:
+        print_check(project)
+    if any(issue.level == "error" for issue in project.issues):
+        raise SystemExit(1)
+
+
+def write_output(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def write_binary_output(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def command_check(arguments):
+    ensure_valid(load_project(arguments.path), arguments.json)
+
+
+def command_build(arguments):
+    project = load_project(arguments.path)
+    ensure_valid(project, arguments.json)
+    output = safe_path(project.root, arguments.output)
+    output.mkdir(parents=True, exist_ok=True)
+    requested = (
+        {"text", "html", "tex", "pdf"}
+        if arguments.format == "all"
+        else {arguments.format}
+    )
+    text_path = output / "report.txt"
+    html_path = output / "report.html"
+    tex_path = output / "report.tex"
+    if "text" in requested:
+        write_output(text_path, render_text(project))
+    if "html" in requested:
+        write_output(html_path, render_html(project))
+    if requested & {"tex", "pdf"}:
+        write_output(tex_path, render_latex(project))
+    if "pdf" in requested:
+        write_binary_output(output / "report.pdf", render_pdf(project))
+    if not arguments.json:
+        for name in ("report.txt", "report.html", "report.tex", "report.pdf"):
+            path = output / name
+            if path.exists() and name.rsplit(".", 1)[1] in requested:
+                print(f"{PINK}  wrote       {path}{RESET}")
+
+
+def initial_index(
+    title, authors, identifiers, roles, institution="", course="", assessment=""
+):
+    identity_count = max(1, len(authors), len(identifiers), len(roles))
+    identity_lines = []
+    for position in range(identity_count):
+        name = authors[position] if position < len(authors) else ""
+        identifier = identifiers[position] if position < len(identifiers) else ""
+        role = roles[position] if position < len(roles) else ""
+        identity_lines.append(
+            f"  - {{name: {json.dumps(name)}, identifier: {json.dumps(identifier)}, "
+            f"role: {json.dumps(role)}}}"
+        )
+    institution_block = ""
+    if institution or course:
+        institution_block = (
+            "institution:\n"
+            f"  name: {json.dumps(institution)}\n"
+            f"  course: {json.dumps(course)}\n"
+            "required_institution_fields: [name, course]\n"
+        )
+    assessment_line = f"assessment: {json.dumps(assessment)}\n" if assessment else ""
+    return f"""---
+schema_version: 1
+title: {json.dumps(title)}
+{assessment_line}cover_page: {{enabled: true}}
+{institution_block}language: en-AU
+citation_style: apa-7
+citation_markup:
+  encoding: yaml_flow_mapping
+  id_source: {{path: references.md, field: id}}
+identities:
+{chr(10).join(identity_lines)}
+presentation: {{font_size_pt: 12}}
+require_verified_references: true
+required_identity_fields: [name]
+sections:
+  - {{id: report, order: 1, path: sections/01-report.md, include_in_submission: true, include_in_word_count: true}}
+  - {{id: references, order: 2, path: references.md, include_in_submission: true, include_in_word_count: false, record_encoding: yaml}}
+---
+
+# Report source
+
+The YAML frontmatter controls assembly. Keep planning notes below it; only the
+listed section files and cited reference records enter the rendered report.
+"""
+
+
+def command_init(arguments):
+    root = Path(arguments.path).resolve()
+    if root.exists() and any(root.iterdir()):
+        fail(f"refusing to initialise non-empty directory: {root}", 2)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "sections").mkdir(exist_ok=True)
+    (root / "assets").mkdir(exist_ok=True)
+    (root / "index.md").write_text(
+        initial_index(
+            arguments.title,
+            arguments.author,
+            arguments.identifier,
+            arguments.role,
+            arguments.institution,
+            arguments.course,
+            arguments.assessment,
+        )
+    )
+    (root / "sections/01-report.md").write_text(
+        "# Introduction\n\nWrite the report here. Use explicit citation keys, labelled figures, and captioned tables when the evidence calls for them.\n"
+    )
+    (root / "references.md").write_text(
+        "---\nschema_version: 1\ncitation_style: apa-7\nrecord_encoding: yaml\n---\n\n# References\n\nAdd one fenced YAML record for each verified source cited by the report.\n"
+    )
+    print(f"{PURPLE}◇ report source created{RESET}\n  {root}")
+
+
+def parser():
+    root = argparse.ArgumentParser(
+        description="Build and validate modular Markdown reports with mapped citations, figures, tables, and print output."
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+    initialise = commands.add_parser("init", help="create a report source tree")
+    initialise.add_argument("path")
+    initialise.add_argument("--title", required=True)
+    initialise.add_argument(
+        "--author", action="append", default=[], help="repeat for multiple identities"
+    )
+    initialise.add_argument(
+        "--identifier",
+        action="append",
+        default=[],
+        help="repeat in the same order as --author",
+    )
+    initialise.add_argument(
+        "--role", action="append", default=[], help="optional repeated identity role"
+    )
+    initialise.add_argument("--institution", default="")
+    initialise.add_argument("--course", default="")
+    initialise.add_argument("--assessment", default="")
+    initialise.set_defaults(handler=command_init)
+    check = commands.add_parser(
+        "check",
+        help="validate structure, references, labels, figures, tables, and word limits",
+    )
+    check.add_argument("path", nargs="?", default=".")
+    check.add_argument("--json", action="store_true")
+    check.set_defaults(handler=command_check)
+    build = commands.add_parser(
+        "build", help="validate and render plain text, HTML, TeX, or PDF"
+    )
+    build.add_argument("path", nargs="?", default=".")
+    build.add_argument(
+        "--format", choices=("all", "text", "html", "tex", "pdf"), default="all"
+    )
+    build.add_argument("--output", default="build")
+    build.add_argument("--json", action="store_true")
+    build.set_defaults(handler=command_build)
+    return root
+
+
+def main():
+    arguments = parser().parse_args()
+    arguments.handler(arguments)
+
+
+if __name__ == "__main__":
+    main()

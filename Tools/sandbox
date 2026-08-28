@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: sandbox [OPTIONS] [--] [COMMAND [ARG...]]
+
+Run a command in a small Bubblewrap sandbox. By default only the current
+directory is writable, the environment is scrubbed, and networking is disabled.
+
+Filesystem:
+  -w, --workspace PATH  Writable working directory (default: current directory)
+      --workspace-ro    Mount the working directory read-only
+      --ro PATH         Add a read-only host path (repeatable)
+      --rw PATH         Add a writable host path (repeatable)
+
+Network:
+      --internet        Enable rootless outbound internet through Pasta
+      --publish SPEC    Publish a port; implies --internet (repeatable)
+                        SPEC is tcp:HOST[:GUEST] or udp:HOST[:GUEST]
+      --no-internet     Explicitly disable networking (the default)
+
+Environment:
+  -e, --env NAME        Copy one host environment variable (repeatable)
+      --set-env N=V     Set one environment variable (repeatable)
+
+Other:
+      --name NAME       Set the sandbox hostname (default: sandbox)
+      --dry-run         Print the launch command without running it
+  -h, --help            Show this help
+
+Examples:
+  sandbox -- bun test
+  sandbox --internet --ro "$HOME/.cache" -- uv run pytest
+  sandbox --internet --publish tcp:3000 -- bun run dev
+EOF
+}
+
+die() {
+  printf '\033[1;31merror:\033[0m %s\n' "$*" >&2
+  exit 1
+}
+
+absolute_path() {
+  local path=$1
+  [[ -e $path ]] || die "path does not exist: $path"
+  realpath -- "$path"
+}
+
+# Bubblewrap needs mount-point parents created inside its initially empty root.
+add_parent_dirs() {
+  local path=$1 parent part built=/
+  parent=$(dirname -- "$path")
+  IFS=/ read -ra parts <<< "${parent#/}"
+  for part in "${parts[@]}"; do
+    [[ -n $part ]] || continue
+    built="${built%/}/$part"
+    [[ -n ${made_dirs[$built]+x} ]] && continue
+    bwrap_args+=(--dir "$built")
+    made_dirs[$built]=1
+  done
+}
+
+workspace=$PWD
+workspace_mode=rw
+internet=false
+hostname=sandbox
+dry_run=false
+declare -a readonly_paths=() writable_paths=() copied_env=() set_env=() publishes=()
+
+while (( $# )); do
+  case "$1" in
+    -w|--workspace)
+      (( $# >= 2 )) || die "$1 needs a path"
+      workspace=$2
+      shift 2
+      ;;
+    --workspace-ro)
+      workspace_mode=ro
+      shift
+      ;;
+    --ro|--rw|-e|--env|--set-env|--publish|--name)
+      option=$1
+      (( $# >= 2 )) || die "$option needs a value"
+      case "$option" in
+        --ro) readonly_paths+=("$2") ;;
+        --rw) writable_paths+=("$2") ;;
+        -e|--env) copied_env+=("$2") ;;
+        --set-env) set_env+=("$2") ;;
+        --publish) publishes+=("$2"); internet=true ;;
+        --name) hostname=$2 ;;
+      esac
+      shift 2
+      ;;
+    --internet)
+      internet=true
+      shift
+      ;;
+    --no-internet)
+      internet=false
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+command -v bwrap >/dev/null || die "bwrap is required (install bubblewrap)"
+if $internet; then
+  command -v pasta >/dev/null || die "pasta is required for --internet (install passt)"
+fi
+
+workspace=$(absolute_path "$workspace")
+for index in "${!readonly_paths[@]}"; do
+  readonly_paths[$index]=$(absolute_path "${readonly_paths[$index]}")
+done
+for index in "${!writable_paths[@]}"; do
+  writable_paths[$index]=$(absolute_path "${writable_paths[$index]}")
+done
+
+[[ $hostname =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || die "invalid hostname: $hostname"
+for assignment in "${set_env[@]}"; do
+  [[ $assignment =~ ^[a-zA-Z_][a-zA-Z0-9_]*= ]] || die "--set-env expects NAME=VALUE"
+done
+
+declare -a bwrap_args=(
+  bwrap
+  --unshare-all
+  --unshare-user
+  --disable-userns
+  --die-with-parent
+  --new-session
+  --hostname "$hostname"
+  --clearenv
+  --setenv HOME /home/sandbox
+  --setenv USER sandbox
+  --setenv LOGNAME sandbox
+  --setenv PATH /usr/local/bin:/usr/bin:/bin
+  --setenv LANG "${LANG:-C.UTF-8}"
+  --setenv TERM "${TERM:-xterm-256color}"
+  --proc /proc
+  --dev /dev
+  --tmpfs /tmp
+  --tmpfs /run
+  --tmpfs /home
+  --dir /home/sandbox
+  --ro-bind /usr /usr
+  --ro-bind /etc /etc
+  --symlink usr/bin /bin
+  --symlink usr/lib /lib
+  --symlink usr/lib64 /lib64
+  --symlink usr/sbin /sbin
+)
+
+declare -A made_dirs=([/home]=1 [/home/sandbox]=1 [/tmp]=1 [/run]=1 [/usr]=1 [/etc]=1)
+
+if [[ -d /opt ]]; then
+  bwrap_args+=(--ro-bind /opt /opt)
+  made_dirs[/opt]=1
+fi
+if [[ -d /nix ]]; then
+  bwrap_args+=(--ro-bind /nix /nix)
+  made_dirs[/nix]=1
+fi
+
+add_parent_dirs "$workspace"
+if [[ $workspace_mode == rw ]]; then
+  bwrap_args+=(--bind "$workspace" "$workspace")
+else
+  bwrap_args+=(--ro-bind "$workspace" "$workspace")
+fi
+
+for path in "${readonly_paths[@]}"; do
+  add_parent_dirs "$path"
+  bwrap_args+=(--ro-bind "$path" "$path")
+done
+for path in "${writable_paths[@]}"; do
+  add_parent_dirs "$path"
+  bwrap_args+=(--bind "$path" "$path")
+done
+
+for name in "${copied_env[@]}"; do
+  [[ $name =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || die "invalid environment name: $name"
+  [[ -v $name ]] || die "host environment variable is unset: $name"
+  bwrap_args+=(--setenv "$name" "${!name}")
+done
+for assignment in "${set_env[@]}"; do
+  bwrap_args+=(--setenv "${assignment%%=*}" "${assignment#*=}")
+done
+
+bwrap_args+=(--chdir "$workspace")
+if $internet; then
+  if [[ -f /run/systemd/resolve/resolv.conf ]]; then
+    bwrap_args+=(
+      --dir /run/systemd
+      --dir /run/systemd/resolve
+      --ro-bind /run/systemd/resolve/resolv.conf /run/systemd/resolve/stub-resolv.conf
+    )
+    made_dirs[/run/systemd]=1
+    made_dirs[/run/systemd/resolve]=1
+  fi
+  bwrap_args+=(--share-net)
+fi
+
+if (( $# == 0 )); then
+  bwrap_args+=(-- /bin/bash)
+else
+  bwrap_args+=(-- "$@")
+fi
+
+declare -a launch_args=()
+if $internet; then
+  launch_args=(pasta --config-net --tcp-ports none --udp-ports none)
+  for publish in "${publishes[@]}"; do
+    if [[ $publish =~ ^tcp:([0-9]+)(:([0-9]+))?$ ]]; then
+      ports=${BASH_REMATCH[1]}
+      [[ -z ${BASH_REMATCH[3]} ]] || ports+=":${BASH_REMATCH[3]}"
+      host_port=${BASH_REMATCH[1]}
+      guest_port=${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}
+      (( host_port >= 1 && host_port <= 65535 && guest_port >= 1 && guest_port <= 65535 )) ||
+        die "port numbers must be between 1 and 65535: $publish"
+      launch_args+=(--tcp-ports "127.0.0.1/$ports")
+    elif [[ $publish =~ ^udp:([0-9]+)(:([0-9]+))?$ ]]; then
+      ports=${BASH_REMATCH[1]}
+      [[ -z ${BASH_REMATCH[3]} ]] || ports+=":${BASH_REMATCH[3]}"
+      host_port=${BASH_REMATCH[1]}
+      guest_port=${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}
+      (( host_port >= 1 && host_port <= 65535 && guest_port >= 1 && guest_port <= 65535 )) ||
+        die "port numbers must be between 1 and 65535: $publish"
+      launch_args+=(--udp-ports "127.0.0.1/$ports")
+    else
+      die "invalid publish spec '$publish' (try tcp:3000 or tcp:8080:3000)"
+    fi
+  done
+  launch_args+=(-- "${bwrap_args[@]}")
+else
+  (( ${#publishes[@]} == 0 )) || die "--publish cannot be combined with --no-internet"
+  launch_args=("${bwrap_args[@]}")
+fi
+
+if $dry_run; then
+  printf '%q ' "${launch_args[@]}"
+  printf '\n'
+  exit 0
+fi
+
+printf '\033[1;35m◇ sandbox:\033[0m %s · workspace %s (%s)\n' \
+  "$($internet && printf 'internet' || printf 'offline')" "$workspace" "$workspace_mode" >&2
+exec "${launch_args[@]}"

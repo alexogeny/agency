@@ -1,0 +1,32 @@
+# 🎀 Stay awake, soften after 15 minutes, and rest displays after 30.
+# Brightness is hardware-dependent and is applied by configure-power.sh.
+
+[AC][Display]
+DimDisplayWhenIdle=true
+DimDisplayIdleTimeoutSec=900
+TurnOffDisplayWhenIdle=true
+TurnOffDisplayIdleTimeoutSec=1800
+
+[AC][SuspendAndShutdown]
+AutoSuspendAction=0
+AutoSuspendIdleTimeoutSec=0
+
+[Battery][Display]
+DimDisplayWhenIdle=true
+DimDisplayIdleTimeoutSec=900
+TurnOffDisplayWhenIdle=true
+TurnOffDisplayIdleTimeoutSec=1800
+
+[Battery][SuspendAndShutdown]
+AutoSuspendAction=0
+AutoSuspendIdleTimeoutSec=0
+
+[LowBattery][Display]
+DimDisplayWhenIdle=true
+DimDisplayIdleTimeoutSec=900
+TurnOffDisplayWhenIdle=true
+TurnOffDisplayIdleTimeoutSec=1800
+
+[LowBattery][SuspendAndShutdown]
+AutoSuspendAction=0
+AutoSuspendIdleTimeoutSec=0

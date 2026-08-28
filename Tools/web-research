@@ -1,0 +1,933 @@
+#!/usr/bin/env bun
+
+import { Database } from "bun:sqlite";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+
+const pink = "\u001b[38;5;183m";
+const purple = "\u001b[1;35m";
+const red = "\u001b[1;31m";
+const yellow = "\u001b[1;33m";
+const reset = "\u001b[0m";
+const dataRoot =
+  process.env.WEB_RESEARCH_DATA_DIR ||
+  join(homedir(), ".local/share/web-research");
+
+type JsonObject = Record<string, unknown>;
+type SearchResult = { title: string; url: string; snippet: string };
+type Page = {
+  title: string;
+  url: string;
+  canonicalUrl: string;
+  published: string;
+  byline: string;
+  text: string;
+  markdown: string;
+  html: string;
+  links: string[];
+};
+
+function terminalText(value: unknown) {
+  return String(value).replace(
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,
+    "",
+  );
+}
+
+function fail(message: string): never {
+  process.stderr.write(`${red}error:${reset} ${terminalText(message)}\n`);
+  process.exit(1);
+}
+
+function info(message: string) {
+  process.stderr.write(`${purple}◇${reset} ${terminalText(message)}\n`);
+}
+
+function takeOption(args: string[], name: string, fallback = "") {
+  const index = args.indexOf(name);
+  if (index < 0) return fallback;
+  if (index + 1 >= args.length) fail(`${name} requires a value`);
+  const value = args[index + 1];
+  args.splice(index, 2);
+  return value;
+}
+
+function takeFlag(args: string[], name: string) {
+  const index = args.indexOf(name);
+  if (index < 0) return false;
+  args.splice(index, 1);
+  return true;
+}
+
+function takeNumber(
+  args: string[],
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+) {
+  const raw = takeOption(args, name);
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    fail(`${name} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return value;
+}
+
+function checkedUrl(value: string) {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    fail(`invalid URL: ${value}`);
+  }
+  if (!new Set(["http:", "https:"]).has(url.protocol)) {
+    fail(`URL must use HTTP or HTTPS: ${value}`);
+  }
+  url.hash = "";
+  return url;
+}
+
+function checkedProfile(value: string) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value) || value === "..") {
+    fail(
+      "profile names use 1–64 letters, numbers, dots, underscores, or hyphens",
+    );
+  }
+  return value;
+}
+
+function sleep(milliseconds: number) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function choosePort() {
+  const server = Bun.serve({ port: 0, fetch: () => new Response("reserved") });
+  const port = server.port;
+  server.stop(true);
+  return port;
+}
+
+function claimProfile(profile: string) {
+  const root = join(dataRoot, "profiles", profile);
+  const lock = `${root}.lock`;
+  mkdirSync(root, { recursive: true });
+  try {
+    const descriptor = openSync(lock, "wx", 0o600);
+    writeFileSync(descriptor, String(process.pid));
+    closeSync(descriptor);
+  } catch {
+    let owner = 0;
+    try {
+      owner = Number(readFileSync(lock, "utf8"));
+      process.kill(owner, 0);
+    } catch {
+      try {
+        unlinkSync(lock);
+      } catch {}
+      return claimProfile(profile);
+    }
+    fail(`browser profile '${profile}' is already in use by process ${owner}`);
+  }
+  const preferences = [
+    'user_pref("browser.shell.checkDefaultBrowser", false);',
+    'user_pref("browser.startup.homepage_override.mstone", "ignore");',
+    'user_pref("browser.aboutwelcome.enabled", false);',
+    'user_pref("datareporting.policy.dataSubmissionEnabled", false);',
+    'user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);',
+  ].join("\n");
+  writeFileSync(join(root, "user.js"), `${preferences}\n`, { mode: 0o600 });
+  return { root, lock };
+}
+
+class Bidi {
+  socket: WebSocket;
+  nextId = 0;
+  pending = new Map<
+    number,
+    {
+      resolve: (value: any) => void;
+      reject: (error: Error) => void;
+      timer: Timer;
+    }
+  >();
+
+  constructor(url: string) {
+    this.socket = new WebSocket(url);
+    this.socket.addEventListener("message", (event) => {
+      const message = JSON.parse(String(event.data));
+      if (typeof message.id !== "number") return;
+      const request = this.pending.get(message.id);
+      if (!request) return;
+      clearTimeout(request.timer);
+      this.pending.delete(message.id);
+      if (message.type === "error") {
+        request.reject(new Error(`${message.error}: ${message.message}`));
+      } else {
+        request.resolve(message.result);
+      }
+    });
+  }
+
+  async open() {
+    await new Promise<void>((resolveOpen, rejectOpen) => {
+      this.socket.addEventListener("open", () => resolveOpen(), { once: true });
+      this.socket.addEventListener(
+        "error",
+        () => rejectOpen(new Error("Firefox WebDriver BiDi connection failed")),
+        { once: true },
+      );
+    });
+    await this.command("session.new", { capabilities: {} });
+  }
+
+  command(method: string, params: JsonObject, timeout = 90_000) {
+    return new Promise<any>((resolveCommand, rejectCommand) => {
+      const id = ++this.nextId;
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        rejectCommand(new Error(`${method} timed out`));
+      }, timeout);
+      this.pending.set(id, {
+        resolve: resolveCommand,
+        reject: rejectCommand,
+        timer,
+      });
+      this.socket.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  async context() {
+    const tree = await this.command("browsingContext.getTree", {});
+    const context = tree.contexts?.[0]?.context;
+    if (!context) throw new Error("Firefox has no browsing context");
+    return String(context);
+  }
+
+  async navigate(context: string, url: string) {
+    return this.command(
+      "browsingContext.navigate",
+      { context, url, wait: "complete" },
+      120_000,
+    );
+  }
+
+  async evaluate(context: string, expression: string) {
+    const response = await this.command(
+      "script.evaluate",
+      {
+        expression,
+        target: { context },
+        awaitPromise: true,
+        serializationOptions: { maxDomDepth: 0, maxObjectDepth: 0 },
+      },
+      90_000,
+    );
+    if (response.type !== "success") {
+      throw new Error(response.exceptionDetails?.text || "page script failed");
+    }
+    return response.result?.value;
+  }
+
+  close() {
+    this.socket.close();
+  }
+}
+
+type BrowserOptions = {
+  profile: string;
+  headless: boolean;
+  humanTimeout: number;
+  waitMs: number;
+};
+
+async function startBrowser(options: BrowserOptions) {
+  if (
+    !options.headless &&
+    !process.env.DISPLAY &&
+    !process.env.WAYLAND_DISPLAY
+  ) {
+    fail("no graphical display is available; use --headless");
+  }
+  const claimed = claimProfile(options.profile);
+  const port = choosePort();
+  const command = [
+    "firefox",
+    "--no-remote",
+    "--profile",
+    claimed.root,
+    "--remote-debugging-port",
+    String(port),
+  ];
+  if (options.headless) command.push("--headless");
+  command.push("about:blank");
+  const processHandle = Bun.spawn(command, {
+    stdout: "ignore",
+    stderr: "ignore",
+    stdin: "ignore",
+  });
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    if (processHandle.exitCode !== null) break;
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/`);
+      if (response.ok) break;
+    } catch {}
+    await sleep(150);
+  }
+  if (processHandle.exitCode !== null) {
+    try {
+      unlinkSync(claimed.lock);
+    } catch {}
+    fail("Firefox exited before its local control socket became ready");
+  }
+  const bidi = new Bidi(`ws://127.0.0.1:${port}/session`);
+  try {
+    await bidi.open();
+  } catch (error) {
+    processHandle.kill();
+    try {
+      unlinkSync(claimed.lock);
+    } catch {}
+    throw error;
+  }
+  const context = await bidi.context();
+  return { bidi, context, processHandle, ...claimed };
+}
+
+async function stopBrowser(browser: Awaited<ReturnType<typeof startBrowser>>) {
+  browser.bidi.close();
+  browser.processHandle.kill();
+  await Promise.race([browser.processHandle.exited, sleep(3_000)]);
+  try {
+    unlinkSync(browser.lock);
+  } catch {}
+}
+
+async function withBrowser<T>(
+  options: BrowserOptions,
+  operation: (browser: Awaited<ReturnType<typeof startBrowser>>) => Promise<T>,
+) {
+  const browser = await startBrowser(options);
+  try {
+    return await operation(browser);
+  } finally {
+    await stopBrowser(browser);
+  }
+}
+
+const challengeExpression = String.raw`(() => {
+  const title = document.title || ""
+  const body = (document.body?.innerText || "").slice(0, 12000)
+  const compact = (title + "\n" + body).toLowerCase()
+  const element = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [class*="captcha" i], [id*="captcha" i]')
+  const phrases = ["verify you are human", "checking your browser", "just a moment", "attention required", "complete the security check", "unusual traffic"]
+  return JSON.stringify({ blocked: Boolean(element) || phrases.some(value => compact.includes(value)), title, url: location.href })
+})()`;
+
+async function waitForChallenge(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  options: BrowserOptions,
+) {
+  let state = JSON.parse(
+    String(await browser.bidi.evaluate(browser.context, challengeExpression)),
+  );
+  if (!state.blocked) return;
+  if (options.headless) {
+    throw new Error(
+      "the page presented a human challenge; rerun without --headless",
+    );
+  }
+  if (options.humanTimeout === 0) {
+    throw new Error("the page presented a human challenge");
+  }
+  info(`human challenge open in Firefox: ${state.title || state.url}`);
+  process.stderr.write(
+    `${yellow}  Complete it in the browser; no cookie or challenge response is exposed to the agent.${reset}\n`,
+  );
+  const deadline = Date.now() + options.humanTimeout * 1000;
+  let nextUpdate = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    await sleep(1_500);
+    state = JSON.parse(
+      String(await browser.bidi.evaluate(browser.context, challengeExpression)),
+    );
+    if (!state.blocked) {
+      info("challenge cleared; continuing local extraction");
+      return;
+    }
+    if (Date.now() >= nextUpdate) {
+      info("still waiting for the browser challenge");
+      nextUpdate = Date.now() + 30_000;
+    }
+  }
+  throw new Error(
+    `human challenge was not cleared within ${options.humanTimeout} seconds`,
+  );
+}
+
+const extractExpression = String.raw`(() => {
+  const absolute = value => { try { return new URL(value, location.href).href } catch { return "" } }
+  const candidates = [...document.querySelectorAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content')]
+  const score = element => (element.innerText || "").length - [...element.querySelectorAll("a")].reduce((total, link) => total + (link.innerText || "").length, 0) * 0.35
+  const source = candidates.sort((a, b) => score(b) - score(a))[0] || document.body
+  const root = source.cloneNode(true)
+  root.querySelectorAll('script, style, nav, footer, header, aside, form, noscript, svg, canvas, iframe, button, [aria-hidden="true"]').forEach(node => node.remove())
+  const clean = value => value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/[ \t\f\v]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim()
+  const inline = node => clean([...node.childNodes].map(walk).join(""))
+  const table = element => {
+    const rows = [...element.querySelectorAll("tr")].map(row => [...row.querySelectorAll("th,td")].map(cell => clean(cell.innerText || "").replaceAll("|", "\\|")))
+    if (!rows.length) return ""
+    const width = Math.max(...rows.map(row => row.length))
+    const padded = rows.map(row => [...row, ...Array(Math.max(0, width - row.length)).fill("")])
+    return "| " + padded[0].join(" | ") + " |\n| " + Array(width).fill("---").join(" | ") + " |\n" + padded.slice(1).map(row => "| " + row.join(" | ") + " |").join("\n") + "\n\n"
+  }
+  function walk(node) {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent || ""
+    if (node.nodeType !== Node.ELEMENT_NODE) return ""
+    const tag = node.tagName.toLowerCase()
+    if (["script", "style", "nav", "footer", "header", "aside", "form", "noscript", "svg", "canvas", "iframe", "button"].includes(tag)) return ""
+    if (/^h[1-6]$/.test(tag)) return "\n\n" + "#".repeat(Number(tag[1])) + " " + inline(node) + "\n\n"
+    if (tag === "p") return "\n\n" + inline(node) + "\n\n"
+    if (tag === "br") return "\n"
+    if (tag === "a") {
+      const text = inline(node)
+      const href = absolute(node.getAttribute("href") || "")
+      return href && text && text !== href ? "[" + text + "](" + href + ")" : text
+    }
+    if (tag === "img") {
+      const src = absolute(node.getAttribute("src") || "")
+      const alt = clean(node.getAttribute("alt") || "")
+      return src && alt ? "![" + alt + "](" + src + ")" : ""
+    }
+    if (tag === "li") return "\n- " + inline(node)
+    if (tag === "blockquote") return "\n\n> " + inline(node).replaceAll("\n", "\n> ") + "\n\n"
+    if (tag === "pre") return "\n\n" + String.fromCharCode(96).repeat(3) + "\n" + clean(node.innerText || "") + "\n" + String.fromCharCode(96).repeat(3) + "\n\n"
+    if (tag === "code") return String.fromCharCode(96) + inline(node) + String.fromCharCode(96)
+    if (tag === "strong" || tag === "b") return "**" + inline(node) + "**"
+    if (tag === "em" || tag === "i") return "*" + inline(node) + "*"
+    if (tag === "table") return "\n\n" + table(node)
+    return [...node.childNodes].map(walk).join("")
+  }
+  const links = [...document.querySelectorAll("a[href]")].map(link => absolute(link.getAttribute("href"))).filter(value => value.startsWith("http://") || value.startsWith("https://"))
+  const canonical = absolute(document.querySelector('link[rel="canonical"]')?.getAttribute("href") || location.href)
+  const published = document.querySelector('meta[property="article:published_time"], meta[name="date"], time[datetime]')?.getAttribute("content") || document.querySelector("time[datetime]")?.getAttribute("datetime") || ""
+  const byline = document.querySelector('meta[name="author"]')?.getAttribute("content") || document.querySelector('[rel="author"], .byline, [class*="author"]')?.textContent || ""
+  return JSON.stringify({ title: document.title || "", url: location.href, canonicalUrl: canonical, published: clean(published), byline: clean(byline), text: clean(source.innerText || root.textContent || ""), markdown: clean(walk(root)), html: root.innerHTML, links: [...new Set(links)] })
+})()`;
+
+async function extractPage(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  options: BrowserOptions,
+) {
+  await waitForChallenge(browser, options);
+  if (options.waitMs) await sleep(options.waitMs);
+  return JSON.parse(
+    String(await browser.bidi.evaluate(browser.context, extractExpression)),
+  ) as Page;
+}
+
+function browserOptions(args: string[]): BrowserOptions {
+  return {
+    profile: checkedProfile(takeOption(args, "--profile", "default")),
+    headless: takeFlag(args, "--headless"),
+    humanTimeout: takeNumber(args, "--human-timeout", 180, 0, 1800),
+    waitMs: takeNumber(args, "--wait-ms", 350, 0, 30_000),
+  };
+}
+
+function searchUrl(engine: string, query: string) {
+  if (engine === "duckduckgo") {
+    return `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  }
+  if (engine === "brave") {
+    return `https://search.brave.com/search?q=${encodeURIComponent(query)}&source=web`;
+  }
+  throw new Error(`unsupported engine: ${engine}`);
+}
+
+function searchExpression(engine: string, limit: number) {
+  return String.raw`(() => {
+    const limit = ${limit}
+    const engine = ${JSON.stringify(engine)}
+    const absolute = value => { try { return new URL(value, location.href) } catch { return null } }
+    const cleanUrl = value => {
+      const url = absolute(value)
+      if (!url) return ""
+      if (url.hostname === "duckduckgo.com" || url.hostname.endsWith(".duckduckgo.com")) {
+        const redirect = url.searchParams.get("uddg")
+        const target = redirect ? absolute(decodeURIComponent(redirect)) : null
+        if (!target || !["http:", "https:"].includes(target.protocol)) return ""
+        target.hash = ""
+        return target.href
+      }
+      if (!["http:", "https:"].includes(url.protocol)) return ""
+      if (url.hostname === "search.brave.com") return ""
+      url.hash = ""
+      return url.href
+    }
+    const results = []
+    if (engine === "duckduckgo") {
+      for (const item of document.querySelectorAll(".result")) {
+        if (item.matches(".result--ad") || item.querySelector(".result__badge")) continue
+        const link = item.querySelector("a.result__a")
+        const url = cleanUrl(link?.getAttribute("href") || "")
+        if (url) results.push({ title: (link?.textContent || "").trim(), url, snippet: (item.querySelector(".result__snippet")?.textContent || "").trim() })
+      }
+    } else {
+      for (const item of document.querySelectorAll("main article, main .snippet, #results article")) {
+        const link = item.querySelector("a[href]")
+        const url = cleanUrl(link?.getAttribute("href") || "")
+        if (url) results.push({ title: (item.querySelector(".search-snippet-title, h2, h3")?.textContent || link?.textContent || "").trim(), url, snippet: (item.querySelector(".generic-snippet .content, .snippet-description, .description, p")?.textContent || "").trim() })
+      }
+    }
+    if (!results.length) {
+      for (const link of document.querySelectorAll("main a[href], #links a[href]")) {
+        const url = cleanUrl(link.getAttribute("href") || "")
+        const title = (link.textContent || "").trim()
+        if (url && title.length > 3) results.push({ title, url, snippet: "" })
+      }
+    }
+    return JSON.stringify([...new Map(results.map(result => [result.url, result])).values()].slice(0, limit))
+  })()`;
+}
+
+function database() {
+  mkdirSync(dataRoot, { recursive: true });
+  const db = new Database(join(dataRoot, "index.sqlite"), { create: true });
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA synchronous = NORMAL");
+  db.run(
+    "CREATE TABLE IF NOT EXISTS pages (url TEXT PRIMARY KEY, title TEXT NOT NULL, text TEXT NOT NULL, markdown TEXT NOT NULL, fetched_at TEXT NOT NULL)",
+  );
+  db.run(
+    "CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, text, tokenize='unicode61')",
+  );
+  return db;
+}
+
+function indexPage(page: Page) {
+  const db = database();
+  const url = /^https?:\/\//.test(page.canonicalUrl)
+    ? page.canonicalUrl
+    : page.url;
+  const transaction = db.transaction(() => {
+    db.query(
+      "INSERT INTO pages (url, title, text, markdown, fetched_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at",
+    ).run(url, page.title, page.text, page.markdown, new Date().toISOString());
+    db.query("DELETE FROM pages_fts WHERE url = ?").run(url);
+    db.query("INSERT INTO pages_fts (url, title, text) VALUES (?, ?, ?)").run(
+      url,
+      page.title,
+      page.text,
+    );
+  });
+  transaction();
+  db.close();
+}
+
+function safeLink(value: string, origin: string) {
+  try {
+    const url = new URL(value);
+    if (
+      url.origin !== origin ||
+      !new Set(["http:", "https:"]).has(url.protocol)
+    ) {
+      return "";
+    }
+    url.hash = "";
+    const lower = `${url.pathname}${url.search}`.toLowerCase();
+    if (
+      /\.(?:7z|avi|bin|bz2|dmg|docx?|exe|gif|gz|iso|jpe?g|mkv|mov|mp3|mp4|msi|odt|png|pptx?|rar|tar|tgz|webm|webp|xlsx?|xz|zip)(?:$|[?#])/.test(
+        lower,
+      )
+    ) {
+      return "";
+    }
+    if (
+      /\/(?:logout|log-out|signout|sign-out|delete|remove)(?:\/|$|\?)/.test(
+        lower,
+      )
+    ) {
+      return "";
+    }
+    if (/[?&](?:action|method)=(?:delete|remove|logout|signout)/.test(lower))
+      return "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function robotsAllows(url: URL, rules: string[]) {
+  const target = `${url.pathname}${url.search}`;
+  let winner = "";
+  let allowed = true;
+  for (const rule of rules) {
+    const [kind, ...rest] = rule.split(":");
+    const path = rest.join(":").trim();
+    if (!path || !target.startsWith(path) || path.length < winner.length)
+      continue;
+    winner = path;
+    allowed = kind === "allow";
+  }
+  return allowed;
+}
+
+function parseRobots(text: string) {
+  const rules: string[] = [];
+  let applies = false;
+  for (const raw of text.split("\n")) {
+    const line = raw.split("#", 1)[0].trim();
+    const separator = line.indexOf(":");
+    if (separator < 0) continue;
+    const key = line.slice(0, separator).trim().toLowerCase();
+    const value = line.slice(separator + 1).trim();
+    if (key === "user-agent") {
+      applies = value === "*";
+    } else if (applies && (key === "allow" || key === "disallow")) {
+      rules.push(`${key}:${value}`);
+    }
+  }
+  return rules;
+}
+
+async function commandSearch(args: string[]) {
+  const options = browserOptions(args);
+  const requestedEngine = takeOption(args, "--engine", "auto");
+  const limit = takeNumber(args, "--limit", 10, 1, 50);
+  const json = takeFlag(args, "--json");
+  const query = args.join(" ").trim();
+  if (!query) fail("search requires a query");
+  if (query.length > 1000) fail("search query must be at most 1000 characters");
+  if (!new Set(["auto", "duckduckgo", "brave"]).has(requestedEngine)) {
+    fail("--engine must be auto, duckduckgo, or brave");
+  }
+  const engines =
+    requestedEngine === "auto"
+      ? ["duckduckgo", "brave"]
+      : [requestedEngine];
+  let engine = engines[0];
+  let results: SearchResult[] = [];
+  let firstError = "";
+  for (const [position, candidate] of engines.entries()) {
+    try {
+      results = await withBrowser(options, async (browser) => {
+        await browser.bidi.navigate(
+          browser.context,
+          searchUrl(candidate, query),
+        );
+        const finalCandidate = position === engines.length - 1;
+        await waitForChallenge(
+          browser,
+          finalCandidate ? options : { ...options, headless: true },
+        );
+        if (options.waitMs) await sleep(options.waitMs);
+        return JSON.parse(
+          String(
+            await browser.bidi.evaluate(
+              browser.context,
+              searchExpression(candidate, limit),
+            ),
+          ),
+        ) as SearchResult[];
+      });
+      if (!results.length && position < engines.length - 1) {
+        info(`${candidate} returned no results; trying ${engines[position + 1]}`);
+        continue;
+      }
+      engine = candidate;
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (position === engines.length - 1) {
+        throw new Error(
+          firstError
+            ? `all search engines failed (${firstError}; ${candidate}: ${message})`
+            : message,
+        );
+      }
+      firstError = `${candidate}: ${message}`;
+      info(`${candidate} unavailable; trying ${engines[position + 1]}`);
+    }
+  }
+  if (json) {
+    console.log(JSON.stringify({ query, engine, results }, null, 2));
+    return;
+  }
+  console.log(`${purple}◇ ${query}${reset}`);
+  for (const [position, result] of results.entries()) {
+    console.log(
+      `${pink}${position + 1}. ${terminalText(result.title)}${reset}\n   ${terminalText(result.url)}`,
+    );
+    if (result.snippet) console.log(`   ${terminalText(result.snippet)}`);
+  }
+}
+
+async function commandScrape(args: string[]) {
+  const options = browserOptions(args);
+  const format = takeOption(args, "--format", "markdown");
+  const output = takeOption(args, "--output");
+  const shouldIndex = takeFlag(args, "--index");
+  if (!new Set(["markdown", "text", "html", "json"]).has(format)) {
+    fail("--format must be markdown, text, html, or json");
+  }
+  if (args.length !== 1) fail("scrape requires one URL");
+  const url = checkedUrl(args[0]);
+  const page = await withBrowser(options, async (browser) => {
+    await browser.bidi.navigate(browser.context, url.href);
+    return extractPage(browser, options);
+  });
+  if (shouldIndex) indexPage(page);
+  const content =
+    format === "json"
+      ? JSON.stringify(page, null, 2)
+      : format === "text"
+        ? page.text
+        : format === "html"
+          ? page.html
+          : page.markdown;
+  if (output) {
+    const path = resolve(output);
+    await Bun.write(path, `${content}\n`);
+    info(`wrote ${path}`);
+  } else {
+    console.log(terminalText(content));
+  }
+}
+
+async function commandMap(args: string[]) {
+  const options = browserOptions(args);
+  const limit = takeNumber(args, "--limit", 200, 1, 5000);
+  const json = takeFlag(args, "--json");
+  if (args.length !== 1) fail("map requires one URL");
+  const url = checkedUrl(args[0]);
+  const links = await withBrowser(options, async (browser) => {
+    await browser.bidi.navigate(browser.context, url.href);
+    const page = await extractPage(browser, options);
+    return [
+      ...new Set(
+        page.links.map((link) => safeLink(link, url.origin)).filter(Boolean),
+      ),
+    ]
+      .sort()
+      .slice(0, limit);
+  });
+  if (json) console.log(JSON.stringify({ root: url.href, links }, null, 2));
+  else links.forEach((link) => console.log(terminalText(link)));
+}
+
+async function commandSnapshot(args: string[]) {
+  const options = browserOptions(args);
+  const format = takeOption(args, "--format", "png");
+  const output = takeOption(args, "--output");
+  if (!new Set(["png", "pdf"]).has(format)) fail("--format must be png or pdf");
+  if (!output) fail("snapshot requires --output PATH");
+  if (args.length !== 1) fail("snapshot requires one URL");
+  const url = checkedUrl(args[0]);
+  const data = await withBrowser(options, async (browser) => {
+    await browser.bidi.navigate(browser.context, url.href);
+    await waitForChallenge(browser, options);
+    if (options.waitMs) await sleep(options.waitMs);
+    const result = await browser.bidi.command(
+      format === "pdf"
+        ? "browsingContext.print"
+        : "browsingContext.captureScreenshot",
+      format === "pdf"
+        ? { context: browser.context, background: true }
+        : {
+            context: browser.context,
+            format: { type: "png" },
+            origin: "document",
+          },
+      120_000,
+    );
+    return String(result.data);
+  });
+  const path = resolve(output);
+  await Bun.write(path, Buffer.from(data, "base64"));
+  info(`wrote ${path}`);
+}
+
+async function commandCrawl(args: string[]) {
+  const options = browserOptions(args);
+  const limit = takeNumber(args, "--limit", 50, 1, 1000);
+  const depthLimit = takeNumber(args, "--depth", 2, 0, 10);
+  const delay = takeNumber(args, "--delay-ms", 750, 0, 60_000);
+  const ignoreRobots = takeFlag(args, "--ignore-robots");
+  const json = takeFlag(args, "--json");
+  if (args.length !== 1) fail("crawl requires one URL");
+  const root = checkedUrl(args[0]);
+  const report = await withBrowser(options, async (browser) => {
+    await browser.bidi.navigate(browser.context, root.href);
+    let rules: string[] = [];
+    if (!ignoreRobots) {
+      const expression = `fetch(${JSON.stringify(`${root.origin}/robots.txt`)}, { credentials: "include" }).then(response => response.ok ? response.text() : "").catch(() => "")`;
+      rules = parseRobots(
+        String(await browser.bidi.evaluate(browser.context, expression)),
+      );
+    }
+    const queue: Array<{ url: string; depth: number }> = [
+      { url: root.href, depth: 0 },
+    ];
+    const seen = new Set<string>();
+    const pages: Array<{ url: string; title?: string; error?: string }> = [];
+    while (queue.length && pages.length < limit) {
+      const current = queue.shift()!;
+      if (seen.has(current.url)) continue;
+      seen.add(current.url);
+      const currentUrl = new URL(current.url);
+      if (!ignoreRobots && !robotsAllows(currentUrl, rules)) {
+        pages.push({ url: current.url, error: "disallowed by robots.txt" });
+        continue;
+      }
+      try {
+        await browser.bidi.navigate(browser.context, current.url);
+        const page = await extractPage(browser, options);
+        indexPage(page);
+        pages.push({ url: page.canonicalUrl || page.url, title: page.title });
+        if (current.depth < depthLimit) {
+          for (const link of page.links) {
+            const safe = safeLink(link, root.origin);
+            if (safe && !seen.has(safe))
+              queue.push({ url: safe, depth: current.depth + 1 });
+          }
+        }
+      } catch (error) {
+        pages.push({
+          url: current.url,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (delay) await sleep(delay);
+    }
+    return pages;
+  });
+  if (json) {
+    console.log(JSON.stringify({ root: root.href, pages: report }, null, 2));
+  } else {
+    for (const page of report) {
+      console.log(
+        page.error
+          ? `${yellow}skip${reset} ${terminalText(page.url)} — ${terminalText(page.error)}`
+          : `${pink}saved${reset} ${terminalText(page.url)}`,
+      );
+    }
+  }
+}
+
+function commandLocal(args: string[]) {
+  const limit = takeNumber(args, "--limit", 10, 1, 100);
+  const json = takeFlag(args, "--json");
+  const query = args.join(" ").trim();
+  if (!query) fail("local requires a query");
+  const terms = query.match(/[\p{L}\p{N}_-]+/gu) || [];
+  if (!terms.length) fail("local query has no searchable terms");
+  const match = terms
+    .map((term) => `"${term.replaceAll('"', '""')}"`)
+    .join(" ");
+  const db = database();
+  const results = db
+    .query(
+      "SELECT url, title, snippet(pages_fts, 2, '', '', ' … ', 18) AS snippet, bm25(pages_fts) AS score FROM pages_fts WHERE pages_fts MATCH ? ORDER BY score LIMIT ?",
+    )
+    .all(match, limit);
+  db.close();
+  if (json) console.log(JSON.stringify({ query, results }, null, 2));
+  else {
+    console.log(`${purple}◇ local index: ${query}${reset}`);
+    for (const [position, result] of (results as any[]).entries()) {
+      console.log(
+        `${pink}${position + 1}. ${terminalText(result.title)}${reset}\n   ${terminalText(result.url)}\n   ${terminalText(result.snippet)}`,
+      );
+    }
+  }
+}
+
+function commandStats(args: string[]) {
+  if (args.length) fail("stats takes no arguments");
+  const db = database();
+  const row = db
+    .query("SELECT COUNT(*) AS pages, MAX(fetched_at) AS newest FROM pages")
+    .get() as any;
+  db.close();
+  console.log(
+    JSON.stringify({ pages: row.pages, newest: row.newest, dataRoot }, null, 2),
+  );
+}
+
+function commandBrowser(args: string[]) {
+  const profile = checkedProfile(takeOption(args, "--profile", "default"));
+  if (args.length > 1) fail("browser accepts at most one URL");
+  const url = args.length ? checkedUrl(args[0]).href : "about:blank";
+  const claimed = claimProfile(profile);
+  const child = Bun.spawn(
+    ["firefox", "--no-remote", "--profile", claimed.root, url],
+    {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    },
+  );
+  writeFileSync(claimed.lock, String(child.pid), { mode: 0o600 });
+  child.unref();
+  info(`opened persistent profile '${profile}' in Firefox`);
+}
+
+function help() {
+  console.log(`web-research — local Firefox search, extraction, crawl, and index
+
+Usage:
+  web-research search QUERY [--engine auto|duckduckgo|brave] [--limit N] [--json]
+  web-research scrape URL [--format markdown|text|html|json] [--output PATH] [--index]
+  web-research map URL [--limit N] [--json]
+  web-research snapshot URL --format png|pdf --output PATH
+  web-research crawl URL [--limit N] [--depth N] [--delay-ms N] [--json]
+  web-research local QUERY [--limit N] [--json]
+  web-research stats
+  web-research browser [URL] [--profile NAME]
+
+Browser options:
+  --profile NAME          Persistent local Firefox profile (default: default)
+  --headless              No interactive challenge handling
+  --human-timeout N       Seconds to wait for a challenge (default: 180)
+  --wait-ms N             Dynamic-content settling time (default: 350)
+
+Crawl obeys robots.txt, stays on the starting origin, visits one page at a time,
+and skips common state-changing links. --ignore-robots requires explicit authority.`);
+}
+
+const args = Bun.argv.slice(2);
+const command = args.shift();
+
+try {
+  if (
+    !command ||
+    command === "help" ||
+    command === "--help" ||
+    command === "-h"
+  )
+    help();
+  else if (args.includes("--help") || args.includes("-h")) help();
+  else if (command === "search") await commandSearch(args);
+  else if (command === "scrape" || command === "fetch")
+    await commandScrape(args);
+  else if (command === "map") await commandMap(args);
+  else if (command === "snapshot") await commandSnapshot(args);
+  else if (command === "crawl") await commandCrawl(args);
+  else if (command === "local") commandLocal(args);
+  else if (command === "stats") commandStats(args);
+  else if (command === "browser") commandBrowser(args);
+  else fail(`unknown command: ${command}`);
+} catch (error) {
+  fail(error instanceof Error ? error.message : String(error));
+}

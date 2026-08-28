@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: long-processes [--age DURATION]
+
+Interactively inspect and stop long-running processes owned by you.
+DURATION accepts values such as 45m, 2h, or 1d (default: 2h).
+EOF
+}
+
+die() {
+  printf '\033[1;31merror:\033[0m %s\n' "$*" >&2
+  exit 1
+}
+
+duration_seconds() {
+  local duration=$1 amount unit multiplier
+  if [[ $duration =~ ^([0-9]+)([smhd]?)$ ]]; then
+    amount=${BASH_REMATCH[1]}
+    unit=${BASH_REMATCH[2]:-s}
+  else
+    return 1
+  fi
+
+  case "$unit" in
+    s) multiplier=1 ;;
+    m) multiplier=60 ;;
+    h) multiplier=3600 ;;
+    d) multiplier=86400 ;;
+  esac
+  printf '%s\n' "$((amount * multiplier))"
+}
+
+format_age() {
+  local seconds=$1 days hours minutes
+  days=$((seconds / 86400))
+  hours=$(((seconds % 86400) / 3600))
+  minutes=$(((seconds % 3600) / 60))
+  if (( days > 0 )); then
+    printf '%dd %02dh' "$days" "$hours"
+  elif (( hours > 0 )); then
+    printf '%dh %02dm' "$hours" "$minutes"
+  else
+    printf '%dm' "$minutes"
+  fi
+}
+
+age=2h
+while (( $# )); do
+  case "$1" in
+    --age)
+      (( $# >= 2 )) || die "--age needs a duration"
+      age=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+minimum_age=$(duration_seconds "$age") || die "invalid duration '$age' (try 30m, 2h, or 1d)"
+command -v fzf >/dev/null || die "fzf is required"
+
+# Never offer to stop this inspector or the shell/process chain that launched it.
+declare -A protected=()
+ancestor=$$
+while [[ $ancestor =~ ^[0-9]+$ ]] && (( ancestor > 1 )); do
+  protected[$ancestor]=1
+  ancestor=$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ') || break
+done
+
+rows=()
+while read -r pid ppid elapsed cpu memory state command; do
+  (( elapsed >= minimum_age )) || continue
+  [[ -z ${protected[$pid]+x} ]] || continue
+  rows+=("$(printf '%-8s  %8s  %6s  %6s  %-5s  %s' "$pid" "$(format_age "$elapsed")" "$cpu%" "$memory%" "$state" "$command")")
+done < <(ps -u "$(id -u)" -o pid=,ppid=,etimes=,pcpu=,pmem=,stat=,args= --sort=-etimes)
+
+if (( ${#rows[@]} == 0 )); then
+  printf '\033[38;5;183m♡ No processes older than %s found.\033[0m\n' "$age"
+  exit 0
+fi
+
+selection=$(printf '%s\n' "${rows[@]}" | fzf \
+  --multi \
+  --ansi \
+  --layout=reverse \
+  --border=rounded \
+  --prompt='  stop › ' \
+  --pointer='♥' \
+  --marker='♡' \
+  --header=$'  PID          AGE     CPU     MEM  STATE  COMMAND\n  tab: select · enter: continue · esc: cancel' \
+  --preview='ps -ww -p {1} -o pid,ppid,user,lstart,etime,%cpu,%mem,stat,args; printf "\nChildren\n"; ps -ww --ppid {1} -o pid,etime,%cpu,%mem,stat,args' \
+  --preview-window='down,45%,wrap' \
+) || exit 0
+
+[[ -n $selection ]] || exit 0
+mapfile -t pids < <(awk '{print $1}' <<< "$selection")
+
+printf '\n\033[1;35mSelected %d process(es):\033[0m\n' "${#pids[@]}"
+ps -ww -p "$(IFS=,; printf '%s' "${pids[*]}")" -o pid=,etime=,stat=,args=
+printf '\nSend TERM to these processes? [y/N] '
+read -r answer
+[[ $answer =~ ^[Yy]$ ]] || {
+  printf 'Left everything running.\n'
+  exit 0
+}
+
+live_pids=()
+for pid in "${pids[@]}"; do
+  if kill -0 "$pid" 2>/dev/null; then
+    live_pids+=("$pid")
+  else
+    printf '\033[2mPID %s already exited.\033[0m\n' "$pid"
+  fi
+done
+
+if (( ${#live_pids[@]} )); then
+  kill -TERM -- "${live_pids[@]}"
+  printf '\033[38;5;183m♡ Sent TERM to %d process(es).\033[0m\n' "${#live_pids[@]}"
+  sleep 2
+fi
+
+survivors=()
+for pid in "${live_pids[@]}"; do
+  kill -0 "$pid" 2>/dev/null && survivors+=("$pid")
+done
+
+if (( ${#survivors[@]} )); then
+  printf '\n%d process(es) still running. Send KILL? [y/N] ' "${#survivors[@]}"
+  read -r answer
+  if [[ $answer =~ ^[Yy]$ ]]; then
+    kill -KILL -- "${survivors[@]}"
+    printf '\033[38;5;183m♡ Force-stopped %d process(es).\033[0m\n' "${#survivors[@]}"
+  else
+    printf 'Left the remaining processes running.\n'
+  fi
+fi

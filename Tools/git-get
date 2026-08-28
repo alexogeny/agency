@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: git-get OWNER/REPO | GIT_URL
+
+Clone a repository into ~/Code, or fast-forward it when it already exists.
+GitHub owner/repository shorthand uses SSH.
+EOF
+}
+
+die() {
+  printf '\033[1;31merror:\033[0m %s\n' "$*" >&2
+  exit 1
+}
+
+canonical_remote() {
+  local remote=${1%.git}
+  remote=${remote#ssh://git@}
+  remote=${remote#git@}
+  remote=${remote#https://}
+  remote=${remote#http://}
+  remote=${remote/:/\/}
+  printf '%s\n' "${remote,,}"
+}
+
+(( $# == 1 )) || {
+  usage
+  exit 2
+}
+
+request=$1
+case "$request" in
+  */*/* | *://* | git@*:*)
+    remote=$request
+    ;;
+  */*)
+    remote="git@github.com:${request%.git}.git"
+    ;;
+  *)
+    die "use owner/repository shorthand or a complete Git URL"
+    ;;
+esac
+
+repository=${request%/}
+repository=${repository%.git}
+repository=${repository##*/}
+repository=${repository##*:}
+[[ -n "$repository" ]] || die "could not determine the repository name"
+
+code_root=${CODE_ROOT:-"$HOME/Code"}
+destination="$code_root/$repository"
+
+if [[ ! -e "$destination" ]]; then
+  mkdir -p "$code_root"
+  printf '\033[1;35m✨ Cloning %s into %s\033[0m\n' "$remote" "$destination" >&2
+  git clone "$remote" "$destination" >&2
+elif [[ ! -d "$destination/.git" ]]; then
+  die "$destination exists but is not a Git repository"
+else
+  existing_remote=$(git -C "$destination" remote get-url origin 2>/dev/null) || \
+    die "$destination has no origin remote"
+
+  [[ $(canonical_remote "$existing_remote") == $(canonical_remote "$remote") ]] ||
+    die "$destination belongs to $existing_remote, not $remote"
+
+  printf '\033[1;35m✨ Fast-forwarding %s\033[0m\n' "$destination" >&2
+  git -C "$destination" pull --ff-only >&2
+fi
+
+printf '%s\n' "$destination"

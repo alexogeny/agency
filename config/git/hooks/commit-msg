@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+message_file=$1
+
+# Guard against coding agents quietly advertising themselves in public history.
+# Human co-author trailers remain valid and untouched.
+if grep -Eiq \
+  '^(co-authored-by|signed-off-by|generated-by|assisted-by|created-by|authored-by):.*(claude|anthropic|codex|openai|chatgpt|copilot|gemini|[^[:alnum:]]ai([^[:alnum:]]|$))' \
+  "$message_file"; then
+  cat >&2 <<'EOF'
+🎀 Commit rejected: remove the AI/assistant attribution trailer.
+
+Agents assist Mara without claiming authorship, co-authorship, or publicity in
+repository history. Human attribution trailers are still allowed.
+EOF
+  exit 1
+fi

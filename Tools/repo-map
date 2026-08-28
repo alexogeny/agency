@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+
+import argparse
+import ast
+import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+import tomllib
+
+PARSER_VERSION = 1
+SOURCE_SUFFIXES = {
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".css": "css",
+    ".fish": "fish",
+    ".go": "go",
+    ".h": "c-header",
+    ".hpp": "cpp-header",
+    ".html": "html",
+    ".java": "java",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".kt": "kotlin",
+    ".lua": "lua",
+    ".php": "php",
+    ".py": "python",
+    ".rb": "ruby",
+    ".rs": "rust",
+    ".sh": "shell",
+    ".sql": "sql",
+    ".swift": "swift",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".zig": "zig",
+}
+MANIFEST_NAMES = {
+    "Cargo.toml": "cargo",
+    "Gemfile": "bundler",
+    "Makefile": "make",
+    "Package.swift": "swift-package",
+    "build.gradle": "gradle",
+    "build.gradle.kts": "gradle",
+    "deno.json": "deno",
+    "go.mod": "go-module",
+    "package.json": "node",
+    "pom.xml": "maven",
+    "pyproject.toml": "python",
+}
+INSTRUCTION_NAMES = {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}
+LOCK_NAMES = {
+    "Cargo.lock",
+    "bun.lock",
+    "bun.lockb",
+    "composer.lock",
+    "Gemfile.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "yarn.lock",
+}
+
+
+def fail(message, code=1):
+    print(f"\033[1;31merror:\033[0m {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run_git(root, *arguments, binary=False):
+    result = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout if binary else result.stdout.decode().strip()
+
+
+def repository_root(path):
+    candidate = Path(path).resolve()
+    value = run_git(candidate, "rev-parse", "--show-toplevel")
+    return Path(value).resolve() if value else candidate
+
+
+def visible_files(root):
+    output = run_git(
+        root,
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        binary=True,
+    )
+    if output is not None:
+        return sorted(
+            Path(os.fsdecode(value)) for value in output.split(b"\0") if value
+        )
+    ignored = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "__pycache__",
+    }
+    paths = []
+    for directory, names, files in os.walk(root):
+        names[:] = sorted(
+            name for name in names if name not in ignored and not name.startswith(".")
+        )
+        base = Path(directory)
+        paths.extend(
+            (base / name).relative_to(root)
+            for name in sorted(files)
+            if not name.startswith(".")
+        )
+    return sorted(paths)
+
+
+def in_scope(path, scopes):
+    if not scopes or "." in scopes:
+        return True
+    text = path.as_posix()
+    return any(
+        text == scope or text.startswith(scope.rstrip("/") + "/") for scope in scopes
+    )
+
+
+def read_file(root, relative):
+    path = root / relative
+    if path.is_symlink():
+        data = os.readlink(path).encode()
+        kind = "symlink"
+    else:
+        data = path.read_bytes()
+        kind = "file"
+    return relative.as_posix(), data, kind, hashlib.sha256(data).hexdigest()
+
+
+def cache_database():
+    override = os.environ.get("REPO_MAP_CACHE_DIR")
+    base = (
+        Path(override)
+        if override
+        else Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "repo-map"
+    )
+    base.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(base / "facts.sqlite3")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS facts (
+            digest TEXT NOT NULL,
+            parser_version INTEGER NOT NULL,
+            facts_json TEXT NOT NULL,
+            PRIMARY KEY (digest, parser_version)
+        )
+        """
+    )
+    return connection
+
+
+def text_content(data):
+    if b"\0" in data[:8192]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def file_roles(path, language):
+    parts = Path(path).parts
+    name = Path(path).name
+    roles = []
+    if name in MANIFEST_NAMES:
+        roles.append("manifest")
+    if name in INSTRUCTION_NAMES:
+        roles.append("agent-instructions")
+    if name in LOCK_NAMES:
+        roles.append("lockfile")
+    if parts and parts[0] == ".github" and "workflows" in parts:
+        roles.append("workflow")
+    if "docs" in parts or Path(path).suffix.lower() in {".md", ".rst"}:
+        roles.append("documentation")
+    if (
+        "test" in parts
+        or "tests" in parts
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+    ):
+        roles.append("test")
+    if language and not roles:
+        roles.append("source")
+    return roles
+
+
+def file_language(path, data):
+    language = SOURCE_SUFFIXES.get(Path(path).suffix.lower())
+    if language or not data.startswith(b"#!"):
+        return language
+    first_line = data.splitlines()[0].decode(errors="ignore")
+    for marker, detected in (
+        ("python", "python"),
+        ("bash", "shell"),
+        ("sh", "shell"),
+        ("fish", "fish"),
+        ("ruby", "ruby"),
+    ):
+        if marker in first_line:
+            return detected
+    return None
+
+
+def python_facts(text):
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as error:
+        return {"parse_error": {"line": error.lineno, "message": error.msg}}
+    imports = []
+    symbols = []
+    tests = []
+    entrypoints = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imports.extend(
+                {"module": alias.name, "line": node.lineno} for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * node.level + (node.module or "")
+            imports.append({"module": module, "line": node.lineno})
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            kind = "class" if isinstance(node, ast.ClassDef) else "function"
+            if not node.name.startswith("_"):
+                symbols.append({"name": node.name, "kind": kind, "line": node.lineno})
+            if node.name.startswith("test_"):
+                tests.append({"name": node.name, "line": node.lineno})
+        elif isinstance(node, ast.If) and is_main_guard(node.test):
+            entrypoints.append({"kind": "main-guard", "line": node.lineno})
+    return {
+        "imports": sorted(imports, key=lambda item: (item["module"], item["line"])),
+        "public_symbols": symbols,
+        "test_cases": tests,
+        "entrypoints": entrypoints,
+    }
+
+
+def is_main_guard(node):
+    if (
+        not isinstance(node, ast.Compare)
+        or len(node.ops) != 1
+        or not isinstance(node.ops[0], ast.Eq)
+    ):
+        return False
+    values = [node.left, *node.comparators]
+    has_name = any(
+        isinstance(value, ast.Name) and value.id == "__name__" for value in values
+    )
+    has_main = any(
+        isinstance(value, ast.Constant) and value.value == "__main__"
+        for value in values
+    )
+    return has_name and has_main
+
+
+def script_imports(text, language):
+    patterns = {
+        "javascript": r"(?:from\s+|require\s*\(\s*)['\"]([^'\"]+)",
+        "typescript": r"(?:from\s+|require\s*\(\s*)['\"]([^'\"]+)",
+        "rust": r"^\s*(?:use|mod)\s+([a-zA-Z0-9_:]+)",
+        "go": r"^\s*import\s+(?:\w+\s+)?[\"`]([^\"`]+)",
+    }
+    pattern = patterns.get(language)
+    if not pattern:
+        return []
+    imports = []
+    for match in re.finditer(pattern, text, flags=re.MULTILINE):
+        imports.append(
+            {"module": match.group(1), "line": text.count("\n", 0, match.start()) + 1}
+        )
+    return imports
+
+
+def manifest_facts(path, text):
+    name = Path(path).name
+    facts = {"kind": MANIFEST_NAMES[name], "commands": [], "dependencies": []}
+    try:
+        if name == "pyproject.toml":
+            document = tomllib.loads(text)
+            project = document.get("project", {})
+            facts["requires_python"] = project.get("requires-python")
+            facts["dependencies"] = sorted(project.get("dependencies", []))
+            scripts = project.get("scripts", {})
+            facts["commands"] = [
+                {"name": key, "command": value}
+                for key, value in sorted(scripts.items())
+            ]
+        elif name == "package.json":
+            document = json.loads(text)
+            dependencies = {
+                **document.get("dependencies", {}),
+                **document.get("devDependencies", {}),
+            }
+            facts["dependencies"] = sorted(dependencies)
+            facts["commands"] = [
+                {"name": key, "command": value}
+                for key, value in sorted(document.get("scripts", {}).items())
+            ]
+            binaries = document.get("bin", {})
+            if isinstance(binaries, str):
+                binaries = {document.get("name", "package"): binaries}
+            facts["entrypoints"] = [
+                {"name": key, "target": value}
+                for key, value in sorted(binaries.items())
+            ]
+        elif name == "Cargo.toml":
+            document = tomllib.loads(text)
+            facts["dependencies"] = sorted(document.get("dependencies", {}))
+            package = document.get("package", {})
+            facts["package"] = package.get("name")
+        elif name == "go.mod":
+            match = re.search(r"^module\s+(\S+)", text, flags=re.MULTILINE)
+            facts["module"] = match.group(1) if match else None
+        elif name == "Makefile":
+            targets = re.findall(
+                r"^([a-zA-Z0-9_.-]+):(?![=])", text, flags=re.MULTILINE
+            )
+            facts["commands"] = [
+                {"name": target, "command": f"make {target}"}
+                for target in sorted(set(targets))
+            ]
+    except (json.JSONDecodeError, tomllib.TOMLDecodeError) as error:
+        facts["parse_error"] = str(error)
+    return facts
+
+
+def parse_facts(path, data, kind, max_bytes):
+    language = file_language(path, data)
+    facts = {"language": language, "roles": file_roles(path, language)}
+    if kind == "symlink":
+        facts["symlink_target"] = data.decode(errors="replace")
+        return facts
+    if len(data) > max_bytes:
+        facts["parse_skipped"] = "size"
+        return facts
+    text = text_content(data)
+    if text is None:
+        facts["parse_skipped"] = "binary"
+        return facts
+    if language == "python":
+        facts.update(python_facts(text))
+    else:
+        imports = script_imports(text, language)
+        if imports:
+            facts["imports"] = imports
+    if Path(path).name in MANIFEST_NAMES:
+        facts["manifest"] = manifest_facts(path, text)
+    return facts
+
+
+def cached_facts(connection, path, data, kind, digest, max_bytes, use_cache):
+    cache_digest = hashlib.sha256(f"{path}\0{digest}\0{max_bytes}".encode()).hexdigest()
+    if use_cache:
+        row = connection.execute(
+            "SELECT facts_json FROM facts WHERE digest = ? AND parser_version = ?",
+            (cache_digest, PARSER_VERSION),
+        ).fetchone()
+        if row:
+            return json.loads(row[0])
+    facts = parse_facts(path, data, kind, max_bytes)
+    if use_cache:
+        connection.execute(
+            "INSERT OR REPLACE INTO facts (digest, parser_version, facts_json) VALUES (?, ?, ?)",
+            (
+                cache_digest,
+                PARSER_VERSION,
+                json.dumps(facts, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+    return facts
+
+
+def build_map(root, scopes, max_bytes, use_cache):
+    paths = [path for path in visible_files(root) if in_scope(path, scopes)]
+    workers = min(32, (os.cpu_count() or 1) + 4)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        loaded = list(pool.map(lambda path: read_file(root, path), paths))
+    connection = cache_database() if use_cache else None
+    files = []
+    for path, data, kind, digest in loaded:
+        facts = cached_facts(connection, path, data, kind, digest, max_bytes, use_cache)
+        files.append(
+            {"path": path, "kind": kind, "bytes": len(data), "sha256": digest, **facts}
+        )
+    if connection:
+        connection.commit()
+    tree_hash = hashlib.sha256()
+    for item in files:
+        tree_hash.update(item["path"].encode())
+        tree_hash.update(b"\0")
+        tree_hash.update(item["sha256"].encode())
+        tree_hash.update(b"\0")
+    manifests = []
+    instructions = []
+    entrypoints = []
+    commands = []
+    language_counts = {}
+    role_counts = {}
+    for item in files:
+        if item.get("language"):
+            language_counts[item["language"]] = (
+                language_counts.get(item["language"], 0) + 1
+            )
+        for role in item["roles"]:
+            role_counts[role] = role_counts.get(role, 0) + 1
+        if "agent-instructions" in item["roles"]:
+            instructions.append(item["path"])
+        if "manifest" in item["roles"]:
+            manifest = {"path": item["path"], **item.get("manifest", {})}
+            manifests.append(manifest)
+            for command in manifest.get("commands", []):
+                commands.append({"source": item["path"], **command})
+            for entrypoint in manifest.get("entrypoints", []):
+                entrypoints.append({"source": item["path"], **entrypoint})
+        for entrypoint in item.get("entrypoints", []):
+            entrypoints.append({"source": item["path"], **entrypoint})
+    return {
+        "schema": 1,
+        "tree_sha256": tree_hash.hexdigest(),
+        "scope": sorted(scopes),
+        "summary": {
+            "files": len(files),
+            "bytes": sum(item["bytes"] for item in files),
+            "languages": dict(sorted(language_counts.items())),
+            "roles": dict(sorted(role_counts.items())),
+        },
+        "agent_instructions": instructions,
+        "manifests": manifests,
+        "commands": commands,
+        "entrypoints": entrypoints,
+        "files": files,
+    }
+
+
+def print_map(result):
+    print(f"\033[1;35m◇ repository {result['tree_sha256'][:16]}\033[0m")
+    print(f"  files       {result['summary']['files']:,}")
+    print(f"  bytes       {result['summary']['bytes']:,}")
+    languages = (
+        ", ".join(
+            f"{name} {count}" for name, count in result["summary"]["languages"].items()
+        )
+        or "none"
+    )
+    print(f"  languages   {languages}")
+    print(
+        f"  manifests   {', '.join(item['path'] for item in result['manifests']) or 'none'}"
+    )
+    print(f"  guidance    {', '.join(result['agent_instructions']) or 'none'}")
+    if result["entrypoints"]:
+        print("\n\033[38;5;183mEntrypoints\033[0m")
+        for item in result["entrypoints"][:20]:
+            target = item.get("target") or f"line {item.get('line')}"
+            name = item.get("name") or item.get("kind")
+            print(f"  {name:<20} {item['source']} · {target}")
+    if result["commands"]:
+        print("\n\033[38;5;183mCommands\033[0m")
+        for item in result["commands"][:20]:
+            print(f"  {item['name']:<20} {item['source']} · {item['command']}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build a deterministic static map of a repository without importing or executing it."
+    )
+    parser.add_argument("path", nargs="?", default=".")
+    parser.add_argument("--scope", action="append", default=[])
+    parser.add_argument("--max-parse-bytes", type=int, default=2 * 1024 * 1024)
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--force", action="store_true")
+    arguments = parser.parse_args()
+    if arguments.max_parse_bytes < 1:
+        fail("--max-parse-bytes must be positive", 2)
+    if arguments.output and arguments.output.exists() and not arguments.force:
+        fail(f"output exists: {arguments.output}; pass --force to replace it", 2)
+    root = repository_root(arguments.path)
+    scopes = [Path(scope).as_posix().strip("/") or "." for scope in arguments.scope]
+    result = build_map(root, scopes, arguments.max_parse_bytes, not arguments.no_cache)
+    encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if arguments.output:
+        arguments.output.parent.mkdir(parents=True, exist_ok=True)
+        arguments.output.write_text(encoded)
+    if arguments.json:
+        print(encoded, end="")
+    else:
+        print_map(result)
+        if arguments.output:
+            print(f"\n  map         {arguments.output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()

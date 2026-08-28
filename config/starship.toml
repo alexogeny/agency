@@ -1,0 +1,41 @@
+add_newline = true
+command_timeout = 800
+palette = "rose"
+format = "$directory$git_branch$git_status$fill$cmd_duration$line_break$character"
+
+[palettes.rose]
+blush = "#ff79c6"
+lavender = "#bd93f9"
+cream = "#f8f8f2"
+muted = "#6272a4"
+red = "#ff5555"
+gold = "#f1fa8c"
+
+[directory]
+style = "bold blush"
+read_only = " 󰁪"
+truncation_length = 4
+truncate_to_repo = false
+
+[directory.substitutions]
+"~/Code" = "󰀖 Code"
+"~/Scratch" = "󰎄 Scratch"
+"~" = "󰫤"
+
+[git_branch]
+symbol = "󰪢 "
+style = "bold lavender"
+
+[git_status]
+style = "bold red"
+
+[fill]
+symbol = " "
+
+[cmd_duration]
+min_time = 1000
+format = "[took $duration](muted)"
+
+[character]
+success_symbol = "[❯](bold blush)"
+error_symbol = "[❯](bold red)"
