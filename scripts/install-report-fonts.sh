@@ -4,6 +4,7 @@ set -euo pipefail
 version=0.7.0
 archive="cm-unicode-$version-ttf.tar.xz"
 checksum=2609c14450f42d0bcd40203900afcb1d693521a9b24a18c65e14b6b0585ff150
+mkdir -p "$HOME/Scratch"
 scratch_dir=$(mktemp -d -p "$HOME/Scratch" report-fonts.XXXXXX)
 trap 'rm -rf -- "$scratch_dir"' EXIT
 url="https://downloads.sourceforge.net/project/cm-unicode/cm-unicode/$version/$archive"

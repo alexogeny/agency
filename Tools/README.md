@@ -76,6 +76,15 @@ monochrome print-ready HTML, inspectable TeX, and a PDF from its built-in
 writer. The global `report-writing` and `report-generation` skills
 separate prose craft from source assembly and final inspection.
 
+## `system-context`
+
+Prints a compact, read-only summary of the local device class, AC or battery
+state, battery percentage, CPU and memory capacity, and visible NVIDIA or AMD
+KFD device nodes. Codex and Claude Code consume its plain-text output through
+session-start hooks so laptop sessions prefer bounded validation and ask before
+sustained high-load work. Use `system-context --json` for diagnostics or other
+tooling.
+
 ## `web-research`
 
 Runs local web search, JavaScript rendering, main-content extraction, link

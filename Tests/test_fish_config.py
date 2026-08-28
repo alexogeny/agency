@@ -7,12 +7,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FISH_CONFIG = ROOT / "config/fish/config.fish"
-SCRATCH = Path.home() / "Scratch"
+SCRATCH = Path(os.environ.get("AGENCY_TEST_SCRATCH", ROOT / ".cache/tests"))
 
 
 class GitPullFunctionTests(unittest.TestCase):
     def setUp(self):
-        SCRATCH.mkdir(exist_ok=True)
+        SCRATCH.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=SCRATCH)
         self.workspace = Path(self.temporary.name)
         self.remote = self.workspace / "remote.git"

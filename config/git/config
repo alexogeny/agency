@@ -1,3 +1,5 @@
+[include]
+	path = ~/.config/git/local
 [init]
 	defaultBranch = main
 [pull]

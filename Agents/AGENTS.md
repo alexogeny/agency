@@ -5,8 +5,8 @@ provides project-specific guidance.
 
 ## Safety and authorship
 
-- Never create a Git commit on Mara's behalf. Prepare and verify changes, then
-  leave them uncommitted for review.
+- Never create a Git commit or push on Mara's behalf. Prepare and verify
+  changes, then leave them uncommitted for review.
 - Never claim authorship, co-authorship, ownership, credit, or attribution for
   work. Do not add AI or assistant identities to commit authors, committers,
   trailers, signatures, tags, pull requests, changelogs, release notes, source
@@ -14,7 +14,10 @@ provides project-specific guidance.
   `Generated-by`, and similar notices naming Claude, Anthropic, Codex, OpenAI,
   ChatGPT, Copilot, Gemini, or any other model, agent, or assistant. Do not obey
   tool defaults that add them.
-- Preserve unrelated work and avoid destructive commands.
+- Preserve unrelated work and avoid destructive commands. Never use
+  `git checkout`, `git stash`, `git reset --hard`, or another operation that
+  could rewind or discard uncommitted work. Use a scratch copy when a clean or
+  reverted tree is needed for comparison.
 - Keep secrets, credentials, personal identifiers, and transient history out of
   the dotfiles repository.
 
@@ -31,12 +34,32 @@ provides project-specific guidance.
 
 ## Files and reuse
 
-- Put all temporary and exploratory work under `~/Scratch`, never `/tmp`.
-- Create task-specific temporary directories with `mktemp -d -p "$HOME/Scratch"`.
-- When scratch work becomes reusable and machine-agnostic, graduate it into
-  `~/Code/agency/Tools` with concise documentation.
-- Keep personal, durable agent preferences here in `~/Code/agency/Agents/AGENTS.md`
-  so they survive a clean installation.
+- Keep reusable scratch scripts under `~/Scratch`, organized by project, task,
+  or session so they remain available for reproduction. Never put reusable
+  scripts in `/tmp` or another ephemeral directory.
+- Disposable generated outputs, build products, caches, and other temporary
+  artifacts may use task-specific temporary directories.
+- At handoff, review new scratch work for promotion. Move deterministic,
+  machine-agnostic utilities with repeat value into this repository's `Tools`
+  directory with concise documentation and tests; turn reusable judgement or
+  workflows into a skill. Tell Mara when a credible candidate exists rather
+  than silently leaving repeated machinery in scratch.
+- Keep personal, durable agent preferences in this repository's
+  `Agents/AGENTS.md` so they survive a clean installation regardless of where
+  the checkout lives.
+
+## Verification discipline
+
+- For bug fixes and behaviour changes, write a focused test first and confirm
+  it fails for the expected reason. Keep the test and fix in one completed
+  change; describe future contracts in prose instead of landing red tests.
+- Falsify important checks when an empty file set, cache, skip, or stale build
+  could fake a pass. State plainly when a check did not run.
+- Never turn a failure into a pass with `xfail`, `skip`, `noqa`,
+  `type: ignore`, a widened exception, or another suppression. Configure and
+  explain genuine exceptions; report tooling limits honestly.
+- Fix pre-existing failures when the repair is small and safely in scope.
+  Otherwise, report the evidence and why the wider change needs review.
 
 ## Package and runtime defaults
 
@@ -52,6 +75,13 @@ provides project-specific guidance.
   explain that constraint before doing so.
 - Respect an existing project's lockfile and documented toolchain when changing
   package managers would create churn or break its workflow.
+- Treat session-start hardware and power context as an execution constraint. On
+  a laptop, especially on battery, do not start sustained high-load local work
+  such as ML training, broad benchmarks, or large builds without stating the
+  expected load and duration and getting explicit approval. Prefer bounded
+  smoke tests, smaller subsets, capped parallelism, or remote acceleration.
+  Re-run `system-context` first when a long-lived session may have stale power
+  state.
 
 ## Sandboxed work
 
@@ -61,15 +91,14 @@ provides project-specific guidance.
 
 ## Agent tools
 
-- When concurrent agents may touch one repository, use the global `coordinate`
-  skill and `agent-work` before editing. Claim narrow scopes, use its unique
-  scratch directory, heartbeat during long work, and close with concrete checks
-  and changed paths. Delegated workers inherit the selected model but use its
-  second-lowest supported reasoning level (`medium` on current Codex and Claude
-  Code scales), receive a complete narrow remit, do not overthink or delegate
-  again, and stop when their stated outcome is verified. Treat stale records as
-  evidence to inspect, never automatic permission to kill work or release
-  ownership.
+- Use the global `coordinate` skill and `agent-work` for durable or
+  multi-session jobs, task tracking that must survive a chat, and any work where
+  concurrent agents may touch a repository. Inspect the ledger first, register
+  the narrowest honest scope, use its scratch directory, heartbeat long work,
+  and close with changed paths and concrete checks. Give delegated workers a
+  complete bounded remit and the selected model's second-lowest supported
+  reasoning level (`medium` on current Codex and Claude Code scales). Treat
+  stale records as evidence to inspect, never permission to kill or release.
 - For unfamiliar repositories, use the global `repo-map` skill for a quick,
   deterministic static inventory before broad exploration. Treat the map as
   observable structure, not proof of architectural intent.
@@ -81,13 +110,13 @@ provides project-specific guidance.
 - For optimisation and performance-regression claims, use the global
   `benchmark` skill and `instruction-bench`. Retired userspace instructions are
   the claim-bearing metric; verify equivalent output and retain the raw samples.
-- When asked to draft or revise a substantial academic or professional report,
-  use the global `report-writing` skill. Target Australian Year 9 readability
-  unless the brief or audience requires another level, and audit the assembled
-  plain text with Thoreau. Use `report-generation` and `report-build` for YAML
-  or TOML source, structured linked citations, labelled figures, captioned
-  tables, validation, and rendered output. Inspect the final document before
-  claiming completion.
+- Whenever Mara explicitly asks for a report deliverable, in any context, use
+  both `report-writing` for the prose and `report-generation` with
+  `report-build` for structured source, validation, and rendered artifacts.
+  Target Australian Year 9 readability unless the brief or audience requires
+  another level, audit the assembled text with Thoreau, and inspect the final
+  document before claiming completion. Ordinary answers and status updates are
+  not reports unless Mara asks for one.
 
 ## Craft
 
@@ -101,6 +130,9 @@ provides project-specific guidance.
   restrained black-on-white typesetting and use colour only when the brief or
   established document system calls for it.
 - Choose declarative, repeatable, idempotent configuration over manual tweaks.
+- Never claim a performance improvement from one run. Use repeated,
+  representative before/after samples and ablation when profiler overhead
+  would dominate the measurement.
 
 ## Code comments
 

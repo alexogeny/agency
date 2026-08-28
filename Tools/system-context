@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+
+LAPTOP_CHASSIS_TYPES = {8, 9, 10, 11, 14, 30, 31, 32}
+AC_SUPPLY_TYPES = {"Mains", "USB", "USB_C", "Wireless"}
+
+
+def read_text(path):
+    try:
+        return path.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def power_supplies(sysfs):
+    root = sysfs / "class/power_supply"
+    try:
+        paths = sorted(root.iterdir())
+    except (FileNotFoundError, OSError):
+        return []
+    return [(path, read_text(path / "type")) for path in paths]
+
+
+def is_system_battery(path, supply_type):
+    return (
+        supply_type == "Battery"
+        and read_text(path / "present") != "0"
+        and read_text(path / "scope") != "Device"
+    )
+
+
+def device_class(sysfs, supplies):
+    chassis = read_text(sysfs / "class/dmi/id/chassis_type")
+    try:
+        if int(chassis) in LAPTOP_CHASSIS_TYPES:
+            return "laptop"
+    except (TypeError, ValueError):
+        pass
+    if any(is_system_battery(path, supply_type) for path, supply_type in supplies):
+        return "laptop"
+    return "desktop"
+
+
+def power_source(device, supplies):
+    if any(
+        supply_type in AC_SUPPLY_TYPES and read_text(path / "online") == "1"
+        for path, supply_type in supplies
+    ):
+        return "ac"
+    battery_statuses = {
+        read_text(path / "status")
+        for path, supply_type in supplies
+        if is_system_battery(path, supply_type)
+    }
+    if "Discharging" in battery_statuses:
+        return "battery"
+    if battery_statuses & {"Charging", "Full", "Not charging"}:
+        return "ac"
+    if device == "laptop" and battery_statuses:
+        return "battery"
+    return "unknown"
+
+
+def battery_percent(supplies):
+    capacities = []
+    for path, supply_type in supplies:
+        if not is_system_battery(path, supply_type):
+            continue
+        value = read_text(path / "capacity")
+        try:
+            capacities.append(int(value))
+        except (TypeError, ValueError):
+            pass
+    if not capacities:
+        return None
+    return round(sum(capacities) / len(capacities))
+
+
+def logical_cpus():
+    override = os.environ.get("AGENCY_LOGICAL_CPUS")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    return os.cpu_count()
+
+
+def memory_gib(procfs):
+    meminfo = read_text(procfs / "meminfo") or ""
+    for line in meminfo.splitlines():
+        if not line.startswith("MemTotal:"):
+            continue
+        try:
+            kib = int(line.split()[1])
+            return round(kib / 1024 / 1024)
+        except (IndexError, ValueError):
+            return None
+    return None
+
+
+def accelerator(dev_root):
+    if (dev_root / "nvidia0").exists():
+        return "nvidia-device (runtime unverified)"
+    if (dev_root / "kfd").exists():
+        return "amd-kfd-device (runtime unverified)"
+    return "none-detected"
+
+
+def resource_policy(device, power):
+    high_load = (
+        "sustained high-load local work such as ML training or large-model "
+        "inference, broad benchmarks, large builds, or jobs likely to run "
+        "longer than five minutes"
+    )
+    alternatives = (
+        "Prefer smoke tests, small subsets, capped parallelism, or a remote "
+        "accelerated runner."
+    )
+    if device == "laptop" and power == "battery":
+        return (
+            f"Treat this as a thermally constrained laptop. Do not start {high_load} "
+            f"without explicit approval. {alternatives} Preserve battery power by default."
+        )
+    if device == "laptop":
+        return (
+            f"Do not assume server-class resources on this laptop. Before {high_load}, "
+            f"state the expected load and duration and get explicit approval. {alternatives}"
+        )
+    return (
+        "Normal local validation is appropriate, but before unusually long or "
+        "resource-intensive jobs, state the expected load and duration and get "
+        "explicit approval."
+    )
+
+
+def collect_context():
+    sysfs = Path(os.environ.get("AGENCY_SYSFS_ROOT", "/sys"))
+    procfs = Path(os.environ.get("AGENCY_PROCFS_ROOT", "/proc"))
+    dev_root = Path(os.environ.get("AGENCY_DEV_ROOT", "/dev"))
+    supplies = power_supplies(sysfs)
+    device = device_class(sysfs, supplies)
+    power = power_source(device, supplies)
+    return {
+        "device_class": device,
+        "power_source": power,
+        "battery_percent": battery_percent(supplies),
+        "logical_cpus": logical_cpus(),
+        "memory_gib": memory_gib(procfs),
+        "compute_accelerator": accelerator(dev_root),
+        "resource_policy": resource_policy(device, power),
+    }
+
+
+def plain_context(context):
+    power = context["power_source"]
+    if power == "battery" and context["battery_percent"] is not None:
+        power = f"battery ({context['battery_percent']}%)"
+    hardware = [f"{context['device_class']} on {power}"]
+    if context["logical_cpus"] is not None:
+        hardware.append(f"{context['logical_cpus']} logical CPUs")
+    if context["memory_gib"] is not None:
+        hardware.append(f"{context['memory_gib']} GiB RAM")
+    hardware.append(f"compute device: {context['compute_accelerator']}")
+    return (
+        f"Local system context: {', '.join(hardware)}.\n"
+        f"Resource policy: {context['resource_policy']}\n"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Report local hardware and power constraints to coding agents."
+    )
+    parser.add_argument("--json", action="store_true")
+    arguments = parser.parse_args()
+    context = collect_context()
+    if arguments.json:
+        print(json.dumps(context, sort_keys=True))
+    else:
+        print(plain_context(context), end="")
+
+
+if __name__ == "__main__":
+    main()
