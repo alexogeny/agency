@@ -1,12 +1,12 @@
-# 🎀 Mara's dots
+# 🎀 Mara's agency
 
 A small, declarative bootstrap for a fresh CachyOS/Arch workstation.
 
 ## Bootstrap
 
 ```sh
-git clone <your-repository-url> ~/Code/Dots
-cd ~/Code/Dots
+git clone <your-repository-url> ~/Code/agency
+cd ~/Code/agency
 ./install.sh
 ```
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOTS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+AGENCY_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 mkdir -p "$HOME/.config"
-ln -sfn "$DOTS_DIR/config/kde/powerdevilrc" "$HOME/.config/powerdevilrc"
+ln -sfn "$AGENCY_DIR/config/kde/powerdevilrc" "$HOME/.config/powerdevilrc"
 
 # PowerDevil reloads the linked policy immediately when a Plasma session exists.
 systemctl --user try-restart plasma-powerdevil.service 2>/dev/null || true
