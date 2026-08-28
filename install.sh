@@ -64,6 +64,7 @@ agency_link "$AGENCY_DIR/Tools/instruction-bench" "$HOME/.local/bin/instruction-
 agency_link "$AGENCY_DIR/Tools/repo-map" "$HOME/.local/bin/repo-map"
 agency_link "$AGENCY_DIR/Tools/report-build" "$HOME/.local/bin/report-build"
 agency_link "$AGENCY_DIR/Tools/system-context" "$HOME/.local/bin/system-context"
+agency_link "$AGENCY_DIR/Tools/sudo-gui" "$HOME/.local/bin/sudo-gui"
 agency_link "$AGENCY_DIR/Tools/web-research" "$HOME/.local/bin/web-research"
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.claude/CLAUDE.md"
@@ -114,7 +115,6 @@ agency_link "$AGENCY_DIR/config/git/hooks" "$HOME/.config/git/hooks"
 rustup default stable
 "$AGENCY_DIR/scripts/install-agent-clis.sh"
 "$AGENCY_DIR/scripts/install-python-tools.sh"
-uv tool install --upgrade podman-compose
 
 mkdir -p "$HOME/.config/containers"
 agency_link "$AGENCY_DIR/config/containers/containers.conf" \

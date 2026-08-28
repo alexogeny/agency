@@ -62,6 +62,11 @@ class InstallHelperTests(unittest.TestCase):
             (self.backups / "home/.config/example").read_text(), "existing\n"
         )
 
+    def test_backup_root_is_created_before_privileged_descendants(self):
+        self.run_bash('source "$1"; agency_ensure_backup_root', LIB)
+
+        self.assertTrue(self.backups.is_dir())
+
     def test_existing_symlink_is_replaced_without_backup(self):
         source = self.workspace / "source"
         old_source = self.workspace / "old-source"

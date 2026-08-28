@@ -85,6 +85,15 @@ session-start hooks so laptop sessions prefer bounded validation and ask before
 sustained high-load work. Use `system-context --json` for diagnostics or other
 tooling.
 
+## `sudo-gui`
+
+Opens one KDE password dialog for an explicitly approved sudo operation, makes
+one authentication attempt, and runs the requested workflow in the same
+process context so sudo's cached authorization remains usable. It refuses to
+prompt during an active PAM lockout and never retries automatically. Passwords
+remain in process memory only and are not written to files, arguments,
+environment variables, or output.
+
 ## `web-research`
 
 Runs local web search, JavaScript rendering, main-content extraction, link
