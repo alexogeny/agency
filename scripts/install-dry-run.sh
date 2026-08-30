@@ -112,7 +112,12 @@ agency_plan_user_links() {
     long-processes
     sandbox
     agent-work
+    comment-audit
+    docs-exec
+    document-inspect
+    evidence-review
     instruction-bench
+    perf-diagnose
     repo-map
     report-build
     system-context
@@ -183,6 +188,10 @@ agency_print_install_plan() {
   fi
   printf '  [%-16s] pacman -Syu --needed --noconfirm %s\n' \
     "install/update" "${packages[*]}"
+  printf '  [%-16s] yay from its reviewed AUR recipe as the normal user\n' \
+    "install AUR"
+  printf '  [%-16s] nghttp2 recipe with an unversioned zlib provider; verify h2load\n' \
+    "install AUR"
   printf '  [%-16s] verified Computer Modern Unicode fonts\n' "install fonts"
   printf '  [%-16s] stable toolchain\n' "rustup default"
   printf '  [%-16s] Codex, Claude Code, and Pi through Bun\n' "install CLIs"

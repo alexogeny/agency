@@ -54,6 +54,39 @@ output evidence and retains raw counts plus reproducibility metadata in JSON.
 Use `instruction-bench --help`; the global `benchmark` skill contains the TOML
 format and evidence rules.
 
+## `document-inspect`
+
+Renders a PDF into numbered page images, extracts layout-preserving text,
+builds a contact sheet, and writes a hashed JSON manifest. Optional local OCR
+supports image-only documents. It refuses a populated output directory so a
+new inspection cannot silently mix with stale pages.
+
+## `docs-exec`
+
+Extracts Markdown code fences by their `title=` values and executes declarative
+TOML cases in isolated temporary directories. Each result retains the command,
+extracted-file hashes, stdout, stderr, and status. The `docs-verification` skill
+defines how to rehearse reader-visible instructions safely.
+
+## `evidence-review`
+
+Normalises CSV, JSON, and JSONL evidence exports into a stable screening ledger,
+marks exact DOI or normalised-title duplicates, and audits decisions, exclusion
+reasons, identifiers, and duplicate links. It never makes substantive screening
+judgements.
+
+## `perf-diagnose`
+
+Captures `perf stat` counters or `perf record` profiles with machine metadata
+and a machine-readable manifest. Its results are explicitly diagnostic; use
+`instruction-bench` for evidence supporting optimisation claims.
+
+## `comment-audit`
+
+Scans common source and configuration formats for empty comments, decorative
+section comments, and historical narration. Python comments and docstrings use
+the tokenizer and AST. Findings are review prompts and no files are changed.
+
 ## `repo-map`
 
 Builds a deterministic static JSON map from Git-visible files without importing

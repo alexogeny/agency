@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+
+FENCE_START = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+TITLE = re.compile(r"(?:^|\s)title=(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))")
+
+
+def fail(message: str, status: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(status)
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def fences(path: Path) -> dict[str, bytes]:
+    lines = path.read_text().splitlines(keepends=True)
+    found: dict[str, bytes] = {}
+    index = 0
+    while index < len(lines):
+        match = FENCE_START.match(lines[index].rstrip("\r\n"))
+        if match is None:
+            index += 1
+            continue
+        marker = match.group(1)
+        attributes = match.group(2)
+        title_match = TITLE.search(attributes)
+        title = (
+            next((value for value in title_match.groups() if value), None)
+            if title_match
+            else None
+        )
+        body = []
+        index += 1
+        while index < len(lines) and not re.match(
+            rf"^\s*{re.escape(marker[0])}{{{len(marker)},}}\s*$",
+            lines[index].rstrip("\r\n"),
+        ):
+            body.append(lines[index])
+            index += 1
+        if index == len(lines):
+            fail(f"unclosed code fence in {path}")
+        if title:
+            if title in found:
+                fail(f"duplicate fenced block title {title!r} in {path}")
+            found[title] = "".join(body).encode()
+        index += 1
+    return found
+
+
+def relative_path(root: Path, value: str, field: str) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        fail(f"{field} must stay beneath its root: {value}", 2)
+    return root / candidate
+
+
+def load_manifest(path: Path) -> dict:
+    try:
+        document = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        fail(f"cannot read manifest: {error}", 2)
+    if document.get("schema_version") != 1:
+        fail("manifest schema_version must be 1", 2)
+    cases = document.get("case")
+    if not isinstance(cases, list) or not cases:
+        fail("manifest must contain at least one [[case]]", 2)
+    return document
+
+
+def validate_case(case: dict, position: int) -> None:
+    name = case.get("name")
+    document = case.get("document")
+    files = case.get("files")
+    command = case.get("command")
+    if not isinstance(name, str) or not name.strip():
+        fail(f"case {position} has no name", 2)
+    if not isinstance(document, str):
+        fail(f"case {name} has no document", 2)
+    if not isinstance(files, dict) or not files:
+        fail(f"case {name} has no files mapping", 2)
+    if not all(isinstance(key, str) and isinstance(value, str) for key, value in files.items()):
+        fail(f"case {name} files must map output paths to fence titles", 2)
+    if not isinstance(command, list) or not command or not all(
+        isinstance(value, str) for value in command
+    ):
+        fail(f"case {name} command must be a non-empty string array", 2)
+
+
+def execute_case(case: dict, root: Path, case_root: Path) -> dict:
+    name = case["name"]
+    document = relative_path(root, case["document"], f"case {name} document")
+    if not document.is_file():
+        fail(f"case {name} document does not exist: {document}")
+    blocks = fences(document)
+    files = []
+    for destination_value, title in sorted(case["files"].items()):
+        if title not in blocks:
+            fail(f"case {name} has no fenced block titled {title!r}")
+        destination = relative_path(case_root, destination_value, f"case {name} file")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(blocks[title])
+        files.append(
+            {
+                "path": destination_value,
+                "title": title,
+                "bytes": len(blocks[title]),
+                "sha256": digest(blocks[title]),
+            }
+        )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DOCS_EXEC_PROJECT_ROOT": str(root),
+            "DOCS_EXEC_CASE_DIR": str(case_root),
+        }
+    )
+    extra_environment = case.get("env", {})
+    if not isinstance(extra_environment, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in extra_environment.items()
+    ):
+        fail(f"case {name} env must map names to strings", 2)
+    environment.update(extra_environment)
+    result = subprocess.run(
+        case["command"],
+        cwd=case_root,
+        env=environment,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    return {
+        "name": name,
+        "document": str(document),
+        "command": case["command"],
+        "command_display": shlex.join(case["command"]),
+        "files": files,
+        "status": "passed" if result.returncode == 0 else "failed",
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Extract named Markdown fences and execute declared examples."
+    )
+    parser.add_argument("manifest", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--scratch", type=Path)
+    parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    arguments = parser.parse_args()
+    manifest_path = arguments.manifest.resolve()
+    output = arguments.output.resolve()
+    if output.exists():
+        fail(f"output already exists: {output}", 2)
+    manifest = load_manifest(manifest_path)
+    root_value = manifest.get("root", ".")
+    if not isinstance(root_value, str):
+        fail("manifest root must be text", 2)
+    root_path = Path(root_value)
+    root = (
+        root_path.resolve()
+        if root_path.is_absolute()
+        else (manifest_path.parent / root_path).resolve()
+    )
+    if not root.is_dir():
+        fail(f"manifest root does not exist: {root}", 2)
+    for position, case in enumerate(manifest["case"], 1):
+        if not isinstance(case, dict):
+            fail(f"case {position} must be a table", 2)
+        validate_case(case, position)
+    scratch = arguments.scratch.resolve() if arguments.scratch else None
+    if scratch:
+        scratch.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    if arguments.keep:
+        workspace = Path(tempfile.mkdtemp(prefix="docs-exec-", dir=scratch))
+    else:
+        temporary = tempfile.TemporaryDirectory(prefix="docs-exec-", dir=scratch)
+        workspace = Path(temporary.name)
+    cases = []
+    for position, case in enumerate(manifest["case"], 1):
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", case["name"]).strip("-")
+        case_root = workspace / f"{position:03d}-{safe_name}"
+        case_root.mkdir()
+        cases.append(execute_case(case, root, case_root))
+    retained = None
+    if arguments.keep:
+        retained = str(workspace)
+    report = {
+        "schema": "agency/docs-exec/1",
+        "manifest": str(manifest_path),
+        "root": str(root),
+        "status": "passed" if all(case["returncode"] == 0 for case in cases) else "failed",
+        "cases": cases,
+        "retained_workspace": retained,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    output.write_text(encoded)
+    if arguments.json:
+        print(encoded, end="")
+    else:
+        for case in cases:
+            print(f"{case['name']}: {case['status']}")
+        print(f"Results: {output}")
+    if temporary is not None:
+        temporary.cleanup()
+    if report["status"] == "failed":
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
