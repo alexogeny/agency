@@ -118,6 +118,16 @@ provides project-specific guidance.
   document before claiming completion. Ordinary answers and status updates are
   not reports unless Mara asks for one.
 
+### Reusable capability manifest
+
+| Skill | Use when | Why |
+| --- | --- | --- |
+| `document-inspection` | A PDF's rendered pages, layout, or OCR matter. | Produces page images, text, a contact sheet, and a hashed manifest for direct inspection. |
+| `docs-verification` | README commands or fenced examples must work as written. | Rehearses reader-visible instructions in clean, retained cases instead of trusting snippets. |
+| `evidence-review` | A scoped review needs searches, screening, deduplication, and exclusion records. | Keeps source selection reproducible and separates evidence logs from report prose. |
+| `perf-diagnosis` | Counters or profiles are needed to locate costly work. | Preserves the boundary between diagnostic PMU evidence and claim-bearing benchmarks. |
+| `comment-audit` | Comment or docstring hygiene is explicitly requested. | Finds narrow cleanup candidates while leaving contextual judgement and edits to review. |
+
 ## Craft
 
 - Make code aggressively performant while keeping its behaviour obvious from

@@ -393,6 +393,14 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("merge hooks", result.stdout)
         self.assertIn("powerdevil-laptoprc", result.stdout)
         self.assertIn("pacman -Syu", result.stdout)
+        self.assertIn("base-devel", result.stdout)
+        self.assertIn("yay", result.stdout)
+        self.assertIn("h2load", result.stdout)
+        self.assertIn("document-inspect", result.stdout)
+        self.assertIn("docs-exec", result.stdout)
+        self.assertIn("evidence-review", result.stdout)
+        self.assertIn("perf-diagnose", result.stdout)
+        self.assertIn("comment-audit", result.stdout)
         self.assertIn("No changes were made", result.stdout)
 
     def test_help_is_non_mutating(self):

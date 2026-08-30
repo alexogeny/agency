@@ -1,4 +1,6 @@
 # Native repository packages, one per line for easy review.
+git
+base-devel
 uv
 bun
 github-cli
@@ -8,6 +10,10 @@ btop
 bottom
 hyperfine
 perf
+poppler
+imagemagick
+tesseract
+tesseract-data-eng
 strace
 lsof
 sysstat

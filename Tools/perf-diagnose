@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def fail(message: str, status: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(status)
+
+
+def perf() -> str:
+    path = shutil.which("perf")
+    if path is None:
+        fail("perf is unavailable", 2)
+    return path
+
+
+def command_output(command: list[str]) -> str | None:
+    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def cpu_model() -> str | None:
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.casefold().startswith("model name"):
+                return line.partition(":")[2].strip()
+    except OSError:
+        pass
+    return None
+
+
+def numeric(value: str) -> int | float | None:
+    value = value.strip().replace(",", "")
+    if value in {"<not counted>", "<not supported>", ""}:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    return int(parsed) if parsed.is_integer() else parsed
+
+
+def parse_stat(path: Path) -> list[dict[str, str | int | float | None]]:
+    events = []
+    for line in path.read_text().splitlines():
+        fields = line.split(";")
+        if len(fields) < 3:
+            continue
+        count = numeric(fields[0])
+        name = fields[2].strip()
+        if not name:
+            continue
+        events.append(
+            {
+                "name": name,
+                "count": count,
+                "unit": fields[1].strip() or None,
+                "runtime_percent": numeric(fields[4]) if len(fields) > 4 else None,
+                "supported": count is not None,
+            }
+        )
+    if not events:
+        fail("perf returned no parseable counters")
+    return events
+
+
+def command(arguments: list[str]) -> list[str]:
+    if arguments and arguments[0] == "--":
+        arguments = arguments[1:]
+    if not arguments:
+        fail("a command is required after --", 2)
+    return arguments
+
+
+def metadata(run_command: list[str], events: list[str], cpu: int | None) -> dict:
+    return {
+        "claim_boundary": "diagnostic-only",
+        "command": run_command,
+        "requested_events": events,
+        "cpu": cpu,
+        "host": {
+            "cpu_model": cpu_model(),
+            "kernel": platform.release(),
+            "machine": platform.machine(),
+            "perf": command_output([perf(), "--version"]),
+        },
+    }
+
+
+def write_output(path: Path, document: dict, as_json: bool) -> None:
+    resolved = path.resolve()
+    if resolved.exists():
+        fail(f"output already exists: {resolved}", 2)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    resolved.write_text(encoded)
+    if as_json:
+        print(encoded, end="")
+
+
+def stat(arguments: argparse.Namespace) -> None:
+    run_command = command(arguments.command)
+    if arguments.output.resolve().exists():
+        fail(f"output already exists: {arguments.output.resolve()}", 2)
+    measured = (
+        ["taskset", "-c", str(arguments.cpu), *run_command]
+        if arguments.cpu is not None
+        else run_command
+    )
+    with tempfile.NamedTemporaryFile(
+        prefix="perf-diagnose-", suffix=".stat", delete=False
+    ) as handle:
+        raw_path = Path(handle.name)
+    try:
+        invocation = [perf(), "stat", "-x", ";", "-o", str(raw_path)]
+        for event in arguments.event:
+            invocation.extend(("-e", event))
+        invocation.extend(("--", *measured))
+        result = subprocess.run(invocation, check=False, text=True, capture_output=True)
+        if result.returncode:
+            fail(result.stderr.strip() or f"perf stat failed with status {result.returncode}")
+        report = {
+            "schema": "agency/perf-diagnose/stat/1",
+            **metadata(run_command, arguments.event, arguments.cpu),
+            "events": parse_stat(raw_path),
+            "command_stdout": result.stdout,
+            "command_stderr": result.stderr,
+        }
+        write_output(arguments.output, report, arguments.json)
+        if not arguments.json:
+            for event in report["events"]:
+                count = "unsupported" if event["count"] is None else f"{event['count']:,}"
+                print(f"{event['name']}: {count}")
+            print(f"Diagnostic result: {arguments.output.resolve()}")
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+
+def record(arguments: argparse.Namespace) -> None:
+    run_command = command(arguments.command)
+    data = arguments.output.resolve()
+    manifest = arguments.manifest.resolve()
+    if data.exists() or manifest.exists():
+        fail("record output or manifest already exists", 2)
+    data.parent.mkdir(parents=True, exist_ok=True)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    measured = (
+        ["taskset", "-c", str(arguments.cpu), *run_command]
+        if arguments.cpu is not None
+        else run_command
+    )
+    invocation = [perf(), "record", "-o", str(data), "-e", arguments.event]
+    if arguments.call_graph:
+        invocation.append("-g")
+    invocation.extend(("--", *measured))
+    result = subprocess.run(invocation, check=False, text=True, capture_output=True)
+    if result.returncode:
+        data.unlink(missing_ok=True)
+        fail(result.stderr.strip() or f"perf record failed with status {result.returncode}")
+    report = {
+        "schema": "agency/perf-diagnose/record/1",
+        **metadata(run_command, [arguments.event], arguments.cpu),
+        "profile": str(data),
+        "profile_bytes": data.stat().st_size,
+        "call_graph": arguments.call_graph,
+        "command_stdout": result.stdout,
+        "command_stderr": result.stderr,
+    }
+    encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    manifest.write_text(encoded)
+    if arguments.json:
+        print(encoded, end="")
+    else:
+        print(f"Profile: {data}")
+        print(f"Manifest: {manifest}")
+
+
+def events(arguments: argparse.Namespace) -> None:
+    result = subprocess.run([perf(), "list"], check=False, text=True, capture_output=True)
+    if result.returncode:
+        fail(result.stderr.strip() or "perf list failed")
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if arguments.contains:
+        pattern = re.compile(re.escape(arguments.contains), re.IGNORECASE)
+        lines = [line for line in lines if pattern.search(line)]
+    if arguments.json:
+        print(json.dumps({"schema": "agency/perf-diagnose/events/1", "lines": lines}, indent=2))
+    else:
+        print("\n".join(lines))
+
+
+def add_cpu(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cpu", type=int)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Collect non-claim-bearing perf counter and profile diagnostics."
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    stat_parser = subparsers.add_parser("stat")
+    stat_parser.add_argument("--event", action="append", default=[])
+    stat_parser.add_argument("--output", type=Path, required=True)
+    stat_parser.add_argument("--json", action="store_true")
+    add_cpu(stat_parser)
+    stat_parser.add_argument("command", nargs=argparse.REMAINDER)
+    stat_parser.set_defaults(handler=stat)
+    record_parser = subparsers.add_parser("record")
+    record_parser.add_argument("--event", default="cycles:u")
+    record_parser.add_argument("--output", type=Path, required=True)
+    record_parser.add_argument("--manifest", type=Path, required=True)
+    record_parser.add_argument("--call-graph", action=argparse.BooleanOptionalAction, default=True)
+    record_parser.add_argument("--json", action="store_true")
+    add_cpu(record_parser)
+    record_parser.add_argument("command", nargs=argparse.REMAINDER)
+    record_parser.set_defaults(handler=record)
+    event_parser = subparsers.add_parser("events")
+    event_parser.add_argument("--contains")
+    event_parser.add_argument("--json", action="store_true")
+    event_parser.set_defaults(handler=events)
+    arguments = parser.parse_args()
+    if getattr(arguments, "cpu", 0) is not None and getattr(arguments, "cpu", 0) < 0:
+        fail("--cpu must not be negative", 2)
+    if arguments.subcommand == "stat" and not arguments.event:
+        arguments.event = ["instructions:u"]
+    arguments.handler(arguments)
+
+
+if __name__ == "__main__":
+    main()

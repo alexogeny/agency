@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Iterable
+
+
+FIELDS = (
+    "source_id",
+    "title",
+    "year",
+    "authors",
+    "doi",
+    "url",
+    "discovery_source",
+    "discovery_record_id",
+    "duplicate_of",
+    "title_abstract_decision",
+    "title_abstract_reason",
+    "full_text_decision",
+    "full_text_reason",
+    "notes",
+)
+ALIASES = {
+    "title": ("title", "article_title", "name"),
+    "year": ("year", "publication_year", "pubdate", "date"),
+    "authors": ("authors", "author", "creator"),
+    "doi": ("doi", "digital_object_identifier"),
+    "url": ("url", "link", "record_url"),
+    "record_id": ("id", "uid", "record_id", "source_id", "pmid"),
+}
+DECISIONS = {"", "pending", "include", "exclude"}
+
+
+def fail(message: str, status: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(status)
+
+
+def first(record: dict, names: Iterable[str]) -> str:
+    for name in names:
+        value = record.get(name)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            return "; ".join(str(item) for item in value)
+        if isinstance(value, dict):
+            return json.dumps(value, sort_keys=True)
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def normalise_title(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def normalise_doi(value: str) -> str:
+    value = value.strip().casefold()
+    value = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", value)
+    return value.rstrip(" .")
+
+
+def year(value: str) -> str:
+    match = re.search(r"(?:19|20)[0-9]{2}", value)
+    return match.group(0) if match else value.strip()
+
+
+def json_records(document: object, records_key: str | None) -> list[dict]:
+    current = document
+    if records_key:
+        for part in records_key.split("."):
+            if not isinstance(current, dict) or part not in current:
+                fail(f"JSON records key does not exist: {records_key}", 2)
+            current = current[part]
+    if isinstance(current, list):
+        records = current
+    elif isinstance(current, dict):
+        records = list(current.values())
+    else:
+        fail("JSON records must be an array or object", 2)
+    return [record for record in records if isinstance(record, dict)]
+
+
+def load_records(path: Path, records_key: str | None) -> list[dict]:
+    suffix = path.suffix.casefold()
+    if suffix == ".csv":
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            return list(csv.DictReader(handle))
+    if suffix in {".jsonl", ".ndjson"}:
+        records = []
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                fail(f"{path}:{number} is not a JSON object", 2)
+            records.append(value)
+        return records
+    if suffix == ".json":
+        return json_records(json.loads(path.read_text()), records_key)
+    fail(f"unsupported evidence input: {path}", 2)
+
+
+def ingest(arguments: argparse.Namespace) -> None:
+    output = arguments.output.resolve()
+    if output.exists():
+        fail(f"output already exists: {output}", 2)
+    records = []
+    for path in arguments.input:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            fail(f"input does not exist: {resolved}", 2)
+        records.extend(load_records(resolved, arguments.records_key))
+    if not records:
+        fail("inputs contain no evidence records", 2)
+    seen_doi: dict[str, str] = {}
+    seen_title: dict[str, str] = {}
+    rows = []
+    for offset, record in enumerate(records, arguments.start):
+        source_id = f"{arguments.id_prefix}{offset:03d}"
+        title = first(record, ALIASES["title"])
+        doi = normalise_doi(first(record, ALIASES["doi"]))
+        title_key = normalise_title(title)
+        duplicate = seen_doi.get(doi) if doi else None
+        if duplicate is None and title_key:
+            duplicate = seen_title.get(title_key)
+        row = {
+            "source_id": source_id,
+            "title": title,
+            "year": year(first(record, ALIASES["year"])),
+            "authors": first(record, ALIASES["authors"]),
+            "doi": doi,
+            "url": first(record, ALIASES["url"]),
+            "discovery_source": arguments.source,
+            "discovery_record_id": first(record, ALIASES["record_id"]),
+            "duplicate_of": duplicate or "",
+            "title_abstract_decision": "pending",
+            "title_abstract_reason": "",
+            "full_text_decision": "pending",
+            "full_text_reason": "",
+            "notes": "",
+        }
+        rows.append(row)
+        if doi and doi not in seen_doi:
+            seen_doi[doi] = source_id
+        if title_key and title_key not in seen_title:
+            seen_title[title_key] = source_id
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = {
+        "records": len(rows),
+        "duplicates": sum(bool(row["duplicate_of"]) for row in rows),
+        "output": str(output),
+    }
+    if arguments.json:
+        print(json.dumps(summary, sort_keys=True))
+    else:
+        print(f"Wrote {len(rows)} records to {output}")
+
+
+def audit(arguments: argparse.Namespace) -> None:
+    ledger = arguments.ledger.resolve()
+    with ledger.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        fields = set(reader.fieldnames or ())
+    issues = []
+    missing = set(FIELDS) - fields
+    if missing:
+        issues.append(
+            {
+                "row": None,
+                "field": None,
+                "message": f"missing fields: {', '.join(sorted(missing))}",
+            }
+        )
+    identifiers = [row.get("source_id", "") for row in rows]
+    known = set(identifiers)
+    for source_id, count in Counter(identifiers).items():
+        if not source_id:
+            issues.append(
+                {"row": None, "field": "source_id", "message": "empty source_id"}
+            )
+        elif count > 1:
+            issues.append(
+                {
+                    "row": None,
+                    "field": "source_id",
+                    "message": f"duplicate source_id: {source_id}",
+                }
+            )
+    for number, row in enumerate(rows, 2):
+        if not row.get("title", "").strip():
+            issues.append({"row": number, "field": "title", "message": "title is empty"})
+        duplicate = row.get("duplicate_of", "").strip()
+        if duplicate and duplicate not in known:
+            issues.append(
+                {
+                    "row": number,
+                    "field": "duplicate_of",
+                    "message": f"unknown source_id: {duplicate}",
+                }
+            )
+        for decision_field, reason_field in (
+            ("title_abstract_decision", "title_abstract_reason"),
+            ("full_text_decision", "full_text_reason"),
+        ):
+            decision = row.get(decision_field, "").strip().casefold()
+            if decision not in DECISIONS:
+                issues.append(
+                    {
+                        "row": number,
+                        "field": decision_field,
+                        "message": f"unsupported decision: {decision}",
+                    }
+                )
+            if decision == "exclude" and not row.get(reason_field, "").strip():
+                issues.append(
+                    {
+                        "row": number,
+                        "field": reason_field,
+                        "message": "excluded records require a reason",
+                    }
+                )
+    title_counts = Counter(
+        (row.get("title_abstract_decision") or "").strip().casefold() or "pending"
+        for row in rows
+    )
+    full_counts = Counter(
+        (row.get("full_text_decision") or "").strip().casefold() or "pending"
+        for row in rows
+    )
+    report = {
+        "schema": "agency/evidence-review/audit/1",
+        "ledger": str(ledger),
+        "valid": not issues,
+        "counts": {
+            "records": len(rows),
+            "duplicates": sum(bool(row.get("duplicate_of", "").strip()) for row in rows),
+            "title_abstract": dict(sorted(title_counts.items())),
+            "full_text": dict(sorted(full_counts.items())),
+        },
+        "issues": issues,
+    }
+    encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if arguments.output:
+        output = arguments.output.resolve()
+        if output.exists():
+            fail(f"output already exists: {output}", 2)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(encoded)
+    if arguments.json:
+        print(encoded, end="")
+    else:
+        print(f"{len(rows)} records; {len(issues)} issue(s)")
+    if issues:
+        raise SystemExit(1)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Normalise, deduplicate, and audit structured evidence ledgers."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    ingest_parser = subparsers.add_parser("ingest")
+    ingest_parser.add_argument("input", type=Path, nargs="+")
+    ingest_parser.add_argument("--source", required=True)
+    ingest_parser.add_argument("--output", type=Path, required=True)
+    ingest_parser.add_argument("--records-key")
+    ingest_parser.add_argument("--id-prefix", default="S")
+    ingest_parser.add_argument("--start", type=int, default=1)
+    ingest_parser.add_argument("--json", action="store_true")
+    ingest_parser.set_defaults(handler=ingest)
+    audit_parser = subparsers.add_parser("audit")
+    audit_parser.add_argument("ledger", type=Path)
+    audit_parser.add_argument("--output", type=Path)
+    audit_parser.add_argument("--json", action="store_true")
+    audit_parser.set_defaults(handler=audit)
+    arguments = parser.parse_args()
+    if getattr(arguments, "start", 1) < 1:
+        fail("--start must be positive", 2)
+    arguments.handler(arguments)
+
+
+if __name__ == "__main__":
+    main()

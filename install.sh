@@ -60,7 +60,12 @@ agency_link "$AGENCY_DIR/Tools/git-get" "$HOME/.local/bin/git-get"
 agency_link "$AGENCY_DIR/Tools/long-processes" "$HOME/.local/bin/long-processes"
 agency_link "$AGENCY_DIR/Tools/sandbox" "$HOME/.local/bin/sandbox"
 agency_link "$AGENCY_DIR/Tools/agent-work" "$HOME/.local/bin/agent-work"
+agency_link "$AGENCY_DIR/Tools/comment-audit" "$HOME/.local/bin/comment-audit"
+agency_link "$AGENCY_DIR/Tools/docs-exec" "$HOME/.local/bin/docs-exec"
+agency_link "$AGENCY_DIR/Tools/document-inspect" "$HOME/.local/bin/document-inspect"
+agency_link "$AGENCY_DIR/Tools/evidence-review" "$HOME/.local/bin/evidence-review"
 agency_link "$AGENCY_DIR/Tools/instruction-bench" "$HOME/.local/bin/instruction-bench"
+agency_link "$AGENCY_DIR/Tools/perf-diagnose" "$HOME/.local/bin/perf-diagnose"
 agency_link "$AGENCY_DIR/Tools/repo-map" "$HOME/.local/bin/repo-map"
 agency_link "$AGENCY_DIR/Tools/report-build" "$HOME/.local/bin/report-build"
 agency_link "$AGENCY_DIR/Tools/system-context" "$HOME/.local/bin/system-context"
@@ -99,6 +104,7 @@ if (( ${#competing_container_packages[@]} )); then
 fi
 
 agency_as_root pacman -Syu --needed --noconfirm "${packages[@]}"
+"$AGENCY_DIR/scripts/install-yay-h2load.sh"
 "$AGENCY_DIR/scripts/install-report-fonts.sh"
 
 mkdir -p "$HOME/.config/git"
