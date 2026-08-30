@@ -15,6 +15,13 @@ CODEX_HOOKS = ROOT / "config/codex/hooks.json"
 SCRATCH = Path(os.environ.get("AGENCY_TEST_SCRATCH", ROOT / ".cache/tests"))
 
 
+class GlobalAgentGuidanceTests(unittest.TestCase):
+    def test_global_instructions_fit_context_budget(self):
+        guidance = ROOT / "Agents/AGENTS.md"
+
+        self.assertLessEqual(guidance.stat().st_size, 8 * 1024)
+
+
 class InstallHelperTests(unittest.TestCase):
     def setUp(self):
         SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -400,6 +407,7 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("docs-exec", result.stdout)
         self.assertIn("evidence-review", result.stdout)
         self.assertIn("perf-diagnose", result.stdout)
+        self.assertIn("performance-design", result.stdout)
         self.assertIn("comment-audit", result.stdout)
         self.assertIn("No changes were made", result.stdout)
 
@@ -415,6 +423,25 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertIn("--dry-run", result.stdout)
+        self.assertIn("--update", result.stdout)
+
+    def test_update_can_be_combined_with_dry_run(self):
+        before = self.snapshot()
+        result = subprocess.run(
+            [INSTALLER, "--dry-run", "--update"],
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "HOME": str(self.home),
+                "AGENCY_SYSFS_ROOT": str(self.sysfs),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertIn("update installed CLIs", result.stdout)
+        self.assertIn("Run ./install.sh --update", result.stdout)
 
 
 if __name__ == "__main__":

@@ -6,31 +6,45 @@ source "$AGENCY_DIR/scripts/lib.sh"
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--dry-run]
+Usage: ./install.sh [--dry-run] [--update]
 
   --dry-run  Inspect the resolved install plan without changing the system.
+  --update   Update installed versioned tools managed outside pacman.
   --help     Show this help.
+
+Without --update, existing stable Rust, yay, h2load, Codex, Claude Code, Pi,
+Gantry, Thoreau, and podman-compose are retained and reported instead.
 EOF
 }
 
-case ${1:-} in
-  --dry-run)
-    (( $# == 1 )) || { usage >&2; exit 2; }
-    source "$AGENCY_DIR/scripts/install-dry-run.sh"
-    agency_print_install_plan
-    exit
-    ;;
-  --help|-h)
-    (( $# == 1 )) || { usage >&2; exit 2; }
-    usage
-    exit
-    ;;
-  "") ;;
-  *)
-    usage >&2
-    exit 2
-    ;;
-esac
+dry_run=false
+update=false
+while (( $# )); do
+  case $1 in
+    --dry-run) dry_run=true ;;
+    --update) update=true ;;
+    --help|-h)
+      usage
+      exit
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if $dry_run; then
+  source "$AGENCY_DIR/scripts/install-dry-run.sh"
+  agency_print_install_plan "$update"
+  exit
+fi
+
+update_arguments=()
+if $update; then
+  update_arguments+=(--update)
+fi
 
 sudo_keepalive_pid=""
 
@@ -104,7 +118,7 @@ if (( ${#competing_container_packages[@]} )); then
 fi
 
 agency_as_root pacman -Syu --needed --noconfirm "${packages[@]}"
-"$AGENCY_DIR/scripts/install-yay-h2load.sh"
+"$AGENCY_DIR/scripts/install-yay-h2load.sh" "${update_arguments[@]}"
 "$AGENCY_DIR/scripts/install-report-fonts.sh"
 
 mkdir -p "$HOME/.config/git"
@@ -118,9 +132,9 @@ agency_link "$AGENCY_DIR/config/git/config" "$HOME/.config/git/config"
 agency_link "$AGENCY_DIR/config/git/ignore" "$HOME/.config/git/ignore"
 agency_link "$AGENCY_DIR/config/git/hooks" "$HOME/.config/git/hooks"
 
-rustup default stable
-"$AGENCY_DIR/scripts/install-agent-clis.sh"
-"$AGENCY_DIR/scripts/install-python-tools.sh"
+"$AGENCY_DIR/scripts/install-rust.sh" "${update_arguments[@]}"
+"$AGENCY_DIR/scripts/install-agent-clis.sh" "${update_arguments[@]}"
+"$AGENCY_DIR/scripts/install-python-tools.sh" "${update_arguments[@]}"
 
 mkdir -p "$HOME/.config/containers"
 agency_link "$AGENCY_DIR/config/containers/containers.conf" \

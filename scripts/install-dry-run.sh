@@ -166,6 +166,7 @@ agency_plan_power() {
 }
 
 agency_print_install_plan() {
+  local update=${1:-false}
   local -a packages competing
   mapfile -t packages < <(sed -E '/^[[:space:]]*(#|$)/d' "$AGENCY_DIR/packages.txt")
   mapfile -t competing < <(pacman -Qq docker docker-compose nerdctl 2>/dev/null || true)
@@ -188,14 +189,25 @@ agency_print_install_plan() {
   fi
   printf '  [%-16s] pacman -Syu --needed --noconfirm %s\n' \
     "install/update" "${packages[*]}"
-  printf '  [%-16s] yay from its reviewed AUR recipe as the normal user\n' \
-    "install AUR"
-  printf '  [%-16s] nghttp2 recipe with an unversioned zlib provider; verify h2load\n' \
-    "install AUR"
   printf '  [%-16s] verified Computer Modern Unicode fonts\n' "install fonts"
-  printf '  [%-16s] stable toolchain\n' "rustup default"
-  printf '  [%-16s] Codex, Claude Code, and Pi through Bun\n' "install CLIs"
-  printf '  [%-16s] Gantry, Thoreau, and podman-compose through uv\n' "install uv tools"
+  if $update; then
+    printf '  [%-16s] yay and patched nghttp2/h2load AUR builds\n' "update AUR tools"
+    printf '  [%-16s] stable Rust toolchain\n' "update toolchain"
+    printf '  [%-16s] Codex, Claude Code, and Pi through Bun\n' \
+      "update installed CLIs"
+    printf '  [%-16s] Gantry, Thoreau, and podman-compose through uv\n' \
+      "update installed CLIs"
+  else
+    printf '  [%-16s] yay and patched nghttp2/h2load; retain installed versions\n' \
+      "install missing"
+    printf '  [%-16s] stable Rust; retain the installed default\n' "install missing"
+    printf '  [%-16s] Codex, Claude Code, and Pi; retain installed versions\n' \
+      "install missing"
+    printf '  [%-16s] Gantry, Thoreau, and podman-compose; retain installed versions\n' \
+      "install missing"
+    printf '  [%-16s] pass --update to check retained tools for newer versions\n' \
+      "update warning"
+  fi
 
   printf '\n\033[1mGit configuration\033[0m\n'
   agency_plan_git
@@ -219,5 +231,9 @@ agency_print_install_plan() {
   printf '  [%-16s] fstrim.timer\n' "enable"
   printf '  [%-16s] 1Password desktop and CLI when absent\n' "install AUR"
 
-  printf '\n\033[1;35mNo changes were made.\033[0m Run ./install.sh without --dry-run to apply this plan.\n'
+  if $update; then
+    printf '\n\033[1;35mNo changes were made.\033[0m Run ./install.sh --update to apply this plan.\n'
+  else
+    printf '\n\033[1;35mNo changes were made.\033[0m Run ./install.sh to apply this plan.\n'
+  fi
 }

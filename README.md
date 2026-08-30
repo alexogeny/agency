@@ -1,21 +1,134 @@
 # 🎀 Mara's agency
 
-Agency turns a fresh CachyOS/Arch workstation into a capable home for serious
-agent work. It is part bootstrap, part operating model: shared instructions for
-Codex, Claude Code, and Pi; small tools that preserve evidence; and skills that
-carry work from a vague request to a checked result.
+Agency turns a fresh CachyOS/Arch workstation into a capable, evidence-minded
+home for Codex, Claude Code, and Pi. It is part declarative bootstrap and part
+operating model: one compact global policy, specialised skills that load when
+needed, and small tools that leave useful evidence behind.
 
-The workflows below are the reason the package list exists.
+The goal is not to give an agent more prose. It is to give each kind of work a
+safe path from request to checked result.
 
-## First-class workflows
+## What makes it different
 
-### Long work stays coordinated
+- **Authority stays explicit.** Agents preserve unrelated work, use Mara's Git
+  identity, never add assistant attribution, and mutate Git or a forge only
+  when the current request authorises that lifecycle.
+- **The global policy stays small.** `Agents/AGENTS.md` has an enforced 8 KiB
+  budget. General rules remain always available; detailed procedures live in
+  skills and load only for matching work.
+- **Checks leave evidence.** Sandboxes, task ledgers, document manifests,
+  benchmark samples, and PR checks make it harder for warm caches or stale
+  output to impersonate success.
+- **The workstation is one system.** Bun, uv, rootless Podman, Git defaults,
+  agent hooks, desktop policy, and inspection tools arrive through one
+  idempotent installer.
+
+## Hero stories
+
+### Give a workload a clean room
+
+The [`sandbox`](Skills/sandbox/SKILL.md) skill and `sandbox` command run tests,
+builds, experiments, and services inside Bubblewrap. The current workspace is
+the only writable project path by default. Other home files and inherited
+variables are hidden, networking is off, and the process tree is private.
+
+```console title="sandbox-tests"
+sandbox -- python3 -m unittest -v Tests.test_install_helpers
+```
+
+Grant only what a workload needs:
+
+```console
+sandbox --ro ./fixtures --rw ./results -- COMMAND...
+sandbox --internet -- COMMAND...
+sandbox --publish tcp:8080 -- COMMAND...
+```
+
+This is a strong boundary against accidental ambient state, not a separate
+kernel. Genuinely hostile code belongs in a VM. Credentials remain outside the
+sandbox unless Mara explicitly exposes a narrow input.
+
+### Carry a dirty tree to a supervised PR
+
+An explicit request such as:
+
+```text
+Babysit a PR with the current changes.
+```
+
+activates [`babysit-pr`](Skills/babysit-pr/SKILL.md) and authorises the normal
+branch, commit, push, PR, and CI lifecycle. It does not authorise force-pushing
+or merging.
+
+```text
+dirty tree
+    ↓ inspect tracked, staged, and untracked work
+identify repository, branch, author, base, and any live PR
+    ↓
+run focused and repository checks
+    ↓
+commit with Mara's configured identity → push → create or update PR
+    ↓
+watch checks → inspect failures → fix in new commits → resume watching
+    ↓
+green CI, or one concrete blocker with evidence
+```
+
+The workflow fetches and prunes before reasoning about branches, queries the
+forge instead of assuming the checked-out branch owns a PR, stages only reviewed
+paths, and preserves unrelated work. [`pr-writing`](Skills/pr-writing/SKILL.md)
+builds the review narrative from the real diff and verified checks. No assistant
+identity, co-authorship trailer, or generated-by notice enters Git or the PR.
+
+### Make code fast for a reason
+
+Performance work has three distinct jobs:
+
+```text
+performance-design        perf-diagnosis              benchmark
+choose the shape    →     locate costly work    →     substantiate the claim
+```
+
+[`performance-design`](Skills/performance-design/SKILL.md) starts with the
+workload and applies the highest-leverage cost reduction first: skip work, do it
+fewer times, move less data, keep memory access compact and sequential, batch
+boundaries, and only then tune instruction-level details. Guard clauses and
+deterministic ordering are treated as structural choices unless they avoid
+material work or improve a measured path.
+
+[`perf-diagnosis`](Skills/perf-diagnosis/SKILL.md) and `perf-diagnose` collect
+counters or profiles when the costly path is uncertain:
+
+```console
+perf-diagnose events --contains cache
+perf-diagnose stat --event instructions:u --event cache-misses:u \
+  --output counters.json --json -- COMMAND...
+perf-diagnose record --event cycles:u --output profile.data \
+  --manifest profile.json -- COMMAND...
+```
+
+Profiles suggest causes; they do not prove an improvement. The
+[`benchmark`](Skills/benchmark/SKILL.md) skill and `instruction-bench` compare
+equivalent baseline and candidate workloads with repeated, CPU-pinned,
+interleaved retired userspace instruction samples:
+
+```console
+instruction-bench SPEC.toml --dry-run
+instruction-bench SPEC.toml --output results.json
+```
+
+The retained JSON includes every sample, dispersion, commands, environment,
+Git state, and output-equivalence evidence. A lower instruction count supports
+a claim about less executed work—not automatically lower latency, energy, or
+cost.
+
+### Let long work survive the chat
 
 The [`coordinate`](Skills/coordinate/SKILL.md) skill and `agent-work` give
-durable or concurrent work a real lifecycle. A task claims the narrowest honest
-scope across every worktree, receives its own directory under `~/Scratch`, and
-records a timebox, heartbeats, changed paths, checks, and a terminal handoff in
-a machine-local SQLite ledger.
+durable, multi-session, or concurrent repository work a real lifecycle. Each
+task claims the narrowest honest scope across worktrees, receives a directory
+under `~/Scratch`, and records its deadline, heartbeat, changed paths, checks,
+and terminal handoff in a machine-local SQLite ledger.
 
 ```console
 agent-work --json status
@@ -26,28 +139,19 @@ agent-work --json finish TASK_ID --status complete \
   --check "focused parser tests passed"
 ```
 
-That state survives chat compaction and handoff without abusing commits,
-branches, or scratch notes as a coordination protocol. Overlapping claims are
-rejected atomically. Stale work is evidence to inspect, never permission to kill
-someone else's process or take over their files.
+Overlapping claims are rejected atomically. Stale records are evidence to
+inspect, never permission to kill a process or take over someone else's files.
+`system-context` refreshes hardware and power guidance when a session starts or
+resumes, while `oldtasks` provides an interactive, confirmation-gated view of
+old user processes.
 
-Long-running work gets two more guardrails:
+For paid remote CPU or GPU work, [`gantry`](Skills/gantry/SKILL.md) carries an
+approved workload through budgeted launch, supervision, result collection, and
+confirmed release.
 
-- `system-context` refreshes device, power, CPU, memory, and visible GPU context
-  when an agent session starts or resumes. Laptop agents keep validation bounded
-  and ask before sustained high-load work.
-- `oldtasks` opens a friendly inspector for user-owned processes older than two
-  hours. It previews each process, asks before `TERM`, and only offers `KILL` for
-  survivors.
+### Finish reports as inspected documents
 
-The same pattern extends to paid remote CPU and GPU work: the
-[`gantry`](Skills/gantry/SKILL.md) skill carries an approved workload through a
-budgeted lease, supervision, result collection, and confirmed release.
-
-### Reports finish as inspected PDFs
-
-Report work is an end-to-end path, not “write some Markdown and hope the PDF is
-fine.” The writing and production responsibilities stay separate:
+Report prose and report production remain separate responsibilities:
 
 ```text
 brief + checked evidence
@@ -57,12 +161,10 @@ report-writing → report-build check → report-build build → document-inspec
 clear prose                         HTML · TeX · PDF      rendered-page review
 ```
 
-The [`report-writing`](Skills/report-writing/SKILL.md) skill works from the
-brief, rubric, audience, and verified sources. The
-[`report-generation`](Skills/report-generation/SKILL.md) skill and
-`report-build` assemble modular Markdown with YAML or TOML frontmatter,
-structured references, citations, figures, tables, labels, cross-references,
-and word limits.
+[`report-writing`](Skills/report-writing/SKILL.md) works from the brief, rubric,
+audience, and verified evidence. [`report-generation`](Skills/report-generation/SKILL.md)
+and `report-build` assemble modular Markdown with structured references,
+citations, figures, tables, cross-references, and word limits.
 
 ```console title="report-workflow"
 report-build init my-report --title "Exact title" --author "Your name"
@@ -71,89 +173,45 @@ report-build build my-report
 document-inspect my-report/build/report.pdf --output my-report-inspection --json
 ```
 
-Validation refuses unknown citations, broken references, unresolved
-placeholders, malformed tables, missing figures, and exceeded word limits. The
-built-in writer emits audit-friendly text, monochrome HTML, inspectable TeX, and
-a PDF without invoking TeX or a browser. `document-inspect` then renders the
-actual pages, extracts layout-preserving text, builds a contact sheet, and
-records hashes. A successful build is not treated as proof that the document
+Validation refuses broken references, unknown citations, unresolved
+placeholders, malformed tables, missing figures, and exceeded limits. The
+[`document-inspection`](Skills/document-inspection/SKILL.md) workflow renders
+the real pages, extracts layout-preserving text, builds a contact sheet, and
+records hashes. Compilation alone is never treated as proof that the document
 looks right.
 
-For larger evidence reviews, `evidence-review` keeps searches, exact
-deduplication, screening decisions, and exclusion reasons reproducible before
-synthesis. Thoreau audits the assembled prose for readability and awkward
-register without pretending style can prove authorship.
+For larger reviews, [`evidence-review`](Skills/evidence-review/SKILL.md) keeps
+searches, exact deduplication, screening decisions, and exclusion reasons
+separate from the final prose. Thoreau provides readability and register
+diagnostics without pretending style can establish authorship.
 
-### Git gets out of the way
+### Make an unfamiliar repository legible
 
-The shell setup includes short, predictable daily commands:
+[`repo-map`](Skills/repo-map/SKILL.md) creates a deterministic, content-hashed
+static map without importing or executing project code. It records manifests,
+entrypoints, commands, languages, public symbols, imports, tests, and agent
+guidance. The map is observable structure, not an invented architecture.
 
-| Command | What it does |
-| --- | --- |
-| `gcl owner/repo` | Clone the repository under `~/Code`, or safely fast-forward the matching checkout, then enter it. |
-| `gpl` | Fetch, prune, and fast-forward the current checkout. If its upstream was deleted, move to the remote's default branch when that can be proved. |
-| `g`, `ga`, `gd`, `gs` | Expand to Git, add, diff, and a compact branch-aware status. |
-| `lg` | Open Lazygit. |
+[`docs-verification`](Skills/docs-verification/SKILL.md) and `docs-exec` rehearse
+named Markdown fences in fresh workspaces and retain commands, file hashes,
+stdout, stderr, and status. Documentation therefore has to work as a reader
+sees it, without borrowing a warm cache or a conveniently configured home.
 
-Global Git defaults prune deleted remote branches, set upstreams on first push,
-sort branches by their newest commit and tags by version, remember conflict
-resolutions with `rerere`, use histogram diffs with moved-line colouring, and
-show conflicts with `zdiff3`. Machine-specific identity and credential settings
-stay in an included local file instead of this repository.
+## Supporting cast
 
-The shared agent policy is deliberately conservative around authorship and
-uncommitted work. Agents preserve unrelated changes, never add assistant
-attribution, and leave Mara's changes uncommitted and unpushed for review. A
-global commit hook blocks common AI attribution trailers. Separate skills can
-research the real branch and forge state to write a useful PR body or turn an
-actual release range into human-facing notes. The broader PR lifecycle skill is
-policy-gated; this personal configuration does not permit agents to commit or
-push.
+- `web-research` uses a persistent local Firefox profile for JavaScript-heavy
+  or authenticated pages while leaving human challenges to a human.
+- `sudo-gui` carries one approved root operation through one KDE password
+  dialog and one authentication attempt without capturing the password.
+- `comment-audit` finds empty, decorative, and historical comments without
+  editing source or treating heuristic findings as verdicts.
+- [`assess`](Skills/assess/SKILL.md) evaluates writing, creative work, or
+  software against a supplied rubric or declared framework without mutation.
+- `gcl`, `gpl`, `g`, `ga`, `gd`, `gs`, and `lg` keep daily Git work short while
+  preserving fast-forward pulls and legible branch state.
 
-### Repositories become legible quickly
-
-`repo-map` creates a deterministic, content-hashed static map of a repository
-without importing or executing it. It records manifests, entrypoints, commands,
-languages, public Python symbols, imports, tests, and applicable agent guidance.
-The map is observable structure, not a speculative architecture essay.
-
-`docs-exec` gives documentation the same treatment. It extracts named Markdown
-fences, rehearses them in fresh workspaces, and retains the command, output,
-status, and input hashes. Reader-visible examples can therefore be tested
-without relying on a warm cache or a conveniently configured home directory.
-
-### Performance claims need evidence
-
-Performance work has an explicit boundary:
-
-- `perf-diagnose` collects counters and profiles to locate expensive work.
-- `instruction-bench` compares equivalent baseline and candidate workloads
-  using repeated, CPU-pinned, interleaved retired userspace instructions.
-
-Profiles can suggest a cause; they do not prove an improvement. Claim-bearing
-benchmarks retain raw samples, verify output equivalence, and avoid treating one
-wall-clock run as a result.
-
-### Useful boundaries for the awkward jobs
-
-- `sandbox` runs builds, tests, experiments, or services in Bubblewrap with a
-  scrubbed environment, a private process tree, a narrow writable workspace,
-  and no network unless it is explicitly enabled.
-- `web-research` uses local Firefox for JavaScript-heavy or authenticated pages,
-  with persistent named profiles and an on-device full-text index. It keeps
-  credentials in the browser and leaves human challenges to a human.
-- `sudo-gui` carries one explicitly approved root operation through one KDE
-  password dialog and one authentication attempt. It never puts the password in
-  arguments, files, environment variables, or captured output.
-- `comment-audit` finds empty separators, decorative section labels, and stale
-  historical narration without editing the source.
-- [`assess`](Skills/assess/SKILL.md) grades writing, creative work, or software
-  against a supplied rubric—or a clearly declared diagnostic framework—without
-  mutating the submitted work.
-
-See [`Tools/README.md`](Tools/README.md) for the CLI catalogue and `--help`
-entrypoints. The matching directories under [`Skills/`](Skills/) describe when
-each workflow should and should not run.
+See [`Tools/README.md`](Tools/README.md) for the CLI catalogue. Each directory
+under [`Skills/`](Skills/) states when its workflow should and should not run.
 
 ## Bootstrap
 
@@ -162,57 +220,62 @@ git clone <your-repository-url> /path/to/agency
 cd /path/to/agency
 ./install.sh --dry-run
 ./install.sh
+./install.sh --update
 ```
 
-Run the dry run first. It resolves hardware, existing files, backup paths, hook
-merges, Git migration, packages, and services without requesting sudo or
-changing the machine.
+Run the dry run first. It resolves hardware, existing files, backups, hook
+merges, Git migration, packages, services, tools, and skills without requesting
+sudo or changing the machine.
 
-The installer is declarative and safe to rerun. The checkout may live anywhere;
-managed links are resolved from its actual location. Before replacing a regular
-file or directory with a link, the installer moves it into a timestamped tree
-under `~/.local/state/agency/backups`. Existing correct links are left alone.
+The installer is declarative and safe to rerun. It resolves links from the
+checkout's actual location and moves replaced regular files or directories into
+a timestamped tree under `~/.local/state/agency/backups`. Correct links remain
+untouched.
 
-`~/Scratch` is the durable home for reproducible task material. If an older
-`~/scratch` exists, installation migrates it without overwriting conflicts.
-Disposable outputs and caches can still use task-specific temporary
-directories.
+A normal rerun installs missing tools but leaves existing stable Rust, yay,
+h2load, Codex, Claude Code, Pi, Gantry, Thoreau, and podman-compose versions
+untouched. It prints a warning so an older installation cannot look freshly
+updated. Pass `--update` to check and update those tools, or combine
+`--dry-run --update` to inspect that plan first.
 
-The installer asks for `sudo` once and refreshes that authorization while it
-runs. Agent CLIs install through Bun under `~/.bun`, so they never need root.
-Bun is the JavaScript and TypeScript default, uv is the Python default, and
-rootless Podman is the one container stack. Node remains only as a compatibility
-runtime for vendor CLI launchers; npm is not used.
+`~/Scratch` is the durable home for reproducible task material. Installation
+migrates an older `~/scratch` without overwriting conflicts. Disposable outputs
+and caches may still use scoped temporary directories.
+
+The installer asks for `sudo` once and refreshes that authorisation while it
+runs. Agent CLIs install through Bun under `~/.bun`; Python tools use uv; and
+rootless Podman is the only container stack. Node remains only as a compatibility
+runtime for vendor launchers.
 
 ## What the workstation receives
 
-- **Agents:** Codex CLI, Claude Code, and Pi with one portable guidance file,
+- **Agents:** Codex CLI, Claude Code, and Pi with one portable global policy,
   shared skills, coordinated-worker profiles, and merged session hooks.
-- **Development:** uv, Bun, GitHub CLI, GitLab CLI, rustup with stable Rust, yay,
-  h2load, Git tooling, and a rose-coloured Fish and Starship shell.
+- **Development:** uv, Bun, GitHub CLI, GitLab CLI, stable Rust, yay, h2load,
+  Git tooling, and a rose-coloured Fish and Starship shell.
 - **Containers:** rootless, daemonless Podman with Pasta networking and Compose
   installed through uv. Docker and nerdctl frontends are removed.
 - **Inspection:** ripgrep, fd, jq, btop, bottom, hyperfine, perf, strace, lsof,
-  sysstat, iotop-c, powertop, bandwhich, dust, PDF rendering, and OCR.
-- **Desktop:** 1Password desktop and CLI, Firefox privacy defaults, uBlock
-  Origin, 1Password and Plasma browser integration, encrypted DNS, LAVD
-  scheduling, and hardware-aware power policy.
+  sysstat, iotop-c, powertop, bandwhich, dust, PDF rendering, OCR, profiling,
+  benchmarking, document checking, and comment auditing.
+- **Desktop:** 1Password, Firefox privacy policy, uBlock Origin, browser
+  integration, encrypted DNS, LAVD scheduling, and hardware-aware power policy.
 - **Maintenance:** a global ignore file, weekly `fstrim.timer`, timestamped
   backups, and normal-user AUR builds for yay and nghttp2. The nghttp2 recipe
   accepts CachyOS's `zlib-ng-compat` provider.
 
-Personal Git identity is read from `~/.config/git/identity`, which is
-intentionally untracked. If it is missing, installation imports an existing
-global name, email, and signing key. Other machine-specific Git settings are
-preserved in `~/.config/git/local` and included by the managed configuration.
+Personal Git identity lives in untracked `~/.config/git/identity`. If absent,
+installation imports an existing global name, email, and signing key. Other
+machine-specific settings remain in `~/.config/git/local` and are included by
+the managed configuration.
 
 ## Layout
 
 ```text
 Agents/       portable guidance and coordinated-worker profiles
-Skills/       cross-agent workflow instructions
+Skills/       progressively disclosed workflow instructions
 Tools/        reusable, independently runnable utilities
-Tests/        focused bootstrap and tool contracts
+Tests/        focused bootstrap, tool, and policy contracts
 config/       user configuration linked into ~/.config
 firefox/      machine policy and profile preferences
 scripts/      focused install helpers
@@ -222,20 +285,17 @@ install.sh    idempotent entry point
 
 ## Sharp edges worth knowing
 
-Review the dry run and the scripts before installing on another machine.
-Firefox must be restarted after installation; `about:policies` shows the active
-policy.
+Review the dry run and scripts before installing on another machine. Firefox
+must restart before its policy is visible in `about:policies`.
 
 System DNS uses strict Cloudflare Families DNS-over-TLS with no plaintext
-fallback. A network that blocks TCP 853 needs a temporary override or a VPN
-before DNS will work.
+fallback. Networks that block TCP 853 need a temporary override or VPN.
 
 Desktop installations mask sleep, suspend, hibernate, and hybrid-sleep while
-leaving display power saving active. Laptop installations keep those targets
-available and select a portable AC/battery policy. The installer checks both
-chassis type and system batteries before choosing a profile or changing display
-brightness.
+keeping display power saving active. Laptop installations leave those targets
+available and select a portable AC/battery policy. Both chassis type and system
+batteries inform the choice.
 
-`fstrim.timer` runs weekly and only asks mounted filesystems to discard where
-their block devices advertise support. Btrfs `discard=async` and the timer can
-coexist; the timer still covers other mounted SSDs.
+`fstrim.timer` runs weekly and only requests discard where mounted filesystems
+advertise support. It can coexist with Btrfs `discard=async` and still cover
+other mounted SSDs.

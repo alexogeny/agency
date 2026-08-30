@@ -45,6 +45,9 @@ technical terms or flatten the argument. Prefer concrete nouns and verbs,
 active voice, short transitions, and sentences whose logic remains visible on
 one read.
 
+Write disclosures and reflective sections from the actual author's point of
+view. Prefer direct first person to calling them "the student" or "the author."
+
 Render a markup-free audit copy, then run Thoreau after substantive revision:
 
 ```console
