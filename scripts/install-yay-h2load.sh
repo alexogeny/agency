@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+update=false
+case ${1:-} in
+  --update) update=true ;;
+  "") ;;
+  *)
+    printf 'Usage: %s [--update]\n' "${0##*/}" >&2
+    exit 2
+    ;;
+esac
+(( $# <= 1 )) || { printf 'Usage: %s [--update]\n' "${0##*/}" >&2; exit 2; }
+
 if (( EUID == 0 )); then
   printf 'Build yay and nghttp2 as a normal user, not root.\n' >&2
   exit 1
@@ -24,16 +35,25 @@ verify_command() {
   "$name" --version
 }
 
+temporary_directories=()
+cleanup() {
+  local directory
+  for directory in "${temporary_directories[@]}"; do
+    if [[ -d $directory &&
+      ( $directory == "$HOME/Scratch/"yay.* ||
+        $directory == "$HOME/Scratch/"nghttp2.* ) ]]; then
+      rm -rf -- "$directory"
+    fi
+  done
+}
+trap cleanup EXIT
+
+retained=()
+
 if ! command -v yay >/dev/null 2>&1; then
   mkdir -p "$HOME/Scratch"
   yay_build_dir="$(mktemp -d -p "$HOME/Scratch" yay.XXXXXX)"
-  cleanup() {
-    if [[ -n ${yay_build_dir:-} && -d $yay_build_dir &&
-      $yay_build_dir == "$HOME/Scratch/"yay.* ]]; then
-      rm -rf -- "$yay_build_dir"
-    fi
-  }
-  trap cleanup EXIT
+  temporary_directories+=("$yay_build_dir")
 
   git clone --depth 1 https://aur.archlinux.org/yay.git "$yay_build_dir"
   review_recipe "$yay_build_dir/PKGBUILD"
@@ -41,16 +61,32 @@ if ! command -v yay >/dev/null 2>&1; then
     cd "$yay_build_dir"
     makepkg -si --needed --noconfirm
   )
+elif $update; then
+  yay -S --needed --noconfirm yay
+else
+  retained+=(yay)
 fi
 
 verify_command yay
 
-if command -v h2load >/dev/null 2>&1; then
+if command -v h2load >/dev/null 2>&1 && ! $update; then
   verify_command h2load
+  retained+=(h2load)
+  printf '⚠ Already installed and left unchanged:\n'
+  printf '  - %s\n' "${retained[@]}"
+  printf 'If any version is older than upstream, run ./install.sh --update.\n'
   exit 0
 fi
 
-nghttp2_dir="${XDG_CACHE_HOME:-$HOME/.cache}/yay/nghttp2"
+if $update; then
+  mkdir -p "$HOME/Scratch"
+  nghttp2_build_dir="$(mktemp -d -p "$HOME/Scratch" nghttp2.XXXXXX)"
+  temporary_directories+=("$nghttp2_build_dir")
+  nghttp2_dir="$nghttp2_build_dir/source"
+  git clone --depth 1 https://aur.archlinux.org/nghttp2.git "$nghttp2_dir"
+else
+  nghttp2_dir="${XDG_CACHE_HOME:-$HOME/.cache}/yay/nghttp2"
+fi
 if [[ ! -e $nghttp2_dir ]]; then
   mkdir -p "$(dirname -- "$nghttp2_dir")"
   git clone --depth 1 https://aur.archlinux.org/nghttp2.git "$nghttp2_dir"

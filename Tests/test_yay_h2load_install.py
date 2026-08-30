@@ -53,9 +53,9 @@ class YayH2loadInstallTests(unittest.TestCase):
             "AGENCY_TEST_LOG": str(self.log),
         }
 
-    def run_installer(self, check=True):
+    def run_installer(self, *arguments, check=True):
         return subprocess.run(
-            [INSTALLER],
+            [INSTALLER, *arguments],
             check=check,
             text=True,
             capture_output=True,
@@ -175,6 +175,65 @@ class YayH2loadInstallTests(unittest.TestCase):
             self.log.read_text().splitlines(),
             ["yay --version", "h2load --version"],
         )
+        self.assertIn("yay", result.stdout)
+        self.assertIn("h2load", result.stdout)
+        self.assertIn("./install.sh --update", result.stdout)
+
+    def test_update_refreshes_existing_yay_and_h2load(self):
+        self.executable(
+            "yay",
+            r"""
+            #!/usr/bin/env bash
+            printf 'yay %s\n' "$*" >> "$AGENCY_TEST_LOG"
+            printf 'yay existing\n'
+            """,
+        )
+        self.executable(
+            "h2load",
+            r"""
+            #!/usr/bin/env bash
+            printf 'h2load %s\n' "$*" >> "$AGENCY_TEST_LOG"
+            printf 'h2load existing\n'
+            """,
+        )
+        self.executable(
+            "git",
+            r"""
+            #!/usr/bin/env bash
+            set -euo pipefail
+            printf 'git %s\n' "$*" >> "$AGENCY_TEST_LOG"
+            if [[ ${1:-} == clone ]]; then
+              target=${@: -1}
+              mkdir -p "$target"
+              printf "pkgname=nghttp2\ndepends=('zlib>=1.2.3')\n" > "$target/PKGBUILD"
+              exit
+            fi
+            if [[ ${1:-} == -C && ${3:-} == diff ]]; then
+              printf '%s\n' 'diff --git a/PKGBUILD b/PKGBUILD'
+              exit
+            fi
+            exit 2
+            """,
+        )
+        self.executable(
+            "makepkg",
+            r"""
+            #!/usr/bin/env bash
+            set -euo pipefail
+            printf 'makepkg cwd=%s args=%s\n' "$PWD" "$*" >> "$AGENCY_TEST_LOG"
+            grep -Fq "'zlib'" PKGBUILD
+            ! grep -Fq "'zlib>=1.2.3'" PKGBUILD
+            """,
+        )
+
+        result = self.run_installer("--update")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.log.read_text()
+        self.assertIn("yay -S --needed --noconfirm yay", log)
+        self.assertIn("aur.archlinux.org/nghttp2.git", log)
+        self.assertIn("makepkg cwd=", log)
+        self.assertIn("h2load --version", log)
 
 
 if __name__ == "__main__":
