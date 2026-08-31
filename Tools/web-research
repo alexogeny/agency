@@ -1,16 +1,36 @@
 #!/usr/bin/env bun
 
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import {
   closeSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { BlockList, isIP } from "node:net";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 
 const pink = "\u001b[38;5;183m";
 const purple = "\u001b[1;35m";
@@ -20,9 +40,39 @@ const reset = "\u001b[0m";
 const dataRoot =
   process.env.WEB_RESEARCH_DATA_DIR ||
   join(homedir(), ".local/share/web-research");
+const webProtocols = new Set(["http:", "https:"]);
+const redirectStatuses = new Set([301, 302, 303, 307, 308]);
 
 type JsonObject = Record<string, unknown>;
 type SearchResult = { title: string; url: string; snippet: string };
+type DiscoveryEvidence = SearchResult & {
+  source: "search-result";
+  query: string;
+  engine: string;
+};
+type RetrievalOptions = {
+  allowPrivate: boolean;
+  maxBytes: number;
+  maxRedirects: number;
+  timeoutMs: number;
+};
+type StructuredEvidence = {
+  metadata: Record<string, string>;
+  jsonLd: unknown[];
+};
+type PageAccessState = "public" | "soft-login" | "soft-challenge";
+type PageAction = {
+  kind: "dismiss" | "expand" | "load-more";
+  label: string;
+  changed: boolean;
+  blocked?: boolean;
+};
+type NetworkEvidence = {
+  url: string;
+  status: number;
+  mimeType: string;
+  body: unknown;
+};
 type Page = {
   title: string;
   url: string;
@@ -33,7 +83,76 @@ type Page = {
   markdown: string;
   html: string;
   links: string[];
+  structured?: StructuredEvidence;
+  sources?: string[];
+  access?: { state: PageAccessState };
+  state?: "public-content" | "soft-gated-content" | "structured-only";
+  captures?: number;
+  actions?: PageAction[];
+  scroll_targets?: string[];
+  network?: NetworkEvidence[];
+  truncated?: {
+    text: boolean;
+    markdown: boolean;
+    html: boolean;
+    links: boolean;
+  };
 };
+
+class RetrievalFailure extends Error {
+  kind: string;
+  code: string;
+  retriable: boolean;
+  safety?: JsonObject;
+
+  constructor(
+    kind: string,
+    code: string,
+    message: string,
+    retriable: boolean,
+    safety?: JsonObject,
+  ) {
+    super(message);
+    this.kind = kind;
+    this.code = code;
+    this.retriable = retriable;
+    this.safety = safety;
+  }
+}
+
+const nonPublicAddresses = new BlockList();
+for (const [network, prefix] of [
+  ["0.0.0.0", 8],
+  ["10.0.0.0", 8],
+  ["100.64.0.0", 10],
+  ["127.0.0.0", 8],
+  ["169.254.0.0", 16],
+  ["172.16.0.0", 12],
+  ["192.0.0.0", 24],
+  ["192.0.2.0", 24],
+  ["192.168.0.0", 16],
+  ["198.18.0.0", 15],
+  ["198.51.100.0", 24],
+  ["203.0.113.0", 24],
+  ["224.0.0.0", 4],
+  ["240.0.0.0", 4],
+] as Array<[string, number]>) {
+  nonPublicAddresses.addSubnet(network, prefix, "ipv4");
+}
+for (const [network, prefix] of [
+  ["::", 128],
+  ["::1", 128],
+  ["64:ff9b:1::", 48],
+  ["100::", 64],
+  ["2001:db8::", 32],
+  ["2001:10::", 28],
+  ["fc00::", 7],
+  ["fe80::", 10],
+  ["fec0::", 10],
+  ["ff00::", 8],
+] as Array<[string, number]>) {
+  nonPublicAddresses.addSubnet(network, prefix, "ipv6");
+}
 
 function terminalText(value: unknown) {
   return String(value).replace(
@@ -58,6 +177,12 @@ function takeOption(args: string[], name: string, fallback = "") {
   const value = args[index + 1];
   args.splice(index, 2);
   return value;
+}
+
+function takeOptions(args: string[], name: string) {
+  const values: string[] = [];
+  while (args.includes(name)) values.push(takeOption(args, name));
+  return values;
 }
 
 function takeFlag(args: string[], name: string) {
@@ -90,11 +215,338 @@ function checkedUrl(value: string) {
   } catch {
     fail(`invalid URL: ${value}`);
   }
-  if (!new Set(["http:", "https:"]).has(url.protocol)) {
+  if (!webProtocols.has(url.protocol)) {
     fail(`URL must use HTTP or HTTPS: ${value}`);
   }
   url.hash = "";
   return url;
+}
+
+function sensitiveQueryParameter(name: string) {
+  const normalized = name.toLowerCase();
+  return (
+    /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(normalized) ||
+    /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|solution)(?:$|[_-])/.test(
+      normalized,
+    ) ||
+    /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(normalized)
+  );
+}
+
+function redactedOutputUrl(value: string) {
+  try {
+    const url = new URL(value);
+    if (!webProtocols.has(url.protocol)) return "";
+    url.username = "";
+    url.password = "";
+    url.hash = "";
+    for (const name of [...url.searchParams.keys()]) {
+      if (sensitiveQueryParameter(name)) url.searchParams.delete(name);
+    }
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function cleanExtractedMarkdown(value: string) {
+  return value
+    .split("\n")
+    .filter((line) => line.trim() !== "``")
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function retrievalUrl(value: string) {
+  if (value.length > 8192) {
+    throw new RetrievalFailure(
+      "policy",
+      "url-too-long",
+      "URL must be at most 8192 characters",
+      false,
+    );
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new RetrievalFailure(
+      "policy",
+      "invalid-url",
+      `invalid URL: ${value}`,
+      false,
+    );
+  }
+  if (!webProtocols.has(url.protocol)) {
+    throw new RetrievalFailure(
+      "policy",
+      "unsupported-scheme",
+      `URL must use HTTP or HTTPS: ${value}`,
+      false,
+      { decision: "blocked", reason: "unsupported-scheme", url: value },
+    );
+  }
+  if (url.username || url.password) {
+    throw new RetrievalFailure(
+      "policy",
+      "embedded-credentials",
+      "URLs with embedded credentials are not allowed",
+      false,
+      {
+        decision: "blocked",
+        reason: "embedded-credentials",
+        url: value,
+      },
+    );
+  }
+  url.hash = "";
+  return url;
+}
+
+function normalizedHostname(hostname: string) {
+  return hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
+}
+
+function isNonPublicAddress(address: string, family: number) {
+  if (family === 4) return nonPublicAddresses.check(address, "ipv4");
+  const mapped = address.toLowerCase().match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return nonPublicAddresses.check(mapped[1], "ipv4");
+  return nonPublicAddresses.check(address, "ipv6");
+}
+
+async function checkRetrievalSafety(url: URL, allowPrivate: boolean) {
+  const hostname = normalizedHostname(url.hostname).toLowerCase();
+  let addresses: Array<{ address: string; family: number }>;
+  const family = isIP(hostname);
+  if (family) {
+    addresses = [{ address: hostname, family }];
+  } else {
+    if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+      addresses = [{ address: "127.0.0.1", family: 4 }];
+    } else {
+      try {
+        addresses = await lookup(hostname, { all: true, verbatim: true });
+      } catch (error) {
+        throw new RetrievalFailure(
+          "network",
+          "dns-failed",
+          error instanceof Error ? error.message : String(error),
+          true,
+        );
+      }
+    }
+  }
+  if (!addresses.length) {
+    throw new RetrievalFailure(
+      "network",
+      "dns-empty",
+      `DNS returned no addresses for ${hostname}`,
+      true,
+    );
+  }
+  const resolved = [...new Set(addresses.map((record) => record.address))];
+  const privateAddresses = addresses
+    .filter((record) => isNonPublicAddress(record.address, record.family))
+    .map((record) => record.address);
+  if (privateAddresses.length && !allowPrivate) {
+    const safety = {
+      decision: "blocked",
+      reason: "private-network",
+      url: url.href,
+      resolved_addresses: resolved,
+    };
+    throw new RetrievalFailure(
+      "policy",
+      "private-network",
+      `private or non-public address requires --allow-private: ${url.href}`,
+      false,
+      safety,
+    );
+  }
+  return {
+    decision: "allowed",
+    reason: privateAddresses.length
+      ? "explicit-private-network-access"
+      : "public-network",
+    url: url.href,
+    resolved_addresses: resolved,
+  };
+}
+
+async function boundedResponseDigest(response: Response, maxBytes: number) {
+  const lengthHeader = response.headers.get("content-length");
+  const declaredLength = lengthHeader === null ? null : Number(lengthHeader);
+  if (
+    declaredLength !== null &&
+    Number.isFinite(declaredLength) &&
+    declaredLength > maxBytes
+  ) {
+    await response.body?.cancel();
+    throw new RetrievalFailure(
+      "limit",
+      "response-too-large",
+      `response declares ${declaredLength} bytes; limit is ${maxBytes}`,
+      false,
+    );
+  }
+  const hash = createHash("sha256");
+  const reader = response.body?.getReader();
+  let bytesRead = 0;
+  if (reader) {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytesRead += chunk.value.byteLength;
+      if (bytesRead > maxBytes) {
+        await reader.cancel();
+        throw new RetrievalFailure(
+          "limit",
+          "response-too-large",
+          `response exceeded the ${maxBytes}-byte limit`,
+          false,
+        );
+      }
+      hash.update(chunk.value);
+    }
+  }
+  return { bytesRead, sha256: hash.digest("hex") };
+}
+
+function retrievalError(error: unknown) {
+  if (error instanceof RetrievalFailure) return error;
+  if (error instanceof Error && error.name === "AbortError") {
+    return new RetrievalFailure(
+      "network",
+      "timeout",
+      "retrieval timed out",
+      true,
+    );
+  }
+  return new RetrievalFailure(
+    "network",
+    "fetch-failed",
+    error instanceof Error ? error.message : String(error),
+    true,
+  );
+}
+
+async function retrieveOne(requestedUrl: string, options: RetrievalOptions) {
+  const startedAt = new Date().toISOString();
+  const started = performance.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
+  const redirectChain: JsonObject[] = [];
+  const checkedHops: JsonObject[] = [];
+  try {
+    let current = retrievalUrl(requestedUrl);
+    const normalizedUrl = current.href;
+    while (true) {
+      const safety = await checkRetrievalSafety(current, options.allowPrivate);
+      checkedHops.push(safety);
+      const response = await fetch(current, {
+        redirect: "manual",
+        signal: controller.signal,
+        headers: {
+          accept: "*/*",
+          "user-agent": "agency-web-research/1 direct-http",
+        },
+      });
+      if (redirectStatuses.has(response.status)) {
+        const location = response.headers.get("location");
+        if (location) {
+          if (redirectChain.length >= options.maxRedirects) {
+            await response.body?.cancel();
+            throw new RetrievalFailure(
+              "limit",
+              "too-many-redirects",
+              `retrieval exceeded ${options.maxRedirects} redirects`,
+              false,
+            );
+          }
+          const next = retrievalUrl(new URL(location, current).href);
+          redirectChain.push({
+            url: current.href,
+            http_status: response.status,
+            location,
+            next_url: next.href,
+          });
+          await response.body?.cancel();
+          current = next;
+          continue;
+        }
+      }
+      const digest = await boundedResponseDigest(response, options.maxBytes);
+      const completedAt = new Date().toISOString();
+      const lengthHeader = response.headers.get("content-length");
+      const declaredLength = lengthHeader === null ? null : Number(lengthHeader);
+      const privateAccess = checkedHops.some(
+        (hop) => hop.reason === "explicit-private-network-access",
+      );
+      return {
+        request: { url: requestedUrl, normalized_url: normalizedUrl },
+        outcome: "retrieved",
+        safety: {
+          decision: "allowed",
+          reason: privateAccess
+            ? "explicit-private-network-access"
+            : "public-network",
+          checked_hops: checkedHops,
+        },
+        provenance: {
+          provider: "direct-http",
+          mode: "live",
+          retrieved_at: completedAt,
+          cache_age_seconds: 0,
+          fallback: null,
+        },
+        retrieval: {
+          final_url: current.href,
+          redirect_chain: redirectChain,
+          http_status: response.status,
+          content_type: response.headers.get("content-type") || "",
+          declared_content_length:
+            declaredLength !== null && Number.isFinite(declaredLength)
+            ? declaredLength
+            : null,
+          bytes_read: digest.bytesRead,
+          sha256: digest.sha256,
+          started_at: startedAt,
+          completed_at: completedAt,
+          duration_ms: Math.round((performance.now() - started) * 1000) / 1000,
+        },
+      };
+    }
+  } catch (unknownError) {
+    const error = retrievalError(unknownError);
+    const completedAt = new Date().toISOString();
+    return {
+      request: { url: requestedUrl },
+      outcome: "failed",
+      safety:
+        error.safety ||
+        (error.kind === "policy"
+          ? { decision: "blocked", reason: error.code }
+          : { decision: "not-completed", reason: error.code }),
+      provenance: {
+        provider: "direct-http",
+        mode: "live",
+        attempted_at: completedAt,
+        cache_age_seconds: 0,
+        fallback: null,
+      },
+      error: {
+        kind: error.kind,
+        code: error.code,
+        message: error.message,
+        retriable: error.retriable,
+      },
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function checkedProfile(value: string) {
@@ -117,9 +569,186 @@ function choosePort() {
   return port;
 }
 
-function claimProfile(profile: string) {
-  const root = join(dataRoot, "profiles", profile);
-  const lock = `${root}.lock`;
+type FirefoxPreference = [string, string | number | boolean];
+
+const booleanTemplatePreferences = new Set([
+  "browser.display.use_system_colors",
+  "browser.tabs.closeWindowWithLastTab",
+  "browser.tabs.warnOnClose",
+  "browser.urlbar.trimURLs",
+  "browser.zoom.full",
+  "browser.zoom.siteSpecific",
+]);
+
+const numericTemplatePreferences = new Map<string, [number, number]>([
+  ["browser.display.document_color_use", [0, 2]],
+  ["browser.theme.content-theme", [0, 2]],
+  ["browser.theme.toolbar-theme", [0, 2]],
+  ["browser.uidensity", [0, 2]],
+  ["layout.css.prefers-color-scheme.content-override", [0, 3]],
+  ["media.autoplay.blocking_policy", [0, 5]],
+  ["media.autoplay.default", [0, 5]],
+]);
+
+function firefoxConfigurationRoot() {
+  return (
+    process.env.WEB_RESEARCH_FIREFOX_ROOT ||
+    join(homedir(), ".mozilla/firefox")
+  );
+}
+
+function parseIniSections(text: string) {
+  const sections = new Map<string, Record<string, string>>();
+  let current: Record<string, string> | null = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    const section = line.match(/^\[([^\]]+)\]$/);
+    if (section) {
+      current = {};
+      sections.set(section[1], current);
+      continue;
+    }
+    if (!current || !line || line.startsWith("#") || line.startsWith(";"))
+      continue;
+    const separator = line.indexOf("=");
+    if (separator < 1) continue;
+    current[line.slice(0, separator).trim()] = line
+      .slice(separator + 1)
+      .trim();
+  }
+  return sections;
+}
+
+function currentFirefoxProfile() {
+  const root = firefoxConfigurationRoot();
+  let sections: Map<string, Record<string, string>>;
+  try {
+    sections = parseIniSections(readFileSync(join(root, "profiles.ini"), "utf8"));
+  } catch (error) {
+    throw new RetrievalFailure(
+      "policy",
+      "profile-template-unavailable",
+      error instanceof Error ? error.message : String(error),
+      false,
+    );
+  }
+  const candidates: string[] = [];
+  for (const [name, values] of sections) {
+    if (name.startsWith("Install") && values.Default) {
+      candidates.push(values.Default);
+    }
+  }
+  for (const [name, values] of sections) {
+    if (!name.startsWith("Profile") || values.Default !== "1" || !values.Path)
+      continue;
+    candidates.push(
+      values.IsRelative === "0" ? values.Path : join(root, values.Path),
+    );
+  }
+  for (const candidate of candidates) {
+    const path = isAbsolute(candidate) ? candidate : join(root, candidate);
+    if (existsSync(join(path, "prefs.js"))) return realpathSync(path);
+  }
+  throw new RetrievalFailure(
+    "policy",
+    "profile-template-unavailable",
+    "Firefox has no current profile with a readable prefs.js",
+    false,
+  );
+}
+
+function checkedTemplateProfile(value: string) {
+  if (value === "current") return currentFirefoxProfile();
+  if (!isAbsolute(value)) {
+    throw new RetrievalFailure(
+      "policy",
+      "profile-template-invalid",
+      "--profile-template must be current or an absolute profile directory",
+      false,
+    );
+  }
+  let profile: string;
+  try {
+    profile = realpathSync(value);
+  } catch (error) {
+    throw new RetrievalFailure(
+      "policy",
+      "profile-template-unavailable",
+      error instanceof Error ? error.message : String(error),
+      false,
+    );
+  }
+  if (!statSync(profile).isDirectory() || !existsSync(join(profile, "prefs.js"))) {
+    throw new RetrievalFailure(
+      "policy",
+      "profile-template-unavailable",
+      "profile template must be a directory containing prefs.js",
+      false,
+    );
+  }
+  return profile;
+}
+
+function allowedTemplatePreference(name: string, value: unknown) {
+  if (booleanTemplatePreferences.has(name)) return typeof value === "boolean";
+  if (name === "intl.accept_languages") {
+    return (
+      typeof value === "string" &&
+      value.length > 0 &&
+      value.length <= 256 &&
+      !/[\u0000-\u001f\u007f]/.test(value)
+    );
+  }
+  const range = numericTemplatePreferences.get(name);
+  if (!range || typeof value !== "number" || !Number.isInteger(value)) {
+    return false;
+  }
+  return value >= range[0] && value <= range[1];
+}
+
+function templatePreferences(value: string): FirefoxPreference[] {
+  const profile = checkedTemplateProfile(value);
+  const selected = new Map<string, string | number | boolean>();
+  const text = readFileSync(join(profile, "prefs.js"), "utf8");
+  for (const line of text.split("\n")) {
+    const match = line.match(/^user_pref\("([^"]+)",\s*(.+)\);$/);
+    if (!match) continue;
+    const name = match[1];
+    if (
+      !booleanTemplatePreferences.has(name) &&
+      name !== "intl.accept_languages" &&
+      !numericTemplatePreferences.has(name)
+    ) {
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(match[2]);
+    } catch {
+      continue;
+    }
+    if (allowedTemplatePreference(name, parsed)) {
+      selected.set(name, parsed as string | number | boolean);
+    }
+  }
+  return [...selected.entries()];
+}
+
+function profileRoot(profile: string, ephemeral: boolean) {
+  if (!ephemeral) return join(dataRoot, "profiles", profile);
+  const ephemeralRoot = join(dataRoot, "ephemeral");
+  mkdirSync(ephemeralRoot, { recursive: true });
+  return mkdtempSync(join(ephemeralRoot, `${profile}-`));
+}
+
+function claimProfile(
+  profile: string,
+  transientPreferences: FirefoxPreference[] = [],
+  managePreferences = true,
+  ephemeral = false,
+) {
+  const root = profileRoot(profile, ephemeral);
+  const lock = ephemeral ? join(root, ".agency.lock") : `${root}.lock`;
   mkdirSync(root, { recursive: true });
   try {
     const descriptor = openSync(lock, "wx", 0o600);
@@ -131,22 +760,83 @@ function claimProfile(profile: string) {
       owner = Number(readFileSync(lock, "utf8"));
       process.kill(owner, 0);
     } catch {
+      if (ephemeral) {
+        rmSync(root, { recursive: true, force: true });
+        throw new Error("could not claim a new ephemeral Firefox profile");
+      }
       try {
         unlinkSync(lock);
       } catch {}
-      return claimProfile(profile);
+      return claimProfile(
+        profile,
+        transientPreferences,
+        managePreferences,
+        ephemeral,
+      );
     }
-    fail(`browser profile '${profile}' is already in use by process ${owner}`);
+    throw new Error(
+      `browser profile '${profile}' is already in use by process ${owner}`,
+    );
   }
-  const preferences = [
-    'user_pref("browser.shell.checkDefaultBrowser", false);',
-    'user_pref("browser.startup.homepage_override.mstone", "ignore");',
-    'user_pref("browser.aboutwelcome.enabled", false);',
-    'user_pref("datareporting.policy.dataSubmissionEnabled", false);',
-    'user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);',
-  ].join("\n");
-  writeFileSync(join(root, "user.js"), `${preferences}\n`, { mode: 0o600 });
-  return { root, lock };
+  const userJs = join(root, "user.js");
+  const previousUserJs = existsSync(userJs) ? readFileSync(userJs, "utf8") : null;
+  if (managePreferences) {
+    const preferences: FirefoxPreference[] = [
+      ["browser.shell.checkDefaultBrowser", false],
+      ["browser.startup.homepage_override.mstone", "ignore"],
+      ["browser.aboutwelcome.enabled", false],
+      ["datareporting.policy.dataSubmissionEnabled", false],
+      ["toolkit.telemetry.reportingpolicy.firstRun", false],
+      ...transientPreferences,
+    ];
+    const managed = preferences
+      .map(([name, value]) => `user_pref(${JSON.stringify(name)}, ${JSON.stringify(value)});`)
+      .join("\n");
+    const prefix = previousUserJs
+      ? `${previousUserJs}${previousUserJs.endsWith("\n") ? "" : "\n"}`
+      : "";
+    try {
+      writeFileSync(userJs, `${prefix}${managed}\n`, { mode: 0o600 });
+    } catch (error) {
+      try {
+        unlinkSync(lock);
+      } catch {}
+      if (ephemeral) rmSync(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
+  return {
+    root,
+    lock,
+    userJs,
+    previousUserJs,
+    managePreferences,
+    ephemeral,
+  };
+}
+
+function releaseProfile(claimed: ReturnType<typeof claimProfile>) {
+  let restoreError: unknown;
+  try {
+    if (claimed.managePreferences) {
+      if (claimed.previousUserJs === null) {
+        try {
+          unlinkSync(claimed.userJs);
+        } catch {}
+      } else {
+        writeFileSync(claimed.userJs, claimed.previousUserJs, { mode: 0o600 });
+      }
+    }
+  } catch (error) {
+    restoreError = error;
+  }
+  try {
+    unlinkSync(claimed.lock);
+  } catch {}
+  if (claimed.ephemeral) {
+    rmSync(claimed.root, { recursive: true, force: true });
+  }
+  if (restoreError) throw restoreError;
 }
 
 class Bidi {
@@ -160,12 +850,20 @@ class Bidi {
       timer: Timer;
     }
   >();
+  listeners = new Map<string, Set<(params: any) => void>>();
+  subscriptions = new Set<string>();
 
   constructor(url: string) {
     this.socket = new WebSocket(url);
     this.socket.addEventListener("message", (event) => {
       const message = JSON.parse(String(event.data));
-      if (typeof message.id !== "number") return;
+      if (typeof message.id !== "number") {
+        if (typeof message.method !== "string") return;
+        for (const listener of this.listeners.get(message.method) || []) {
+          listener(message.params);
+        }
+        return;
+      }
       const request = this.pending.get(message.id);
       if (!request) return;
       clearTimeout(request.timer);
@@ -206,18 +904,47 @@ class Bidi {
     });
   }
 
+  async tree() {
+    return this.command("browsingContext.getTree", {});
+  }
+
   async context() {
-    const tree = await this.command("browsingContext.getTree", {});
+    const tree = await this.tree();
     const context = tree.contexts?.[0]?.context;
     if (!context) throw new Error("Firefox has no browsing context");
     return String(context);
   }
 
-  async navigate(context: string, url: string) {
+  on(method: string, listener: (params: any) => void) {
+    const listeners = this.listeners.get(method) || new Set();
+    listeners.add(listener);
+    this.listeners.set(method, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (!listeners.size) this.listeners.delete(method);
+    };
+  }
+
+  async subscribe(method: string, context: string) {
+    const key = `${method}\n${context}`;
+    if (this.subscriptions.has(key)) return;
+    await this.command("session.subscribe", {
+      events: [method],
+      contexts: [context],
+    });
+    this.subscriptions.add(key);
+  }
+
+  async navigate(
+    context: string,
+    url: string,
+    timeoutMs = 45_000,
+    wait: "none" | "interactive" | "complete" = "interactive",
+  ) {
     return this.command(
       "browsingContext.navigate",
-      { context, url, wait: "complete" },
-      120_000,
+      { context, url, wait },
+      timeoutMs,
     );
   }
 
@@ -245,20 +972,59 @@ class Bidi {
 
 type BrowserOptions = {
   profile: string;
+  ephemeral: boolean;
+  templatePreferences: FirefoxPreference[];
   headless: boolean;
   humanTimeout: number;
   waitMs: number;
+  settleMs: number;
+  navigationTimeoutMs: number;
+  maxContentChars: number;
+  maxLinks: number;
+  scrollSteps: number;
+  interactionSteps: number;
+  captureNetworkJson: boolean;
 };
 
-async function startBrowser(options: BrowserOptions) {
+const ordinaryBrowserPreload = String.raw`() => {
+  const descriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "webdriver")
+  if (descriptor && !descriptor.configurable) return
+  Object.defineProperty(Navigator.prototype, "webdriver", {
+    configurable: true,
+    enumerable: descriptor?.enumerable ?? true,
+    get: () => false,
+  })
+}`;
+
+async function terminateBrowserProcess(
+  processHandle: ReturnType<typeof Bun.spawn>,
+) {
+  if (processHandle.exitCode !== null) return;
+  processHandle.kill();
+  await Promise.race([processHandle.exited, sleep(3_000)]);
+  if (processHandle.exitCode === null) {
+    processHandle.kill(9);
+    await processHandle.exited;
+  }
+}
+
+async function startBrowser(
+  options: BrowserOptions,
+  transientPreferences: FirefoxPreference[] = [],
+) {
   if (
     !options.headless &&
     !process.env.DISPLAY &&
     !process.env.WAYLAND_DISPLAY
   ) {
-    fail("no graphical display is available; use --headless");
+    throw new Error("no graphical display is available; use --headless");
   }
-  const claimed = claimProfile(options.profile);
+  const claimed = claimProfile(
+    options.profile,
+    [...options.templatePreferences, ...transientPreferences],
+    true,
+    options.ephemeral,
+  );
   const port = choosePort();
   const command = [
     "firefox",
@@ -276,48 +1042,57 @@ async function startBrowser(options: BrowserOptions) {
     stdin: "ignore",
   });
   const deadline = Date.now() + 20_000;
+  let ready = false;
   while (Date.now() < deadline) {
     if (processHandle.exitCode !== null) break;
     try {
       const response = await fetch(`http://127.0.0.1:${port}/`);
-      if (response.ok) break;
+      if (response.ok) {
+        ready = true;
+        break;
+      }
     } catch {}
     await sleep(150);
   }
-  if (processHandle.exitCode !== null) {
-    try {
-      unlinkSync(claimed.lock);
-    } catch {}
-    fail("Firefox exited before its local control socket became ready");
+  if (!ready) {
+    await terminateBrowserProcess(processHandle);
+    releaseProfile(claimed);
+    throw new Error(
+      processHandle.exitCode !== null
+        ? "Firefox exited before its local control socket became ready"
+        : "Firefox control socket did not become ready within 20 seconds",
+    );
   }
   const bidi = new Bidi(`ws://127.0.0.1:${port}/session`);
+  let context: string;
   try {
     await bidi.open();
+    context = await bidi.context();
+    await bidi.command("script.addPreloadScript", {
+      functionDeclaration: ordinaryBrowserPreload,
+      contexts: [context],
+    });
   } catch (error) {
-    processHandle.kill();
-    try {
-      unlinkSync(claimed.lock);
-    } catch {}
+    bidi.close();
+    await terminateBrowserProcess(processHandle);
+    releaseProfile(claimed);
     throw error;
   }
-  const context = await bidi.context();
   return { bidi, context, processHandle, ...claimed };
 }
 
 async function stopBrowser(browser: Awaited<ReturnType<typeof startBrowser>>) {
   browser.bidi.close();
-  browser.processHandle.kill();
-  await Promise.race([browser.processHandle.exited, sleep(3_000)]);
-  try {
-    unlinkSync(browser.lock);
-  } catch {}
+  await terminateBrowserProcess(browser.processHandle);
+  releaseProfile(browser);
 }
 
 async function withBrowser<T>(
   options: BrowserOptions,
   operation: (browser: Awaited<ReturnType<typeof startBrowser>>) => Promise<T>,
+  transientPreferences: FirefoxPreference[] = [],
 ) {
-  const browser = await startBrowser(options);
+  const browser = await startBrowser(options, transientPreferences);
   try {
     return await operation(browser);
   } finally {
@@ -325,64 +1100,780 @@ async function withBrowser<T>(
   }
 }
 
-const challengeExpression = String.raw`(() => {
-  const title = document.title || ""
-  const body = (document.body?.innerText || "").slice(0, 12000)
-  const compact = (title + "\n" + body).toLowerCase()
-  const element = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [class*="captcha" i], [id*="captcha" i]')
-  const phrases = ["verify you are human", "checking your browser", "just a moment", "attention required", "complete the security check", "unusual traffic"]
-  return JSON.stringify({ blocked: Boolean(element) || phrases.some(value => compact.includes(value)), title, url: location.href })
+function sanitizedNetworkJson(value: unknown) {
+  let nodes = 0;
+  const visit = (item: unknown, depth: number): unknown => {
+    nodes += 1;
+    if (nodes > 2_000 || depth > 8 || item === null) return null;
+    if (typeof item === "string") {
+      const cleaned = terminalText(item).slice(0, 4_000);
+      return /^https?:\/\//i.test(cleaned)
+        ? redactedOutputUrl(cleaned)
+        : cleaned;
+    }
+    if (typeof item === "number" || typeof item === "boolean") return item;
+    if (Array.isArray(item)) {
+      return item
+        .slice(0, 100)
+        .map((value) => visit(value, depth + 1))
+        .filter((value) => value !== null);
+    }
+    if (typeof item !== "object") return null;
+    const result: JsonObject = {};
+    for (const [key, value] of Object.entries(item).slice(0, 100)) {
+      if (
+        sensitiveQueryParameter(key) ||
+        /^(?:cookie|set-cookie|password|passwd|authorization)$/i.test(key)
+      ) {
+        continue;
+      }
+      const sanitized = visit(value, depth + 1);
+      if (sanitized !== null) result[key] = sanitized;
+    }
+    return result;
+  };
+  return visit(value, 0);
+}
+
+async function startNetworkCapture(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  targetUrl: string,
+  enabled: boolean,
+) {
+  const empty = {
+    finish: async () => [] as NetworkEvidence[],
+    close: async () => {},
+  };
+  if (!enabled) return empty;
+  let targetOrigin = "";
+  try {
+    targetOrigin = new URL(targetUrl).origin;
+  } catch {
+    return empty;
+  }
+  let collector = "";
+  try {
+    const result = await browser.bidi.command("network.addDataCollector", {
+      dataTypes: ["response"],
+      maxEncodedDataSize: 131_072,
+      contexts: [browser.context],
+    });
+    collector = String(result.collector || "");
+    if (!collector) return empty;
+    await browser.bidi.subscribe("network.responseCompleted", browser.context);
+  } catch {
+    if (collector) {
+      try {
+        await browser.bidi.command("network.removeDataCollector", { collector });
+      } catch {}
+    }
+    return empty;
+  }
+  const candidates: Array<{
+    request: string;
+    url: string;
+    status: number;
+    mimeType: string;
+  }> = [];
+  const seen = new Set<string>();
+  const stopListening = browser.bidi.on("network.responseCompleted", (params) => {
+    if (candidates.length >= 24 || params?.context !== browser.context) return;
+    const request = String(params?.request?.request || "");
+    const url = String(params?.request?.url || "");
+    const status = Number(params?.response?.status || 0);
+    const mimeType = String(params?.response?.mimeType || "").toLowerCase();
+    if (!request || seen.has(request) || status < 200 || status >= 300) return;
+    try {
+      if (new URL(url).origin !== targetOrigin) return;
+    } catch {
+      return;
+    }
+    if (!mimeType.includes("json") && !/\/(?:graphql|api)(?:\/|\?|$)/i.test(url)) {
+      return;
+    }
+    seen.add(request);
+    candidates.push({ request, url, status, mimeType });
+  });
+  let closed = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    stopListening();
+    try {
+      await browser.bidi.command("network.removeDataCollector", { collector });
+    } catch {}
+  };
+  const finish = async () => {
+    const evidence: NetworkEvidence[] = [];
+    let retainedChars = 0;
+    try {
+      for (const candidate of candidates.slice(0, 12)) {
+        if (retainedChars >= 524_288) break;
+        try {
+          const result = await browser.bidi.command("network.getData", {
+            request: candidate.request,
+            dataType: "response",
+            collector,
+            disown: true,
+          });
+          const bytes = result?.bytes;
+          const raw =
+            bytes?.type === "base64"
+              ? Buffer.from(String(bytes.value || ""), "base64").toString("utf8")
+              : String(bytes?.value || "");
+          if (!raw || retainedChars + raw.length > 524_288) continue;
+          const body = sanitizedNetworkJson(JSON.parse(raw));
+          if (body === null) continue;
+          retainedChars += raw.length;
+          evidence.push({
+            url: redactedOutputUrl(candidate.url),
+            status: candidate.status,
+            mimeType: candidate.mimeType,
+            body,
+          });
+        } catch {}
+      }
+      return evidence;
+    } finally {
+      await close();
+    }
+  };
+  return { finish, close };
+}
+
+const downloadMimeTypes = [
+  "application/octet-stream",
+  "application/pdf",
+  "application/zip",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+].join(",");
+
+const downloadTypes = new Set([
+  "pdf",
+  "zip",
+  "docx",
+  "xlsx",
+  "pptx",
+  "png",
+  "jpeg",
+  "gif",
+]);
+
+function checkedDownloadOutput(
+  outputValue: string,
+  rootValue: string,
+  replace: boolean,
+) {
+  if (!isAbsolute(outputValue) || !isAbsolute(rootValue)) {
+    throw new RetrievalFailure(
+      "policy",
+      "absolute-path-required",
+      "--output and --output-root must be absolute paths",
+      false,
+    );
+  }
+  let root: string;
+  let parent: string;
+  try {
+    root = realpathSync(rootValue);
+    parent = realpathSync(dirname(outputValue));
+  } catch (error) {
+    throw new RetrievalFailure(
+      "policy",
+      "output-directory-missing",
+      error instanceof Error ? error.message : String(error),
+      false,
+    );
+  }
+  if (!statSync(root).isDirectory() || !statSync(parent).isDirectory()) {
+    throw new RetrievalFailure(
+      "policy",
+      "output-directory-invalid",
+      "--output-root and the output parent must be directories",
+      false,
+    );
+  }
+  const parentRelative = relative(root, parent);
+  if (
+    parentRelative === ".." ||
+    parentRelative.startsWith(`..${sep}`) ||
+    isAbsolute(parentRelative)
+  ) {
+    throw new RetrievalFailure(
+      "policy",
+      "output-outside-root",
+      "--output must stay inside --output-root",
+      false,
+    );
+  }
+  const output = join(parent, basename(outputValue));
+  if (output === root || basename(output) === "." || basename(output) === "..") {
+    throw new RetrievalFailure(
+      "policy",
+      "output-invalid",
+      "--output must name a file inside --output-root",
+      false,
+    );
+  }
+  if (existsSync(output)) {
+    const existing = lstatSync(output);
+    if (!existing.isFile() || existing.isSymbolicLink()) {
+      throw new RetrievalFailure(
+        "policy",
+        "output-not-regular",
+        "an existing output must be a regular file",
+        false,
+      );
+    }
+    if (!replace) {
+      throw new RetrievalFailure(
+        "policy",
+        "output-exists",
+        "output exists; use --replace to replace it after validation",
+        false,
+      );
+    }
+  }
+  return { output, root };
+}
+
+function inferredDownloadType(output: string, requested: string) {
+  const extensionTypes: Record<string, string> = {
+    ".pdf": "pdf",
+    ".zip": "zip",
+    ".docx": "docx",
+    ".xlsx": "xlsx",
+    ".pptx": "pptx",
+    ".png": "png",
+    ".jpg": "jpeg",
+    ".jpeg": "jpeg",
+    ".gif": "gif",
+  };
+  const expected = requested || extensionTypes[extname(output).toLowerCase()];
+  if (!expected || !downloadTypes.has(expected)) {
+    throw new RetrievalFailure(
+      "policy",
+      "expected-type-required",
+      "use --expected-type pdf|zip|docx|xlsx|pptx|png|jpeg|gif",
+      false,
+    );
+  }
+  return expected;
+}
+
+function startsWithBytes(bytes: Buffer, signature: number[] | Buffer) {
+  const expected = Buffer.from(signature);
+  return (
+    bytes.length >= expected.length &&
+    bytes.subarray(0, expected.length).equals(expected)
+  );
+}
+
+function zipEntryNames(bytes: Buffer) {
+  const minimum = Math.max(0, bytes.length - 65_557);
+  let end = -1;
+  for (let offset = bytes.length - 22; offset >= minimum; offset -= 1) {
+    if (bytes.readUInt32LE(offset) === 0x06054b50) {
+      end = offset;
+      break;
+    }
+  }
+  if (end < 0) return [];
+  const entryCount = bytes.readUInt16LE(end + 10);
+  let offset = bytes.readUInt32LE(end + 16);
+  const names: string[] = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    if (offset + 46 > bytes.length || bytes.readUInt32LE(offset) !== 0x02014b50)
+      return [];
+    const nameLength = bytes.readUInt16LE(offset + 28);
+    const extraLength = bytes.readUInt16LE(offset + 30);
+    const commentLength = bytes.readUInt16LE(offset + 32);
+    const nameStart = offset + 46;
+    const nameEnd = nameStart + nameLength;
+    if (nameEnd > bytes.length) return [];
+    names.push(bytes.subarray(nameStart, nameEnd).toString("utf8"));
+    offset = nameEnd + extraLength + commentLength;
+  }
+  return names;
+}
+
+function verifyDownload(bytes: Buffer, expectedType: string) {
+  const simpleSignatures: Record<string, Array<number[] | Buffer>> = {
+    pdf: [Buffer.from("%PDF-")],
+    png: [[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+    jpeg: [[0xff, 0xd8, 0xff]],
+    gif: [Buffer.from("GIF87a"), Buffer.from("GIF89a")],
+    zip: [
+      [0x50, 0x4b, 0x03, 0x04],
+      [0x50, 0x4b, 0x05, 0x06],
+    ],
+  };
+  const zipBased = new Set(["zip", "docx", "xlsx", "pptx"]);
+  const signatureType = zipBased.has(expectedType) ? "zip" : expectedType;
+  const signatures = simpleSignatures[signatureType] || [];
+  if (!signatures.some((signature) => startsWithBytes(bytes, signature))) {
+    throw new RetrievalFailure(
+      "validation",
+      "signature-mismatch",
+      `download does not match expected ${expectedType} signature`,
+      false,
+    );
+  }
+  if (new Set(["docx", "xlsx", "pptx"]).has(expectedType)) {
+    const entries = zipEntryNames(bytes);
+    const requiredDirectory = { docx: "word/", xlsx: "xl/", pptx: "ppt/" }[
+      expectedType
+    ];
+    if (
+      !entries.includes("[Content_Types].xml") ||
+      !entries.some((name) => name.startsWith(requiredDirectory))
+    ) {
+      throw new RetrievalFailure(
+        "validation",
+        "office-container-mismatch",
+        `download is not a valid ${expectedType} container`,
+        false,
+      );
+    }
+  }
+}
+
+async function waitForDownload(
+  directory: string,
+  maxBytes: number,
+  timeoutMs: number,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let stableName = "";
+  let stableSize = -1;
+  let stableChecks = 0;
+  while (Date.now() < deadline) {
+    const entries = readdirSync(directory).filter((name) => {
+      try {
+        return lstatSync(join(directory, name)).isFile();
+      } catch {
+        return false;
+      }
+    });
+    for (const name of entries) {
+      const size = statSync(join(directory, name)).size;
+      if (size > maxBytes) {
+        throw new RetrievalFailure(
+          "limit",
+          "download-too-large",
+          `download exceeded the ${maxBytes}-byte limit`,
+          false,
+        );
+      }
+    }
+    const partials = entries.filter((name) => /\.(?:part|tmp)$/i.test(name));
+    const complete = entries.filter((name) => !/\.(?:part|tmp)$/i.test(name));
+    if (complete.length > 1) {
+      throw new RetrievalFailure(
+        "validation",
+        "ambiguous-download",
+        "browser created more than one completed file",
+        false,
+      );
+    }
+    if (complete.length === 1 && partials.length === 0) {
+      const name = complete[0];
+      const size = statSync(join(directory, name)).size;
+      if (size > 0 && name === stableName && size === stableSize) {
+        stableChecks += 1;
+        if (stableChecks >= 2) return join(directory, name);
+      } else {
+        stableName = name;
+        stableSize = size;
+        stableChecks = 0;
+      }
+    } else {
+      stableName = "";
+      stableSize = -1;
+      stableChecks = 0;
+    }
+    await sleep(250);
+  }
+  throw new RetrievalFailure(
+    "network",
+    "download-timeout",
+    `download did not complete within ${timeoutMs} milliseconds`,
+    true,
+  );
+}
+
+const loginExpression = String.raw`(() => {
+  const text = ((document.title || "") + "\n" + (document.body?.innerText || "")).toLowerCase().slice(0, 12000)
+  const control = document.querySelector('input[type="password"], form[action*="login" i], form[id*="login" i], form[class*="login" i]')
+  return Boolean(control) || ["sign in", "log in", "session expired", "authentication required"].some(value => text.includes(value))
 })()`;
 
-async function waitForChallenge(
+function downloadPreferences(directory: string): FirefoxPreference[] {
+  return [
+    ["browser.download.folderList", 2],
+    ["browser.download.dir", directory],
+    ["browser.download.useDownloadDir", true],
+    ["browser.download.alwaysOpenPanel", false],
+    ["browser.helperApps.neverAsk.saveToDisk", downloadMimeTypes],
+    ["browser.helperApps.neverAsk.openFile", ""],
+    ["pdfjs.disabled", true],
+    ["browser.download.viewableInternally.enabledTypes", ""],
+  ];
+}
+
+const pageStabilityExpression = String.raw`(() => {
+  const roots = [document]
+  let inspected = 0
+  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
+    for (const element of roots[index].querySelectorAll("*")) {
+      inspected += 1
+      if (element.shadowRoot) roots.push(element.shadowRoot)
+      if (inspected >= 50000 || roots.length >= 64) break scan
+    }
+  }
+  let textLength = 0
+  let links = 0
+  for (const root of roots) {
+    textLength += (root.textContent || "").length
+    links += root.querySelectorAll("a[href]").length
+  }
+  return JSON.stringify({
+    readyState: document.readyState,
+    url: location.href,
+    title: document.title || "",
+    textLength,
+    scrollHeight: document.documentElement?.scrollHeight || 0,
+    links,
+    shadowRoots: roots.length - 1,
+  })
+})()`;
+
+type PageStability = {
+  readyState: string;
+  url: string;
+  title: string;
+  textLength: number;
+  scrollHeight: number;
+  links: number;
+  shadowRoots: number;
+};
+
+async function settlePage(
   browser: Awaited<ReturnType<typeof startBrowser>>,
   options: BrowserOptions,
 ) {
-  let state = JSON.parse(
-    String(await browser.bidi.evaluate(browser.context, challengeExpression)),
+  if (options.waitMs) await sleep(options.waitMs);
+  const read = async () =>
+    JSON.parse(
+      String(
+        await browser.bidi.evaluate(browser.context, pageStabilityExpression),
+      ),
+    ) as PageStability;
+  if (!options.settleMs) return read();
+  const deadline = Date.now() + options.settleMs;
+  let previous = "";
+  let stableMatches = 0;
+  let state = await read();
+  while (true) {
+    const signature = JSON.stringify(state);
+    stableMatches = signature === previous ? stableMatches + 1 : 0;
+    if (state.readyState !== "loading" && stableMatches >= 1) return state;
+    if (Date.now() >= deadline) return state;
+    previous = signature;
+    await sleep(Math.min(200, Math.max(1, deadline - Date.now())));
+    state = await read();
+  }
+}
+
+async function preparePage(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  options: BrowserOptions,
+) {
+  let state = await settlePage(browser, options);
+  await waitForPageAccess(browser, options);
+  for (let step = 0; step < options.scrollSteps; step += 1) {
+    const before = state.scrollHeight;
+    await browser.bidi.evaluate(
+      browser.context,
+      "window.scrollTo(0, document.documentElement?.scrollHeight || document.body?.scrollHeight || 0)",
+    );
+    state = await settlePage(browser, options);
+    await waitForPageAccess(browser, options);
+    if (state.scrollHeight <= before) break;
+  }
+  return state;
+}
+
+const pageAccessExpression = String.raw`(() => {
+  const roots = [document]
+  let inspected = 0
+  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
+    for (const element of roots[index].querySelectorAll("*")) {
+      inspected += 1
+      if (element.shadowRoot) roots.push(element.shadowRoot)
+      if (inspected >= 50000 || roots.length >= 64) break scan
+    }
+  }
+  const queryAll = selector => roots.flatMap(root => [...root.querySelectorAll(selector)])
+  const visible = element => {
+    const style = getComputedStyle(element)
+    const bounds = element.getBoundingClientRect()
+    return style.display !== "none" && style.visibility !== "hidden" && bounds.width > 0 && bounds.height > 0
+  }
+  const title = document.title || ""
+  const text = (document.body?.innerText || "").slice(0, 12000)
+  const contentRoots = queryAll('article, main, [role="main"], [role="article"], .article-body, .article-content, .post-content, .entry-content, #content').filter(visible)
+  const mainTextLength = contentRoots.reduce((largest, element) => Math.max(largest, (element.innerText || "").length), 0)
+  const articleCount = queryAll('article, [role="article"]').filter(visible).length
+  const contentLinks = contentRoots.reduce((total, element) => total + [...element.querySelectorAll('a[href]')].filter(visible).length, 0)
+  const structuredDataChars = [...document.querySelectorAll('meta[name="description"], meta[property^="og:"], script[type="application/ld+json"]')].reduce((total, element) => Math.min(20000, total + (element.getAttribute('content') || element.textContent || '').length), 0)
+  const challengeControl = queryAll('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-sitekey], input[name*="captcha" i], #cf-challenge-running, .cf-challenge-running, [id*="turnstile" i], [class*="turnstile" i]').some(visible)
+  const loginControl = queryAll('input[type="password"], form[action*="/login" i], form[action*="/signin" i], form[action*="/auth" i], [role="dialog"] a[href*="/login" i], [role="dialog"] a[href*="/signin" i], [role="dialog"] a[href*="/auth" i]').some(visible)
+  return JSON.stringify({ title, url: location.href, text, challengeControl, loginControl, mainTextLength, articleCount, contentLinks, structuredDataChars })
+})()`;
+
+type PageAccessSignals = {
+  title: string;
+  url: string;
+  text: string;
+  challengeControl: boolean;
+  loginControl: boolean;
+  mainTextLength?: number;
+  articleCount?: number;
+  contentLinks?: number;
+  structuredDataChars?: number;
+};
+
+type PageAccessKind =
+  | "challenge"
+  | "login"
+  | "rate-limit"
+  | "soft-challenge"
+  | "soft-login"
+  | "none";
+
+function classifyPageAccess(signals: PageAccessSignals): PageAccessKind {
+  const title = String(signals.title || "").trim().toLowerCase();
+  const text = String(signals.text || "").toLowerCase();
+  const compact = `${title}\n${text}`;
+  if (
+    /^(?:429|too many requests|rate limit(?:ed| exceeded)?)(?:\b|[.!…-])/.test(
+      title,
+    ) ||
+    ["rate limit exceeded", "too many requests", "try again later"].filter(
+      (phrase) => compact.includes(phrase),
+    ).length >= 2
+  ) {
+    return "rate-limit";
+  }
+  const challengePhrases = [
+    "verify you are human",
+    "checking your browser",
+    "complete the security check",
+    "security verification",
+    "unusual traffic",
+    "enable javascript and cookies to continue",
+  ];
+  const challengeEvidence = challengePhrases.filter((phrase) =>
+    compact.includes(phrase),
+  ).length;
+  const challengeTitle = /^(?:attention required|checking your browser|just a moment|security check|verify you are human)(?:\b|[.!…-])/.test(
+    title,
   );
-  if (!state.blocked) return;
+  const hasPublicEvidence =
+    Number(signals.mainTextLength || 0) >= 600 ||
+    Number(signals.structuredDataChars || 0) >= 200 ||
+    (Number(signals.articleCount || 0) >= 2 &&
+      Number(signals.contentLinks || 0) >= 3) ||
+    (Number(signals.mainTextLength || 0) >= 250 &&
+      Number(signals.contentLinks || 0) >= 8);
+  if (
+    signals.challengeControl ||
+    challengeEvidence >= 2 ||
+    (challengeTitle && challengeEvidence >= 1)
+  ) {
+    if (
+      hasPublicEvidence &&
+      signals.challengeControl &&
+      !challengeTitle &&
+      challengeEvidence < 2
+    ) {
+      return "soft-challenge";
+    }
+    return "challenge";
+  }
+  let path = "";
+  try {
+    path = new URL(signals.url).pathname.toLowerCase();
+  } catch {}
+  const loginPath = /\/(?:authwall|checkpoint|login|signin|sign-in)(?:\/|$)/.test(
+    path,
+  );
+  const loginPhrase = [
+    "sign in",
+    "log in",
+    "join linkedin",
+    "authentication required",
+    "session expired",
+  ].some((phrase) => compact.includes(phrase));
+  if (signals.loginControl || (loginPath && loginPhrase)) {
+    if (signals.loginControl && hasPublicEvidence && !loginPath) {
+      return "soft-login";
+    }
+    return "login";
+  }
+  return "none";
+}
+
+async function pageAccessState(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+) {
+  const signals = JSON.parse(
+    String(await browser.bidi.evaluate(browser.context, pageAccessExpression)),
+  ) as PageAccessSignals;
+  return { kind: classifyPageAccess(signals), signals };
+}
+
+async function waitForPageAccess(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  options: BrowserOptions,
+) {
+  let state = await pageAccessState(browser);
+  if (state.kind === "rate-limit") {
+    throw new Error("origin rate limited; retry later");
+  }
+  if (
+    state.kind === "none" ||
+    state.kind === "soft-login" ||
+    state.kind === "soft-challenge"
+  ) {
+    return state;
+  }
+  const label = state.kind === "login" ? "login" : "challenge";
   if (options.headless) {
     throw new Error(
-      "the page presented a human challenge; rerun without --headless",
+      `interactive ${label} required; use browser for interactive setup or rerun with --visible`,
     );
   }
   if (options.humanTimeout === 0) {
-    throw new Error("the page presented a human challenge");
+    throw new Error(`interactive ${label} required`);
   }
-  info(`human challenge open in Firefox: ${state.title || state.url}`);
+  info(
+    `interactive ${label} open in Firefox: ${state.signals.title || redactedOutputUrl(state.signals.url)}`,
+  );
   process.stderr.write(
-    `${yellow}  Complete it in the browser; no cookie or challenge response is exposed to the agent.${reset}\n`,
+    `${yellow}  Complete it in the browser; no browser state or response token is exposed to the agent.${reset}\n`,
   );
   const deadline = Date.now() + options.humanTimeout * 1000;
   let nextUpdate = Date.now() + 30_000;
   while (Date.now() < deadline) {
     await sleep(1_500);
-    state = JSON.parse(
-      String(await browser.bidi.evaluate(browser.context, challengeExpression)),
-    );
-    if (!state.blocked) {
-      info("challenge cleared; continuing local extraction");
-      return;
+    state = await pageAccessState(browser);
+    if (state.kind === "rate-limit") {
+      throw new Error("origin rate limited; retry later");
+    }
+    if (
+      state.kind === "none" ||
+      state.kind === "soft-login" ||
+      state.kind === "soft-challenge"
+    ) {
+      info(`${label} cleared; continuing local extraction`);
+      return state;
     }
     if (Date.now() >= nextUpdate) {
-      info("still waiting for the browser challenge");
+      info(`still waiting for the browser ${label}`);
       nextUpdate = Date.now() + 30_000;
     }
   }
   throw new Error(
-    `human challenge was not cleared within ${options.humanTimeout} seconds`,
+    `interactive ${label} was not cleared within ${options.humanTimeout} seconds`,
   );
 }
 
-const extractExpression = String.raw`(() => {
-  const absolute = value => { try { return new URL(value, location.href).href } catch { return "" } }
-  const candidates = [...document.querySelectorAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content')]
+function extractionExpression(options: BrowserOptions) {
+  return String.raw`(() => {
+  const maxContentChars = ${options.maxContentChars}
+  const maxLinks = ${options.maxLinks}
+  const roots = [document]
+  let inspected = 0
+  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
+    for (const element of roots[index].querySelectorAll("*")) {
+      inspected += 1
+      if (element.shadowRoot) roots.push(element.shadowRoot)
+      if (inspected >= 50000 || roots.length >= 64) break scan
+    }
+  }
+  const queryAll = selector => roots.flatMap(root => [...root.querySelectorAll(selector)])
+  const first = selector => queryAll(selector)[0] || null
+  const sensitive = name => /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(name) || /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|solution)(?:$|[_-])/.test(name) || /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(name)
+  const absolute = value => {
+    try {
+      const url = new URL(value, location.href)
+      if (!['http:', 'https:'].includes(url.protocol)) return ""
+      url.username = ""
+      url.password = ""
+      url.hash = ""
+      for (const name of [...url.searchParams.keys()]) if (sensitive(name.toLowerCase())) url.searchParams.delete(name)
+      return url.href
+    } catch { return "" }
+  }
+  const candidates = queryAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content')
   const score = element => (element.innerText || "").length - [...element.querySelectorAll("a")].reduce((total, link) => total + (link.innerText || "").length, 0) * 0.35
-  const source = candidates.sort((a, b) => score(b) - score(a))[0] || document.body
+  const source = candidates.sort((a, b) => score(b) - score(a))[0] || document.body || document.documentElement
+  if (!source) return JSON.stringify({ title: document.title || "", url: absolute(location.href), canonicalUrl: absolute(location.href), published: "", byline: "", text: "", markdown: "", html: "", links: [] })
   const root = source.cloneNode(true)
   root.querySelectorAll('script, style, nav, footer, header, aside, form, noscript, svg, canvas, iframe, button, [aria-hidden="true"]').forEach(node => node.remove())
   const clean = value => value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/[ \t\f\v]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim()
+  const metadata = {}
+  for (const [name, selector] of [
+    ['description', 'meta[name="description"]'],
+    ['og:title', 'meta[property="og:title"]'],
+    ['og:description', 'meta[property="og:description"]'],
+    ['og:type', 'meta[property="og:type"]'],
+    ['og:url', 'meta[property="og:url"]'],
+    ['twitter:title', 'meta[name="twitter:title"]'],
+    ['twitter:description', 'meta[name="twitter:description"]'],
+  ]) {
+    const raw = document.querySelector(selector)?.getAttribute('content') || ''
+    const value = name === 'og:url' ? absolute(raw) : clean(raw).slice(0, 4000)
+    if (value) metadata[name] = value
+  }
+  let structuredNodes = 0
+  const sanitizeStructured = (value, depth = 0) => {
+    structuredNodes += 1
+    if (structuredNodes > 2000 || depth > 8 || value === null) return null
+    if (typeof value === 'string') {
+      const cleaned = clean(value).slice(0, 4000)
+      return /^https?:\/\//i.test(cleaned) ? absolute(cleaned) : cleaned
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') return value
+    if (Array.isArray(value)) return value.slice(0, 100).map(item => sanitizeStructured(item, depth + 1)).filter(item => item !== null)
+    if (typeof value !== 'object') return null
+    const result = {}
+    for (const [key, item] of Object.entries(value).slice(0, 100)) {
+      if (sensitive(key.toLowerCase())) continue
+      const sanitized = sanitizeStructured(item, depth + 1)
+      if (sanitized !== null) result[key] = sanitized
+    }
+    return result
+  }
+  const jsonLd = []
+  let jsonLdChars = 0
+  for (const script of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0, 32)) {
+    const raw = script.textContent || ''
+    if (!raw.trim() || raw.length > 524288 - jsonLdChars) continue
+    jsonLdChars += raw.length
+    try {
+      const sanitized = sanitizeStructured(JSON.parse(raw))
+      if (sanitized !== null) jsonLd.push(sanitized)
+    } catch {}
+  }
+  root.querySelectorAll('code, pre').forEach(node => { if (!clean(node.innerText || node.textContent || "")) node.remove() })
   const inline = node => clean([...node.childNodes].map(walk).join(""))
   const table = element => {
     const rows = [...element.querySelectorAll("tr")].map(row => [...row.querySelectorAll("th,td")].map(cell => clean(cell.innerText || "").replaceAll("|", "\\|")))
@@ -411,37 +1902,533 @@ const extractExpression = String.raw`(() => {
     }
     if (tag === "li") return "\n- " + inline(node)
     if (tag === "blockquote") return "\n\n> " + inline(node).replaceAll("\n", "\n> ") + "\n\n"
-    if (tag === "pre") return "\n\n" + String.fromCharCode(96).repeat(3) + "\n" + clean(node.innerText || "") + "\n" + String.fromCharCode(96).repeat(3) + "\n\n"
-    if (tag === "code") return String.fromCharCode(96) + inline(node) + String.fromCharCode(96)
+    if (tag === "pre") {
+      const content = clean(node.innerText || "")
+      return content ? "\n\n" + String.fromCharCode(96).repeat(3) + "\n" + content + "\n" + String.fromCharCode(96).repeat(3) + "\n\n" : ""
+    }
+    if (tag === "code") {
+      const content = inline(node)
+      return content ? String.fromCharCode(96) + content + String.fromCharCode(96) : ""
+    }
     if (tag === "strong" || tag === "b") return "**" + inline(node) + "**"
     if (tag === "em" || tag === "i") return "*" + inline(node) + "*"
     if (tag === "table") return "\n\n" + table(node)
     return [...node.childNodes].map(walk).join("")
   }
-  const links = [...document.querySelectorAll("a[href]")].map(link => absolute(link.getAttribute("href"))).filter(value => value.startsWith("http://") || value.startsWith("https://"))
+  const links = queryAll("a[href]").map(link => absolute(link.getAttribute("href"))).filter(value => value.startsWith("http://") || value.startsWith("https://"))
   const canonical = absolute(document.querySelector('link[rel="canonical"]')?.getAttribute("href") || location.href)
-  const published = document.querySelector('meta[property="article:published_time"], meta[name="date"], time[datetime]')?.getAttribute("content") || document.querySelector("time[datetime]")?.getAttribute("datetime") || ""
-  const byline = document.querySelector('meta[name="author"]')?.getAttribute("content") || document.querySelector('[rel="author"], .byline, [class*="author"]')?.textContent || ""
-  return JSON.stringify({ title: document.title || "", url: location.href, canonicalUrl: canonical, published: clean(published), byline: clean(byline), text: clean(source.innerText || root.textContent || ""), markdown: clean(walk(root)), html: root.innerHTML, links: [...new Set(links)] })
+  const published = first('meta[property="article:published_time"], meta[name="date"], time[datetime]')?.getAttribute("content") || first("time[datetime]")?.getAttribute("datetime") || ""
+  const byline = first('meta[name="author"]')?.getAttribute("content") || first('[rel="author"], .byline, [class*="author"]')?.textContent || ""
+  for (const element of root.querySelectorAll('[href], [src]')) {
+    for (const attribute of ['href', 'src']) {
+      if (!element.hasAttribute(attribute)) continue
+      const value = absolute(element.getAttribute(attribute) || "")
+      if (value) element.setAttribute(attribute, value)
+      else element.removeAttribute(attribute)
+    }
+  }
+  const text = clean(source.innerText || root.textContent || "")
+  const markdown = clean(walk(root))
+  const html = root.innerHTML
+  const uniqueLinks = [...new Set(links)]
+  const sources = []
+  if (text || markdown) sources.push('rendered-dom')
+  if (Object.keys(metadata).length) sources.push('page-metadata')
+  if (jsonLd.length) sources.push('json-ld')
+  return JSON.stringify({
+    title: document.title || "",
+    url: absolute(location.href),
+    canonicalUrl: canonical,
+    published: clean(published),
+    byline: clean(byline),
+    text: text.slice(0, maxContentChars),
+    markdown: markdown.slice(0, maxContentChars),
+    html: html.slice(0, maxContentChars),
+    links: uniqueLinks.slice(0, maxLinks),
+    structured: Object.keys(metadata).length || jsonLd.length ? { metadata, jsonLd } : undefined,
+    sources,
+    truncated: {
+      text: text.length > maxContentChars,
+      markdown: markdown.length > maxContentChars,
+      html: html.length > maxContentChars,
+      links: uniqueLinks.length > maxLinks,
+    },
+  })
+})()`;
+}
+
+const interactionExpression = String.raw`(() => {
+  const roots = [document]
+  let inspected = 0
+  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
+    for (const element of roots[index].querySelectorAll('*')) {
+      inspected += 1
+      if (element.shadowRoot) roots.push(element.shadowRoot)
+      if (inspected >= 50000 || roots.length >= 64) break scan
+    }
+  }
+  const visible = element => {
+    const style = getComputedStyle(element)
+    const bounds = element.getBoundingClientRect()
+    return style.display !== 'none' && style.visibility !== 'hidden' && bounds.width > 0 && bounds.height > 0
+  }
+  const candidates = roots.flatMap(root => [...root.querySelectorAll('button, [role="button"], summary')])
+  const choices = []
+  for (const element of candidates) {
+    if (!visible(element) || element.disabled || element.dataset.agencyInteractionCandidate || element.closest('form, [contenteditable="true"]')) continue
+    const label = (element.getAttribute('aria-label') || element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+    const normalized = label.toLowerCase()
+    const dialog = element.closest('[role="dialog"], dialog, [aria-modal="true"]')
+    const content = element.closest('article, main, [role="main"], [role="feed"], [role="list"]')
+    const excluded = element.closest('nav, header, aside, [role="navigation"]') || /(?:user|account|profile|navigation|menu|filter|sort|share|settings|options)/.test(normalized)
+    let kind = ''
+    let priority = 0
+    if (dialog && /^(?:close|dismiss|not now|maybe later|no thanks|continue without(?: accepting)?)(?:\b|[.!…])/.test(normalized)) {
+      kind = 'dismiss'
+      priority = 3
+    } else if (content && !excluded && /^(?:load|show|view|see) more(?:\b|[.!…])|more (?:comments|replies|posts|results)/.test(normalized)) {
+      kind = 'load-more'
+      priority = 2
+    } else if (content && !excluded && (/^(?:read|show|view|see|continue reading) more(?:\b|[.!…])|^(?:more details|expand (?:content|details|section|text|post|comment))(?:\b|[.!…])/.test(normalized))) {
+      kind = 'expand'
+      priority = 1
+    }
+    if (kind) choices.push({ element, kind, label, priority })
+  }
+  choices.sort((left, right) => right.priority - left.priority)
+  const choice = choices[0]
+  if (!choice) return ''
+  choice.element.dataset.agencyInteractionCandidate = 'handled'
+  choice.element.click()
+  return JSON.stringify({ kind: choice.kind, label: choice.label })
+})()`;
+
+const scrollExpression = String.raw`(() => {
+  const agencyScrollTarget = true
+  const roots = [document]
+  let inspected = 0
+  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
+    for (const element of roots[index].querySelectorAll('*')) {
+      inspected += 1
+      if (element.shadowRoot) roots.push(element.shadowRoot)
+      if (inspected >= 50000 || roots.length >= 64) break scan
+    }
+  }
+  const candidates = roots.flatMap(root => [...root.querySelectorAll('main, [role="main"], [role="feed"], [role="list"], section, div')]).filter(element => {
+    const style = getComputedStyle(element)
+    const bounds = element.getBoundingClientRect()
+    return bounds.width > 0 && bounds.height >= 150 && ['auto', 'scroll'].includes(style.overflowY) && element.scrollHeight - element.clientHeight > 100
+  })
+  candidates.sort((left, right) => {
+    const score = element => (element.innerText || '').length + element.querySelectorAll('article, [role="article"]').length * 500
+    return score(right) - score(left)
+  })
+  const target = candidates[0]
+  if (target) {
+    const before = target.scrollTop
+    target.scrollTop = target.scrollHeight
+    return JSON.stringify({ target: 'container', moved: target.scrollTop !== before })
+  }
+  const before = window.scrollY
+  window.scrollTo(0, document.documentElement?.scrollHeight || document.body?.scrollHeight || 0)
+  return JSON.stringify({ target: 'document', moved: window.scrollY !== before })
 })()`;
 
 async function extractPage(
   browser: Awaited<ReturnType<typeof startBrowser>>,
   options: BrowserOptions,
 ) {
-  await waitForChallenge(browser, options);
-  if (options.waitMs) await sleep(options.waitMs);
-  return JSON.parse(
-    String(await browser.bidi.evaluate(browser.context, extractExpression)),
-  ) as Page;
+  const expression = extractionExpression(options);
+  const readPage = async () =>
+    JSON.parse(
+      String(await browser.bidi.evaluate(browser.context, expression)),
+    ) as Page;
+  const hasExtractableContent = (page: Page) =>
+    Boolean(
+      page.text.trim() ||
+        page.markdown.trim() ||
+        page.links.length ||
+        Object.keys(page.structured?.metadata || {}).length ||
+        page.structured?.jsonLd.length,
+    );
+  const captures: Page[] = [];
+  const accessStates: PageAccessKind[] = [];
+  let stability = await settlePage(browser, options);
+  let access = await waitForPageAccess(browser, options);
+  accessStates.push(access.kind);
+  let page = await readPage();
+  if (!hasExtractableContent(page)) {
+    await sleep(500);
+    access = await waitForPageAccess(browser, options);
+    accessStates.push(access.kind);
+    page = await readPage();
+  }
+  if (!hasExtractableContent(page)) {
+    throw new Error("page did not expose extractable content after navigation");
+  }
+  captures.push(page);
+  const actions: PageAction[] = [];
+  const scrollTargets: string[] = [];
+  for (let step = 0; step < options.interactionSteps; step += 1) {
+    const rawAction = String(
+      await browser.bidi.evaluate(browser.context, interactionExpression),
+    );
+    if (!rawAction) break;
+    const action = JSON.parse(rawAction) as Omit<PageAction, "changed">;
+    const previousPage = captures[captures.length - 1];
+    try {
+      stability = await settlePage(browser, options);
+      access = await waitForPageAccess(browser, options);
+      accessStates.push(access.kind);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("interactive ")) throw error;
+      actions.push({ ...action, changed: false, blocked: true });
+      break;
+    }
+    const nextPage = await readPage();
+    const changed =
+      nextPage.text !== previousPage.text ||
+      nextPage.markdown !== previousPage.markdown ||
+      nextPage.links.join("\n") !== previousPage.links.join("\n");
+    actions.push({ ...action, changed });
+    if (hasExtractableContent(nextPage) && changed) captures.push(nextPage);
+  }
+  for (let step = 0; step < options.scrollSteps; step += 1) {
+    const previousStability = stability;
+    const previousPage = captures[captures.length - 1];
+    const rawScroll = String(
+      await browser.bidi.evaluate(browser.context, scrollExpression),
+    );
+    let scroll = { target: "document", moved: true };
+    try {
+      scroll = JSON.parse(rawScroll);
+    } catch {}
+    scrollTargets.push(scroll.target);
+    stability = await settlePage(browser, options);
+    access = await waitForPageAccess(browser, options);
+    accessStates.push(access.kind);
+    const nextPage = await readPage();
+    if (hasExtractableContent(nextPage)) captures.push(nextPage);
+    const contentChanged =
+      nextPage.text !== previousPage.text ||
+      nextPage.markdown !== previousPage.markdown ||
+      nextPage.links.join("\n") !== previousPage.links.join("\n");
+    if (stability.scrollHeight <= previousStability.scrollHeight && !contentChanged) {
+      break;
+    }
+  }
+  const mergeBlocks = (values: string[]) => {
+    const seen = new Set<string>();
+    const blocks: string[] = [];
+    let length = 0;
+    let wasTruncated = false;
+    for (const value of values) {
+      for (const rawBlock of value.split(/\n{2,}/)) {
+        const block = rawBlock.trim();
+        if (!block) continue;
+        const key = block.replace(/\s+/g, " ");
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const separator = blocks.length ? "\n\n" : "";
+        const remaining = options.maxContentChars - length - separator.length;
+        if (remaining <= 0) {
+          wasTruncated = true;
+          continue;
+        }
+        const kept = block.slice(0, remaining);
+        blocks.push(kept);
+        length += separator.length + kept.length;
+        if (kept.length < block.length) wasTruncated = true;
+      }
+    }
+    return { value: blocks.join("\n\n"), wasTruncated };
+  };
+  const textResult = mergeBlocks(captures.map((capture) => capture.text));
+  const markdownResult = mergeBlocks(
+    captures.map((capture) => cleanExtractedMarkdown(capture.markdown)),
+  );
+  const metadata: Record<string, string> = {};
+  const jsonLd: unknown[] = [];
+  const seenJsonLd = new Set<string>();
+  const sources = new Set<string>();
+  for (const capture of captures) {
+    for (const source of capture.sources || []) sources.add(source);
+    for (const [name, value] of Object.entries(
+      capture.structured?.metadata || {},
+    )) {
+      if (!metadata[name] && value) metadata[name] = value;
+    }
+    for (const value of capture.structured?.jsonLd || []) {
+      const key = JSON.stringify(value);
+      if (seenJsonLd.has(key)) continue;
+      seenJsonLd.add(key);
+      jsonLd.push(value);
+    }
+  }
+  const structured =
+    Object.keys(metadata).length || jsonLd.length
+      ? { metadata, jsonLd }
+      : undefined;
+  let text = textResult.value;
+  let markdown = markdownResult.value;
+  let textWasTruncated = textResult.wasTruncated;
+  let markdownWasTruncated = markdownResult.wasTruncated;
+  if (structured && text.length < 500) {
+    const evidence = [
+      ...Object.entries(structured.metadata).map(
+        ([name, value]) => `${name}: ${value}`,
+      ),
+      ...structured.jsonLd.map((value) => JSON.stringify(value)),
+    ].join("\n");
+    if (evidence) {
+      const fusedText = mergeBlocks([text, evidence]);
+      const fusedMarkdown = mergeBlocks([
+        markdown,
+        `## Structured page evidence\n\n${evidence}`,
+      ]);
+      text = fusedText.value;
+      markdown = fusedMarkdown.value;
+      textWasTruncated ||= fusedText.wasTruncated;
+      markdownWasTruncated ||= fusedMarkdown.wasTruncated;
+    }
+  }
+  const finalPage = captures[captures.length - 1];
+  const url = redactedOutputUrl(finalPage.url);
+  const canonicalUrl = redactedOutputUrl(finalPage.canonicalUrl) || url;
+  const html = finalPage.html.slice(0, options.maxContentChars);
+  const uniqueLinkSet = new Set<string>();
+  for (const capture of captures) {
+    for (const link of capture.links) {
+      const redacted = redactedOutputUrl(link);
+      if (redacted) uniqueLinkSet.add(redacted);
+    }
+  }
+  const uniqueLinks = [...uniqueLinkSet];
+  const links = uniqueLinks.slice(0, options.maxLinks);
+  const accessState: PageAccessState = accessStates.includes("soft-challenge")
+    ? "soft-challenge"
+    : accessStates.includes("soft-login")
+      ? "soft-login"
+      : "public";
+  const state =
+    accessState !== "public"
+      ? "soft-gated-content"
+      : text || markdown
+        ? "public-content"
+        : "structured-only";
+  const truncated = {
+    text:
+      textWasTruncated || captures.some((capture) => capture.truncated?.text),
+    markdown:
+      markdownWasTruncated ||
+      captures.some((capture) => capture.truncated?.markdown),
+    html:
+      captures.some((capture) => capture.truncated?.html) ||
+      finalPage.html.length > options.maxContentChars,
+    links:
+      captures.some((capture) => capture.truncated?.links) ||
+      uniqueLinks.length > options.maxLinks,
+  };
+  return {
+    ...finalPage,
+    url,
+    canonicalUrl,
+    text,
+    markdown,
+    html,
+    links,
+    ...(structured ? { structured } : {}),
+    sources: [...sources],
+    access: { state: accessState },
+    state,
+    captures: captures.length,
+    actions,
+    scroll_targets: scrollTargets,
+    truncated,
+  };
+}
+
+function attachNetworkEvidence(
+  page: Page,
+  evidence: NetworkEvidence[],
+  options: BrowserOptions,
+) {
+  if (!evidence.length) return page;
+  page.network = evidence;
+  page.sources = [...new Set([...(page.sources || []), "network-json"])];
+  if (page.text.length < 500) {
+    const serialized = evidence.map((item) => JSON.stringify(item.body)).join("\n");
+    const textSeparator = page.text ? "\n\n" : "";
+    const markdownSeparator = page.markdown ? "\n\n" : "";
+    const textRemaining =
+      options.maxContentChars - page.text.length - textSeparator.length;
+    const markdownHeading = "## Network JSON evidence\n\n";
+    const markdownRemaining =
+      options.maxContentChars -
+      page.markdown.length -
+      markdownSeparator.length -
+      markdownHeading.length;
+    if (textRemaining > 0) {
+      page.text += textSeparator + serialized.slice(0, textRemaining);
+    }
+    if (markdownRemaining > 0) {
+      page.markdown +=
+        markdownSeparator +
+        markdownHeading +
+        serialized.slice(0, markdownRemaining);
+    }
+    if (serialized.length > textRemaining) page.truncated!.text = true;
+    if (serialized.length > markdownRemaining) page.truncated!.markdown = true;
+  }
+  return page;
+}
+
+async function navigateAndExtract(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  url: string,
+  options: BrowserOptions,
+) {
+  const networkCapture = await startNetworkCapture(
+    browser,
+    url,
+    options.captureNetworkJson,
+  );
+  let finished = false;
+  try {
+    await browser.bidi.navigate(
+      browser.context,
+      url,
+      options.navigationTimeoutMs,
+    );
+    const page = await extractPage(browser, options);
+    const evidence = await networkCapture.finish();
+    finished = true;
+    return attachNetworkEvidence(page, evidence, options);
+  } finally {
+    if (!finished) await networkCapture.close();
+  }
+}
+
+const frameExtractExpression = String.raw`(() => {
+  const candidates = [...document.querySelectorAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content')]
+  const score = element => (element.innerText || "").length - [...element.querySelectorAll("a")].reduce((total, link) => total + (link.innerText || "").length, 0) * 0.35
+  const source = candidates.sort((a, b) => score(b) - score(a))[0] || document.body
+  const clean = value => value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/[ \t\f\v]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim()
+  return JSON.stringify({ title: document.title || "", text: clean(source?.innerText || "") })
+})()`;
+
+type BrowsingContextNode = {
+  context?: string;
+  url?: string;
+  children?: BrowsingContextNode[];
+};
+
+function childContexts(nodes: BrowsingContextNode[]) {
+  const children: BrowsingContextNode[] = [];
+  const visit = (node: BrowsingContextNode) => {
+    for (const child of node.children || []) {
+      children.push(child);
+      visit(child);
+    }
+  };
+  for (const node of nodes) visit(node);
+  return children;
+}
+
+async function extractFrames(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  topOrigin: string,
+  extraOrigins: string[],
+) {
+  const allowedOrigins = new Set([topOrigin, ...extraOrigins]);
+  const tree = await browser.bidi.tree();
+  const frames: JsonObject[] = [];
+  for (const node of childContexts(tree.contexts || [])) {
+    let frameUrl: URL;
+    try {
+      frameUrl = new URL(String(node.url || ""));
+    } catch {
+      frames.push({
+        status: "skipped",
+        reason: "invalid-frame-url",
+        origin: "",
+        path: "",
+      });
+      continue;
+    }
+    const identity = { origin: frameUrl.origin, path: frameUrl.pathname };
+    if (!allowedOrigins.has(frameUrl.origin)) {
+      frames.push({
+        status: "skipped",
+        reason: "cross-origin",
+        ...identity,
+      });
+      continue;
+    }
+    if (!node.context) {
+      frames.push({
+        status: "skipped",
+        reason: "missing-context",
+        ...identity,
+      });
+      continue;
+    }
+    try {
+      const extracted = JSON.parse(
+        String(
+          await browser.bidi.evaluate(node.context, frameExtractExpression),
+        ),
+      );
+      frames.push({
+        status: "extracted",
+        ...identity,
+        title: String(extracted.title || ""),
+        text: String(extracted.text || ""),
+      });
+    } catch {
+      frames.push({
+        status: "failed",
+        reason: "extraction-failed",
+        ...identity,
+      });
+    }
+  }
+  return frames;
 }
 
 function browserOptions(args: string[]): BrowserOptions {
+  const visible = takeFlag(args, "--visible");
+  const legacyHeadless = takeFlag(args, "--headless");
+  const ephemeral = takeFlag(args, "--ephemeral-profile");
+  const template = takeOption(args, "--profile-template");
+  if (visible && legacyHeadless) fail("use either --visible or --headless");
   return {
     profile: checkedProfile(takeOption(args, "--profile", "default")),
-    headless: takeFlag(args, "--headless"),
+    ephemeral,
+    templatePreferences: template ? templatePreferences(template) : [],
+    headless: !visible,
     humanTimeout: takeNumber(args, "--human-timeout", 180, 0, 1800),
     waitMs: takeNumber(args, "--wait-ms", 350, 0, 30_000),
+    settleMs: takeNumber(args, "--settle-ms", 1_200, 0, 30_000),
+    navigationTimeoutMs: takeNumber(
+      args,
+      "--navigation-timeout-ms",
+      45_000,
+      1_000,
+      180_000,
+    ),
+    maxContentChars: takeNumber(
+      args,
+      "--max-content-chars",
+      2_000_000,
+      1,
+      20_000_000,
+    ),
+    maxLinks: takeNumber(args, "--max-links", 2_000, 1, 20_000),
+    scrollSteps: takeNumber(args, "--scroll-steps", 0, 0, 20),
+    interactionSteps: takeNumber(args, "--interaction-steps", 0, 0, 10),
+    captureNetworkJson: takeFlag(args, "--capture-network-json"),
   };
 }
 
@@ -452,6 +2439,9 @@ function searchUrl(engine: string, query: string) {
   if (engine === "brave") {
     return `https://search.brave.com/search?q=${encodeURIComponent(query)}&source=web`;
   }
+  if (engine === "bing") {
+    return `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
+  }
   throw new Error(`unsupported engine: ${engine}`);
 }
 
@@ -460,6 +2450,14 @@ function searchExpression(engine: string, limit: number) {
     const limit = ${limit}
     const engine = ${JSON.stringify(engine)}
     const absolute = value => { try { return new URL(value, location.href) } catch { return null } }
+    const sensitive = name => /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(name) || /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|solution)(?:$|[_-])/.test(name) || /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(name)
+    const sanitized = url => {
+      url.username = ""
+      url.password = ""
+      url.hash = ""
+      for (const name of [...url.searchParams.keys()]) if (sensitive(name.toLowerCase())) url.searchParams.delete(name)
+      return url.href
+    }
     const cleanUrl = value => {
       const url = absolute(value)
       if (!url) return ""
@@ -467,13 +2465,12 @@ function searchExpression(engine: string, limit: number) {
         const redirect = url.searchParams.get("uddg")
         const target = redirect ? absolute(decodeURIComponent(redirect)) : null
         if (!target || !["http:", "https:"].includes(target.protocol)) return ""
-        target.hash = ""
-        return target.href
+        return sanitized(target)
       }
       if (!["http:", "https:"].includes(url.protocol)) return ""
       if (url.hostname === "search.brave.com") return ""
-      url.hash = ""
-      return url.href
+      if (engine === "bing" && (url.hostname === "bing.com" || url.hostname.endsWith(".bing.com"))) return ""
+      return sanitized(url)
     }
     const results = []
     if (engine === "duckduckgo") {
@@ -483,15 +2480,21 @@ function searchExpression(engine: string, limit: number) {
         const url = cleanUrl(link?.getAttribute("href") || "")
         if (url) results.push({ title: (link?.textContent || "").trim(), url, snippet: (item.querySelector(".result__snippet")?.textContent || "").trim() })
       }
-    } else {
+    } else if (engine === "brave") {
       for (const item of document.querySelectorAll("main article, main .snippet, #results article")) {
         const link = item.querySelector("a[href]")
         const url = cleanUrl(link?.getAttribute("href") || "")
         if (url) results.push({ title: (item.querySelector(".search-snippet-title, h2, h3")?.textContent || link?.textContent || "").trim(), url, snippet: (item.querySelector(".generic-snippet .content, .snippet-description, .description, p")?.textContent || "").trim() })
       }
+    } else {
+      for (const item of document.querySelectorAll("#b_results > li.b_algo, main li.b_algo")) {
+        const link = item.querySelector("h2 a[href]")
+        const url = cleanUrl(link?.getAttribute("href") || "")
+        if (url) results.push({ title: (link?.textContent || "").trim(), url, snippet: (item.querySelector(".b_caption p, .b_snippet, p")?.textContent || "").trim() })
+      }
     }
     if (!results.length) {
-      for (const link of document.querySelectorAll("main a[href], #links a[href]")) {
+      for (const link of document.querySelectorAll("main a[href], #links a[href], #b_results a[href]")) {
         const url = cleanUrl(link.getAttribute("href") || "")
         const title = (link.textContent || "").trim()
         if (url && title.length > 3) results.push({ title, url, snippet: "" })
@@ -499,6 +2502,156 @@ function searchExpression(engine: string, limit: number) {
     }
     return JSON.stringify([...new Map(results.map(result => [result.url, result])).values()].slice(0, limit))
   })()`;
+}
+
+type SearchAttempt = {
+  engine: string;
+  outcome: "challenged" | "empty" | "failed" | "searched";
+  message?: string;
+};
+
+type SearchProviderHealth = {
+  failures: number;
+  cooldownUntil: number;
+  disabled: boolean;
+};
+
+type SearchRunState = {
+  health: Map<string, SearchProviderHealth>;
+  preferred: string;
+};
+
+function newSearchRunState(): SearchRunState {
+  return { health: new Map(), preferred: "" };
+}
+
+function searchEngines(requested: string) {
+  return requested === "auto"
+    ? ["duckduckgo", "brave", "bing"]
+    : [requested];
+}
+
+function orderedSearchEngines(
+  requested: string,
+  state: SearchRunState,
+  queryIndex: number,
+) {
+  const engines = searchEngines(requested);
+  if (state.preferred && engines.includes(state.preferred)) {
+    engines.splice(engines.indexOf(state.preferred), 1);
+    engines.unshift(state.preferred);
+  }
+  return engines.filter((engine) => {
+    const health = state.health.get(engine);
+    return !health?.disabled && (!health || health.cooldownUntil <= queryIndex);
+  });
+}
+
+function updateSearchHealth(
+  state: SearchRunState,
+  engine: string,
+  queryIndex: number,
+  message: string,
+) {
+  const previous = state.health.get(engine) || {
+    failures: 0,
+    cooldownUntil: 0,
+    disabled: false,
+  };
+  const failures = previous.failures + 1;
+  const challenged = message.includes("interactive challenge required");
+  state.health.set(engine, {
+    failures,
+    cooldownUntil: challenged
+      ? Number.MAX_SAFE_INTEGER
+      : queryIndex + Math.min(16, 2 ** Math.min(failures, 4)),
+    disabled: challenged,
+  });
+  return challenged;
+}
+
+async function searchOne(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  options: BrowserOptions,
+  query: string,
+  requestedEngine: string,
+  limit: number,
+  state: SearchRunState,
+  queryIndex: number,
+) {
+  const engines = orderedSearchEngines(requestedEngine, state, queryIndex);
+  if (!engines.length) throw new Error("no healthy search provider remains");
+  const attempts: SearchAttempt[] = [];
+  let firstError = "";
+  for (const [position, candidate] of engines.entries()) {
+    try {
+      await browser.bidi.navigate(
+        browser.context,
+        searchUrl(candidate, query),
+        options.navigationTimeoutMs,
+      );
+      const finalCandidate = position === engines.length - 1;
+      await preparePage(
+        browser,
+        finalCandidate ? options : { ...options, headless: true },
+      );
+      const results = JSON.parse(
+        String(
+          await browser.bidi.evaluate(
+            browser.context,
+            searchExpression(candidate, limit),
+          ),
+        ),
+      ) as SearchResult[];
+      if (!results.length) {
+        attempts.push({ engine: candidate, outcome: "empty" });
+        if (!finalCandidate) {
+          info(
+            `${candidate} returned no results; trying ${engines[position + 1]}`,
+          );
+          continue;
+        }
+      } else {
+        attempts.push({ engine: candidate, outcome: "searched" });
+      }
+      state.preferred = candidate;
+      state.health.set(candidate, {
+        failures: 0,
+        cooldownUntil: 0,
+        disabled: false,
+      });
+      return { engine: candidate, results, attempts };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const challenged = updateSearchHealth(
+        state,
+        candidate,
+        queryIndex,
+        message,
+      );
+      attempts.push({
+        engine: candidate,
+        outcome: challenged ? "challenged" : "failed",
+        message,
+      });
+      if (position === engines.length - 1) {
+        const details = firstError
+          ? `${firstError}; ${candidate}: ${message}`
+          : `${candidate}: ${message}`;
+        if (
+          !orderedSearchEngines(requestedEngine, state, queryIndex + 1).length
+        ) {
+          throw new Error(`no healthy search provider remains (${details})`);
+        }
+        throw new Error(`all search engines failed (${details})`);
+      }
+      firstError = firstError
+        ? `${firstError}; ${candidate}: ${message}`
+        : `${candidate}: ${message}`;
+      info(`${candidate} unavailable; trying ${engines[position + 1]}`);
+    }
+  }
+  throw new Error("no healthy search provider returned a result");
 }
 
 function database() {
@@ -515,29 +2668,53 @@ function database() {
   return db;
 }
 
-function indexPage(page: Page) {
-  const db = database();
-  const url = /^https?:\/\//.test(page.canonicalUrl)
+function pageIndexUrl(page: Page) {
+  return /^https?:\/\//.test(page.canonicalUrl)
     ? page.canonicalUrl
     : page.url;
-  const transaction = db.transaction(() => {
-    db.query(
-      "INSERT INTO pages (url, title, text, markdown, fetched_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at",
-    ).run(url, page.title, page.text, page.markdown, new Date().toISOString());
-    db.query("DELETE FROM pages_fts WHERE url = ?").run(url);
-    db.query("INSERT INTO pages_fts (url, title, text) VALUES (?, ?, ?)").run(
+}
+
+function pageIndexer() {
+  const db = database();
+  const upsert = db.query(
+    "INSERT INTO pages (url, title, text, markdown, fetched_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at",
+  );
+  const removeSearch = db.query("DELETE FROM pages_fts WHERE url = ?");
+  const addSearch = db.query(
+    "INSERT INTO pages_fts (url, title, text) VALUES (?, ?, ?)",
+  );
+  const write = db.transaction((page: Page) => {
+    const url = pageIndexUrl(page);
+    upsert.run(
       url,
       page.title,
       page.text,
+      page.markdown,
+      new Date().toISOString(),
     );
+    removeSearch.run(url);
+    addSearch.run(url, page.title, page.text);
   });
-  transaction();
-  db.close();
+  return {
+    write,
+    close: () => db.close(),
+  };
+}
+
+function indexPage(page: Page) {
+  const indexer = pageIndexer();
+  try {
+    indexer.write(page);
+  } finally {
+    indexer.close();
+  }
 }
 
 function safeLink(value: string, origin: string) {
   try {
-    const url = new URL(value);
+    const redacted = redactedOutputUrl(value);
+    if (!redacted) return "";
+    const url = new URL(redacted);
     if (
       url.origin !== origin ||
       !new Set(["http:", "https:"]).has(url.protocol)
@@ -566,6 +2743,34 @@ function safeLink(value: string, origin: string) {
   } catch {
     return "";
   }
+}
+
+const trackingQueryParameters = new Set([
+  "dclid",
+  "fbclid",
+  "gclid",
+  "igshid",
+  "mc_cid",
+  "mc_eid",
+  "msclkid",
+]);
+
+function crawlLink(value: string, origin: string, maxQueryParameters: number) {
+  const safe = safeLink(value, origin);
+  if (!safe) return "";
+  const url = new URL(safe);
+  for (const name of [...url.searchParams.keys()]) {
+    const normalized = name.toLowerCase();
+    if (
+      normalized.startsWith("utm_") ||
+      trackingQueryParameters.has(normalized)
+    ) {
+      url.searchParams.delete(name);
+    }
+  }
+  if ([...url.searchParams.keys()].length > maxQueryParameters) return "";
+  url.searchParams.sort();
+  return url.href;
 }
 
 function robotsAllows(url: URL, rules: string[]) {
@@ -609,57 +2814,21 @@ async function commandSearch(args: string[]) {
   const query = args.join(" ").trim();
   if (!query) fail("search requires a query");
   if (query.length > 1000) fail("search query must be at most 1000 characters");
-  if (!new Set(["auto", "duckduckgo", "brave"]).has(requestedEngine)) {
-    fail("--engine must be auto, duckduckgo, or brave");
+  if (!new Set(["auto", "duckduckgo", "brave", "bing"]).has(requestedEngine)) {
+    fail("--engine must be auto, duckduckgo, brave, or bing");
   }
-  const engines =
-    requestedEngine === "auto"
-      ? ["duckduckgo", "brave"]
-      : [requestedEngine];
-  let engine = engines[0];
-  let results: SearchResult[] = [];
-  let firstError = "";
-  for (const [position, candidate] of engines.entries()) {
-    try {
-      results = await withBrowser(options, async (browser) => {
-        await browser.bidi.navigate(
-          browser.context,
-          searchUrl(candidate, query),
-        );
-        const finalCandidate = position === engines.length - 1;
-        await waitForChallenge(
-          browser,
-          finalCandidate ? options : { ...options, headless: true },
-        );
-        if (options.waitMs) await sleep(options.waitMs);
-        return JSON.parse(
-          String(
-            await browser.bidi.evaluate(
-              browser.context,
-              searchExpression(candidate, limit),
-            ),
-          ),
-        ) as SearchResult[];
-      });
-      if (!results.length && position < engines.length - 1) {
-        info(`${candidate} returned no results; trying ${engines[position + 1]}`);
-        continue;
-      }
-      engine = candidate;
-      break;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (position === engines.length - 1) {
-        throw new Error(
-          firstError
-            ? `all search engines failed (${firstError}; ${candidate}: ${message})`
-            : message,
-        );
-      }
-      firstError = `${candidate}: ${message}`;
-      info(`${candidate} unavailable; trying ${engines[position + 1]}`);
-    }
-  }
+  const outcome = await withBrowser(options, async (browser) => {
+    return searchOne(
+      browser,
+      options,
+      query,
+      requestedEngine,
+      limit,
+      newSearchRunState(),
+      0,
+    );
+  });
+  const { engine, results } = outcome;
   if (json) {
     console.log(JSON.stringify({ query, engine, results }, null, 2));
     return;
@@ -673,19 +2842,755 @@ async function commandSearch(args: string[]) {
   }
 }
 
+function checkedBatchOutput(value: string, resume: boolean, command: string) {
+  const output = resolve(value);
+  const parent = dirname(output);
+  if (!existsSync(parent) || !statSync(parent).isDirectory()) {
+    fail(`${command} output parent must be an existing directory`);
+  }
+  if (existsSync(output)) {
+    const status = lstatSync(output);
+    if (!status.isFile() || status.isSymbolicLink()) {
+      fail(`${command} output must be a regular non-symlink file`);
+    }
+    if (!resume) fail(`${command} output exists; use --resume`);
+  } else {
+    writeFileSync(output, "", { flag: "wx", mode: 0o600 });
+  }
+  return output;
+}
+
+function batchQueries(value: string) {
+  const input = realpathSync(resolve(value));
+  const status = statSync(input);
+  if (!status.isFile()) fail("search-batch input must be a regular file");
+  if (status.size > 64 * 1024 * 1024) {
+    fail("search-batch input must be at most 64 MiB");
+  }
+  const queries: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of readFileSync(input, "utf8").split(/\r?\n/)) {
+    const query = raw.trim();
+    if (!query || seen.has(query)) continue;
+    if (query.length > 1000) fail("search-batch queries must be at most 1000 characters");
+    seen.add(query);
+    queries.push(query);
+  }
+  return { input, queries };
+}
+
+function completedBatchQueries(output: string, retryFailures: boolean) {
+  const completed = new Set<string>();
+  const text = readFileSync(output, "utf8");
+  for (const [index, line] of text.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    let record: any;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      fail(`search-batch output has invalid JSON on line ${index + 1}`);
+    }
+    if (
+      record.schema !== "agency/web-search-result/1" ||
+      typeof record.query !== "string" ||
+      !new Set(["searched", "failed"]).has(record.outcome)
+    ) {
+      fail(`search-batch output has an invalid record on line ${index + 1}`);
+    }
+    if (!retryFailures || record.outcome === "searched") {
+      completed.add(record.query);
+    }
+  }
+  return completed;
+}
+
+function deterministicJitter(query: string, maximum: number) {
+  if (!maximum) return 0;
+  const digest = createHash("sha256").update(query).digest();
+  return digest.readUInt32BE(0) % (maximum + 1);
+}
+
+async function commandSearchBatch(args: string[]) {
+  const options = browserOptions(args);
+  const outputValue = takeOption(args, "--output");
+  const requestedEngine = takeOption(args, "--engine", "auto");
+  const limit = takeNumber(args, "--limit", 10, 1, 50);
+  const delayMs = takeNumber(args, "--delay-ms", 1_500, 0, 60_000);
+  const jitterMs = takeNumber(args, "--jitter-ms", 500, 0, 60_000);
+  const maxQueries = takeNumber(args, "--max-queries", 1_000, 1, 100_000);
+  const resume = takeFlag(args, "--resume");
+  const retryFailures = takeFlag(args, "--retry-failures");
+  if (!outputValue) fail("search-batch requires --output PATH");
+  if (args.length !== 1) fail("search-batch requires one query file");
+  if (!new Set(["auto", "duckduckgo", "brave", "bing"]).has(requestedEngine)) {
+    fail("--engine must be auto, duckduckgo, brave, or bing");
+  }
+  const { input, queries } = batchQueries(args[0]);
+  const output = checkedBatchOutput(outputValue, resume, "search-batch");
+  if (input === realpathSync(output)) {
+    fail("search-batch input and output must be different files");
+  }
+  const previouslyCompleted = completedBatchQueries(output, retryFailures);
+  const pending = queries
+    .filter((query) => !previouslyCompleted.has(query))
+    .slice(0, maxQueries);
+  const summary = {
+    schema: "agency/web-search-batch/1",
+    input,
+    output,
+    total: queries.length,
+    resumed: queries.filter((query) => previouslyCompleted.has(query)).length,
+    attempted: 0,
+    completed: 0,
+    failed: 0,
+    pending: pending.length,
+    stopped: false,
+  };
+  if (!pending.length) {
+    console.log(JSON.stringify(summary, null, 2));
+    return;
+  }
+  const state = newSearchRunState();
+  await withBrowser(options, async (browser) => {
+    for (const [index, query] of pending.entries()) {
+      summary.attempted += 1;
+      try {
+        const result = await searchOne(
+          browser,
+          options,
+          query,
+          requestedEngine,
+          limit,
+          state,
+          index,
+        );
+        writeFileSync(
+          output,
+          `${JSON.stringify({
+            schema: "agency/web-search-result/1",
+            query,
+            outcome: "searched",
+            engine: result.engine,
+            results: result.results,
+            attempts: result.attempts,
+            completed_at: new Date().toISOString(),
+          })}\n`,
+          { flag: "a" },
+        );
+        summary.completed += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeFileSync(
+          output,
+          `${JSON.stringify({
+            schema: "agency/web-search-result/1",
+            query,
+            outcome: "failed",
+            error: message,
+            completed_at: new Date().toISOString(),
+          })}\n`,
+          { flag: "a" },
+        );
+        summary.failed += 1;
+        if (message.includes("no healthy search provider remains")) {
+          summary.stopped = true;
+          break;
+        }
+      }
+      if (index < pending.length - 1) {
+        await sleep(delayMs + deterministicJitter(query, jitterMs));
+      }
+    }
+  });
+  summary.pending = pending.length - summary.attempted;
+  console.log(JSON.stringify(summary, null, 2));
+  if (summary.failed) process.exitCode = 1;
+}
+
+function batchUrls(value: string) {
+  const input = realpathSync(resolve(value));
+  const status = statSync(input);
+  if (!status.isFile()) fail("scrape-batch input must be a regular file");
+  if (status.size > 256 * 1024 * 1024) {
+    fail("scrape-batch input must be at most 256 MiB");
+  }
+  const lines = readFileSync(input, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const candidates: Array<{
+    url: string;
+    evidence?: Omit<DiscoveryEvidence, "url">;
+  }> = [];
+  if (lines[0]?.startsWith("{")) {
+    for (const [index, line] of lines.entries()) {
+      let record: any;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        fail(`scrape-batch input has invalid JSON on line ${index + 1}`);
+      }
+      if (
+        record.schema !== "agency/web-search-result/1" ||
+        record.outcome !== "searched" ||
+        !Array.isArray(record.results)
+      ) {
+        continue;
+      }
+      for (const result of record.results) {
+        if (typeof result?.url !== "string") continue;
+        candidates.push({
+          url: result.url,
+          evidence: {
+            source: "search-result",
+            query:
+              typeof record.query === "string" ? record.query.slice(0, 1000) : "",
+            engine:
+              typeof record.engine === "string" ? record.engine.slice(0, 100) : "",
+            title:
+              typeof result.title === "string" ? result.title.slice(0, 1000) : "",
+            snippet:
+              typeof result.snippet === "string"
+                ? result.snippet.slice(0, 4000)
+                : "",
+          },
+        });
+      }
+    }
+  } else {
+    candidates.push(...lines.map((url) => ({ url })));
+  }
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const discoveryEvidence = new Map<string, DiscoveryEvidence[]>();
+  for (const candidate of candidates) {
+    const url = checkedUrl(candidate.url);
+    if (url.username || url.password) {
+      fail("scrape-batch URLs must not contain embedded credentials");
+    }
+    const normalized = redactedOutputUrl(url.href);
+    if (!normalized) continue;
+    if (candidate.evidence) {
+      const evidence = {
+        ...candidate.evidence,
+        url: normalized,
+      } satisfies DiscoveryEvidence;
+      const existing = discoveryEvidence.get(normalized) || [];
+      const key = JSON.stringify(evidence);
+      if (
+        existing.length < 8 &&
+        !existing.some((item) => JSON.stringify(item) === key)
+      ) {
+        existing.push(evidence);
+        discoveryEvidence.set(normalized, existing);
+      }
+    }
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    urls.push(normalized);
+  }
+  return { input, urls, discoveryEvidence };
+}
+
+function completedBatchUrls(output: string, retryFailures: boolean) {
+  const completed = new Set<string>();
+  for (const [index, line] of readFileSync(output, "utf8")
+    .split(/\r?\n/)
+    .entries()) {
+    if (!line.trim()) continue;
+    let record: any;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      fail(`scrape-batch output has invalid JSON on line ${index + 1}`);
+    }
+    if (
+      record.schema !== "agency/web-page-result/1" ||
+      typeof record.requested_url !== "string" ||
+      !new Set(["scraped", "partial", "failed"]).has(record.outcome)
+    ) {
+      fail(`scrape-batch output has an invalid record on line ${index + 1}`);
+    }
+    if (!retryFailures || record.outcome === "scraped") {
+      completed.add(record.requested_url);
+    }
+  }
+  return completed;
+}
+
+function interleaveUrlsByOrigin(urls: string[]) {
+  const grouped = new Map<string, { urls: string[]; index: number }>();
+  for (const url of urls) {
+    const origin = new URL(url).origin;
+    const group = grouped.get(origin);
+    if (group) group.urls.push(url);
+    else grouped.set(origin, { urls: [url], index: 0 });
+  }
+  let active = [...grouped.values()];
+  const ordered: string[] = [];
+  while (active.length) {
+    const remaining = [];
+    for (const group of active) {
+      ordered.push(group.urls[group.index]);
+      group.index += 1;
+      if (group.index < group.urls.length) remaining.push(group);
+    }
+    active = remaining;
+  }
+  return ordered;
+}
+
+async function commandScrapeBatch(args: string[]) {
+  const options = browserOptions(args);
+  const outputValue = takeOption(args, "--output");
+  const resume = takeFlag(args, "--resume");
+  const retryFailures = takeFlag(args, "--retry-failures");
+  const shouldIndex = takeFlag(args, "--index");
+  const delayMs = takeNumber(args, "--delay-ms", 750, 0, 60_000);
+  const jitterMs = takeNumber(args, "--jitter-ms", 250, 0, 60_000);
+  const originDelayMs = takeNumber(
+    args,
+    "--origin-delay-ms",
+    2_000,
+    0,
+    120_000,
+  );
+  const maxPages = takeNumber(args, "--max-pages", 1_000, 1, 100_000);
+  if (!outputValue) fail("scrape-batch requires --output PATH");
+  if (args.length !== 1) fail("scrape-batch requires one URL or search-result file");
+  const { input, urls, discoveryEvidence } = batchUrls(args[0]);
+  const output = checkedBatchOutput(outputValue, resume, "scrape-batch");
+  if (input === realpathSync(output)) {
+    fail("scrape-batch input and output must be different files");
+  }
+  const previouslyCompleted = completedBatchUrls(output, retryFailures);
+  const allPending = urls.filter((url) => !previouslyCompleted.has(url));
+  const work = interleaveUrlsByOrigin(allPending.slice(0, maxPages));
+  const summary = {
+    schema: "agency/web-scrape-batch/1",
+    input,
+    output,
+    total: urls.length,
+    resumed: urls.filter((url) => previouslyCompleted.has(url)).length,
+    attempted: 0,
+    completed: 0,
+    partial: 0,
+    failed: 0,
+    deferred: 0,
+    pending: allPending.length,
+  };
+  if (!work.length) {
+    console.log(JSON.stringify(summary, null, 2));
+    return;
+  }
+  const blockedOrigins = new Set<string>();
+  const originReadyAt = new Map<string, number>();
+  let requestReadyAt = 0;
+  const indexer = shouldIndex ? pageIndexer() : null;
+  try {
+    await withBrowser(options, async (browser) => {
+      for (const requestedUrl of work) {
+        const origin = new URL(requestedUrl).origin;
+        if (blockedOrigins.has(origin)) {
+          summary.deferred += 1;
+          continue;
+        }
+        const now = Date.now();
+        const readyAt = Math.max(requestReadyAt, originReadyAt.get(origin) || 0);
+        if (readyAt > now) await sleep(readyAt - now);
+        summary.attempted += 1;
+        try {
+          const page = await navigateAndExtract(browser, requestedUrl, options);
+          indexer?.write(page);
+          writeFileSync(
+            output,
+            `${JSON.stringify({
+              schema: "agency/web-page-result/1",
+              requested_url: requestedUrl,
+              outcome: "scraped",
+              page,
+              completed_at: new Date().toISOString(),
+            })}\n`,
+            { flag: "a" },
+          );
+          summary.completed += 1;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const hardGate = message.includes("interactive challenge required")
+            ? "hard-challenge"
+            : message.includes("interactive login required")
+              ? "hard-login"
+              : message.includes("origin rate limited")
+                ? "rate-limited"
+              : "";
+          const retainedEvidence = discoveryEvidence.get(requestedUrl) || [];
+          if (hardGate && retainedEvidence.length) {
+            writeFileSync(
+              output,
+              `${JSON.stringify({
+                schema: "agency/web-page-result/1",
+                requested_url: requestedUrl,
+                outcome: "partial",
+                constraint: hardGate,
+                evidence: retainedEvidence,
+                completed_at: new Date().toISOString(),
+              })}\n`,
+              { flag: "a" },
+            );
+            summary.partial += 1;
+          } else {
+            writeFileSync(
+              output,
+              `${JSON.stringify({
+                schema: "agency/web-page-result/1",
+                requested_url: requestedUrl,
+                outcome: "failed",
+                error: message,
+                completed_at: new Date().toISOString(),
+              })}\n`,
+              { flag: "a" },
+            );
+            summary.failed += 1;
+          }
+          if (
+            message.includes("interactive challenge required") ||
+            message.includes("interactive login required") ||
+            message.includes("origin rate limited")
+          ) {
+            blockedOrigins.add(origin);
+          }
+        }
+        const completedAt = Date.now();
+        requestReadyAt =
+          completedAt + delayMs + deterministicJitter(requestedUrl, jitterMs);
+        originReadyAt.set(origin, completedAt + originDelayMs);
+      }
+    });
+  } finally {
+    indexer?.close();
+  }
+  summary.pending =
+    allPending.length - summary.completed - summary.partial - summary.failed;
+  console.log(JSON.stringify(summary, null, 2));
+  if (summary.failed) process.exitCode = 1;
+}
+
+async function commandRetrieve(args: string[]) {
+  const allowPrivate = takeFlag(args, "--allow-private");
+  const json = takeFlag(args, "--json");
+  const maxBytes = takeNumber(
+    args,
+    "--max-bytes",
+    5 * 1024 * 1024,
+    1,
+    100 * 1024 * 1024,
+  );
+  const maxRedirects = takeNumber(args, "--max-redirects", 10, 0, 20);
+  const timeoutMs = takeNumber(args, "--timeout-ms", 30_000, 100, 120_000);
+  if (!args.length) fail("retrieve requires at least one URL");
+  if (args.length > 100) fail("retrieve accepts at most 100 URLs");
+  const options = { allowPrivate, maxBytes, maxRedirects, timeoutMs };
+  const results = [];
+  for (const url of args) results.push(await retrieveOne(url, options));
+  const retrieved = results.filter(
+    (result) => result.outcome === "retrieved",
+  ).length;
+  const report = {
+    schema: "agency/web-retrieval/1",
+    generated_at: new Date().toISOString(),
+    summary: {
+      total: results.length,
+      retrieved,
+      failed: results.length - retrieved,
+    },
+    results,
+  };
+  if (json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    for (const result of results) {
+      if (result.outcome === "retrieved" && "retrieval" in result) {
+        const retrieval = result.retrieval as JsonObject;
+        console.log(
+          `${pink}retrieved${reset} ${terminalText(retrieval.http_status)} ${terminalText(result.request.url)} → ${terminalText(retrieval.final_url)}`,
+        );
+      } else if ("error" in result) {
+        const error = result.error as JsonObject;
+        console.log(
+          `${yellow}failed${reset} ${terminalText(result.request.url)} — ${terminalText(error.code)}: ${terminalText(error.message)}`,
+        );
+      }
+    }
+  }
+  if (retrieved !== results.length) process.exitCode = 1;
+}
+
+async function commandDownload(args: string[]) {
+  const outputValue = takeOption(args, "--output");
+  const rootValue = takeOption(args, "--output-root");
+  const profile = checkedProfile(takeOption(args, "--profile", "default"));
+  const expectedValue = takeOption(args, "--expected-type").toLowerCase();
+  const allowedOriginValue = takeOption(args, "--allow-origin");
+  const contextValue = takeOption(args, "--context-url");
+  const maxBytes = takeNumber(
+    args,
+    "--max-bytes",
+    25 * 1024 * 1024,
+    1,
+    1024 * 1024 * 1024,
+  );
+  const timeoutMs = takeNumber(args, "--timeout-ms", 60_000, 1000, 600_000);
+  const allowPrivate = takeFlag(args, "--allow-private");
+  const replace = takeFlag(args, "--replace");
+  const json = takeFlag(args, "--json");
+  if (args.length !== 1) fail("download requires one URL");
+  if (!outputValue || !rootValue) {
+    fail("download requires --output PATH and --output-root PATH");
+  }
+  const sourceValue = args[0];
+  const startedAt = new Date().toISOString();
+  const started = performance.now();
+  let temporaryDirectory = "";
+  let report: JsonObject;
+  try {
+    const source = retrievalUrl(sourceValue);
+    const allowedOrigin = allowedOriginValue
+      ? retrievalUrl(allowedOriginValue).origin
+      : source.origin;
+    if (source.origin !== allowedOrigin) {
+      throw new RetrievalFailure(
+        "policy",
+        "origin-not-allowed",
+        `source origin does not match ${allowedOrigin}`,
+        false,
+      );
+    }
+    const contextUrl = contextValue ? retrievalUrl(contextValue) : null;
+    if (contextUrl && contextUrl.origin !== allowedOrigin) {
+      throw new RetrievalFailure(
+        "policy",
+        "context-origin-not-allowed",
+        "--context-url must use the allowed source origin",
+        false,
+      );
+    }
+    const safety = await checkRetrievalSafety(source, allowPrivate);
+    if (contextUrl) await checkRetrievalSafety(contextUrl, allowPrivate);
+    const destination = checkedDownloadOutput(outputValue, rootValue, replace);
+    const expectedType = inferredDownloadType(
+      destination.output,
+      expectedValue,
+    );
+    temporaryDirectory = mkdtempSync(
+      join(destination.root, ".web-research-download-"),
+    );
+    const browserOptions: BrowserOptions = {
+      profile,
+      ephemeral: false,
+      templatePreferences: [],
+      headless: true,
+      humanTimeout: 0,
+      waitMs: 0,
+      settleMs: 0,
+      navigationTimeoutMs: Math.min(timeoutMs, 45_000),
+      maxContentChars: 1,
+      maxLinks: 1,
+      scrollSteps: 0,
+      interactionSteps: 0,
+      captureNetworkJson: false,
+    };
+    const downloadedPath = await withBrowser(
+      browserOptions,
+      async (browser) => {
+        if (contextUrl) {
+          await browser.bidi.navigate(
+            browser.context,
+            contextUrl.href,
+            browserOptions.navigationTimeoutMs,
+          );
+        }
+        let navigationError: Error | null = null;
+        try {
+          await browser.bidi.command(
+            "browsingContext.navigate",
+            { context: browser.context, url: source.href, wait: "none" },
+            Math.min(timeoutMs, 15_000),
+          );
+        } catch (error) {
+          navigationError =
+            error instanceof Error ? error : new Error(String(error));
+        }
+        try {
+          return await waitForDownload(
+            temporaryDirectory,
+            maxBytes,
+            timeoutMs,
+          );
+        } catch (downloadError) {
+          let loginRequired = false;
+          try {
+            loginRequired = Boolean(
+              await browser.bidi.evaluate(browser.context, loginExpression),
+            );
+          } catch {}
+          if (loginRequired) {
+            throw new RetrievalFailure(
+              "authentication",
+              "interactive-login-required",
+              `profile '${profile}' requires interactive login`,
+              false,
+            );
+          }
+          if (navigationError) {
+            throw new RetrievalFailure(
+              "browser",
+              "navigation-failed",
+              navigationError.message,
+              true,
+            );
+          }
+          throw downloadError;
+        }
+      },
+      downloadPreferences(temporaryDirectory),
+    );
+    const bytes = readFileSync(downloadedPath);
+    if (bytes.length > maxBytes) {
+      throw new RetrievalFailure(
+        "limit",
+        "download-too-large",
+        `download exceeded the ${maxBytes}-byte limit`,
+        false,
+      );
+    }
+    verifyDownload(bytes, expectedType);
+    if (existsSync(destination.output) && !replace) {
+      throw new RetrievalFailure(
+        "policy",
+        "output-exists",
+        "output appeared during retrieval and was not replaced",
+        false,
+      );
+    }
+    if (existsSync(destination.output)) {
+      const existing = lstatSync(destination.output);
+      if (!existing.isFile() || existing.isSymbolicLink()) {
+        throw new RetrievalFailure(
+          "policy",
+          "output-not-regular",
+          "output changed to a non-regular file during retrieval",
+          false,
+        );
+      }
+    }
+    renameSync(downloadedPath, destination.output);
+    const completedAt = new Date().toISOString();
+    report = {
+      schema: "agency/web-download/1",
+      outcome: "downloaded",
+      source: { url: source.href, allowed_origin: allowedOrigin },
+      safety,
+      provenance: {
+        provider: "firefox-bidi",
+        mode: "live-authenticated-browser",
+        profile,
+        retrieved_at: completedAt,
+        redirected_url_disclosed: false,
+      },
+      output: {
+        path: destination.output,
+        bytes: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        expected_type: expectedType,
+        signature: "valid",
+      },
+      timing: {
+        started_at: startedAt,
+        completed_at: completedAt,
+        duration_ms: Math.round((performance.now() - started) * 1000) / 1000,
+      },
+    };
+  } catch (unknownError) {
+    const error =
+      unknownError instanceof RetrievalFailure
+        ? unknownError
+        : new RetrievalFailure(
+            "browser",
+            "download-failed",
+            unknownError instanceof Error
+              ? unknownError.message
+              : String(unknownError),
+            true,
+          );
+    report = {
+      schema: "agency/web-download/1",
+      outcome: "failed",
+      source: { url: sourceValue },
+      provenance: {
+        provider: "firefox-bidi",
+        mode: "live-authenticated-browser",
+        profile,
+        attempted_at: new Date().toISOString(),
+        redirected_url_disclosed: false,
+      },
+      error: {
+        kind: error.kind,
+        code: error.code,
+        message: error.message,
+        retriable: error.retriable,
+      },
+    };
+  } finally {
+    if (temporaryDirectory) {
+      rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+  }
+  if (json) console.log(JSON.stringify(report, null, 2));
+  else if (report.outcome === "downloaded") {
+    const output = report.output as JsonObject;
+    console.log(
+      `${pink}downloaded${reset} ${terminalText(output.path)} (${terminalText(output.bytes)} bytes)`,
+    );
+  } else {
+    const error = report.error as JsonObject;
+    console.log(
+      `${yellow}failed${reset} ${terminalText(error.code)}: ${terminalText(error.message)}`,
+    );
+  }
+  if (report.outcome !== "downloaded") process.exitCode = 1;
+}
+
 async function commandScrape(args: string[]) {
   const options = browserOptions(args);
   const format = takeOption(args, "--format", "markdown");
   const output = takeOption(args, "--output");
   const shouldIndex = takeFlag(args, "--index");
+  const includeFrames = takeFlag(args, "--include-frames");
+  const frameOrigins = takeOptions(args, "--frame-origin").map(
+    (value) => checkedUrl(value).origin,
+  );
   if (!new Set(["markdown", "text", "html", "json"]).has(format)) {
     fail("--format must be markdown, text, html, or json");
+  }
+  if (includeFrames && format !== "json") {
+    fail("--include-frames requires --format json");
   }
   if (args.length !== 1) fail("scrape requires one URL");
   const url = checkedUrl(args[0]);
   const page = await withBrowser(options, async (browser) => {
-    await browser.bidi.navigate(browser.context, url.href);
-    return extractPage(browser, options);
+    const extracted: Page & { frames?: JsonObject[] } = await navigateAndExtract(
+      browser,
+      url.href,
+      options,
+    );
+    if (includeFrames) {
+      let topOrigin = url.origin;
+      try {
+        topOrigin = new URL(extracted.url).origin;
+      } catch {}
+      extracted.frames = await extractFrames(browser, topOrigin, frameOrigins);
+    }
+    return extracted;
   });
   if (shouldIndex) indexPage(page);
   const content =
@@ -712,8 +3617,7 @@ async function commandMap(args: string[]) {
   if (args.length !== 1) fail("map requires one URL");
   const url = checkedUrl(args[0]);
   const links = await withBrowser(options, async (browser) => {
-    await browser.bidi.navigate(browser.context, url.href);
-    const page = await extractPage(browser, options);
+    const page = await navigateAndExtract(browser, url.href, options);
     return [
       ...new Set(
         page.links.map((link) => safeLink(link, url.origin)).filter(Boolean),
@@ -735,9 +3639,12 @@ async function commandSnapshot(args: string[]) {
   if (args.length !== 1) fail("snapshot requires one URL");
   const url = checkedUrl(args[0]);
   const data = await withBrowser(options, async (browser) => {
-    await browser.bidi.navigate(browser.context, url.href);
-    await waitForChallenge(browser, options);
-    if (options.waitMs) await sleep(options.waitMs);
+    await browser.bidi.navigate(
+      browser.context,
+      url.href,
+      options.navigationTimeoutMs,
+    );
+    await preparePage(browser, options);
     const result = await browser.bidi.command(
       format === "pdf"
         ? "browsingContext.print"
@@ -763,59 +3670,149 @@ async function commandCrawl(args: string[]) {
   const limit = takeNumber(args, "--limit", 50, 1, 1000);
   const depthLimit = takeNumber(args, "--depth", 2, 0, 10);
   const delay = takeNumber(args, "--delay-ms", 750, 0, 60_000);
+  const maxQueue = takeNumber(
+    args,
+    "--max-queue",
+    Math.min(100_000, Math.max(limit, limit * 20)),
+    1,
+    100_000,
+  );
+  const linksPerPage = takeNumber(
+    args,
+    "--links-per-page",
+    200,
+    1,
+    5_000,
+  );
+  const maxQueryParameters = takeNumber(
+    args,
+    "--max-query-params",
+    8,
+    0,
+    100,
+  );
   const ignoreRobots = takeFlag(args, "--ignore-robots");
   const json = takeFlag(args, "--json");
   if (args.length !== 1) fail("crawl requires one URL");
   const root = checkedUrl(args[0]);
-  const report = await withBrowser(options, async (browser) => {
-    await browser.bidi.navigate(browser.context, root.href);
-    let rules: string[] = [];
-    if (!ignoreRobots) {
-      const expression = `fetch(${JSON.stringify(`${root.origin}/robots.txt`)}, { credentials: "include" }).then(response => response.ok ? response.text() : "").catch(() => "")`;
-      rules = parseRobots(
-        String(await browser.bidi.evaluate(browser.context, expression)),
+  const indexer = pageIndexer();
+  let report: {
+    pages: Array<{ url: string; title?: string; error?: string }>;
+    summary: {
+      visited: number;
+      indexed: number;
+      failed: number;
+      disallowed: number;
+      frontier_truncated: boolean;
+    };
+  };
+  try {
+    report = await withBrowser(options, async (browser) => {
+      const rootNetworkCapture = await startNetworkCapture(
+        browser,
+        root.href,
+        options.captureNetworkJson,
       );
-    }
-    const queue: Array<{ url: string; depth: number }> = [
-      { url: root.href, depth: 0 },
-    ];
-    const seen = new Set<string>();
-    const pages: Array<{ url: string; title?: string; error?: string }> = [];
-    while (queue.length && pages.length < limit) {
-      const current = queue.shift()!;
-      if (seen.has(current.url)) continue;
-      seen.add(current.url);
-      const currentUrl = new URL(current.url);
-      if (!ignoreRobots && !robotsAllows(currentUrl, rules)) {
-        pages.push({ url: current.url, error: "disallowed by robots.txt" });
-        continue;
+      let rootCaptureOpen = true;
+      await browser.bidi.navigate(
+        browser.context,
+        root.href,
+        options.navigationTimeoutMs,
+      );
+      let rules: string[] = [];
+      if (!ignoreRobots) {
+        const expression = `fetch(${JSON.stringify(`${root.origin}/robots.txt`)}, { credentials: "include" }).then(response => response.ok ? response.text() : "").catch(() => "")`;
+        rules = parseRobots(
+          String(await browser.bidi.evaluate(browser.context, expression)),
+        );
       }
-      try {
-        await browser.bidi.navigate(browser.context, current.url);
-        const page = await extractPage(browser, options);
-        indexPage(page);
-        pages.push({ url: page.canonicalUrl || page.url, title: page.title });
-        if (current.depth < depthLimit) {
-          for (const link of page.links) {
-            const safe = safeLink(link, root.origin);
-            if (safe && !seen.has(safe))
-              queue.push({ url: safe, depth: current.depth + 1 });
+      const queue: Array<{ url: string; depth: number }> = [
+        { url: root.href, depth: 0 },
+      ];
+      const queued = new Set([root.href]);
+      const pages: Array<{ url: string; title?: string; error?: string }> = [];
+      let cursor = 0;
+      let indexed = 0;
+      let failed = 0;
+      let disallowed = 0;
+      let frontierTruncated = false;
+      while (cursor < queue.length && pages.length < limit) {
+        const current = queue[cursor++];
+        const currentUrl = new URL(current.url);
+        if (!ignoreRobots && !robotsAllows(currentUrl, rules)) {
+          if (current.url === root.href && rootCaptureOpen) {
+            await rootNetworkCapture.close();
+            rootCaptureOpen = false;
           }
+          pages.push({ url: current.url, error: "disallowed by robots.txt" });
+          disallowed += 1;
+          continue;
         }
-      } catch (error) {
-        pages.push({
-          url: current.url,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        try {
+          let page: Page;
+          if (current.url === root.href) {
+            page = await extractPage(browser, options);
+            const evidence = await rootNetworkCapture.finish();
+            rootCaptureOpen = false;
+            attachNetworkEvidence(page, evidence, options);
+          } else {
+            page = await navigateAndExtract(browser, current.url, options);
+          }
+          indexer.write(page);
+          indexed += 1;
+          pages.push({ url: page.canonicalUrl || page.url, title: page.title });
+          if (current.depth < depthLimit) {
+            let addedFromPage = 0;
+            for (const link of page.links) {
+              const safe = crawlLink(
+                link,
+                root.origin,
+                maxQueryParameters,
+              );
+              if (!safe || queued.has(safe)) continue;
+              if (addedFromPage >= linksPerPage || queue.length >= maxQueue) {
+                frontierTruncated = true;
+                break;
+              }
+              queued.add(safe);
+              queue.push({ url: safe, depth: current.depth + 1 });
+              addedFromPage += 1;
+            }
+          }
+        } catch (error) {
+          if (current.url === root.href && rootCaptureOpen) {
+            await rootNetworkCapture.close();
+            rootCaptureOpen = false;
+          }
+          failed += 1;
+          pages.push({
+            url: current.url,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        if (delay && cursor < queue.length && pages.length < limit) {
+          await sleep(delay);
+        }
       }
-      if (delay) await sleep(delay);
-    }
-    return pages;
-  });
+      if (rootCaptureOpen) await rootNetworkCapture.close();
+      return {
+        pages,
+        summary: {
+          visited: pages.length,
+          indexed,
+          failed,
+          disallowed,
+          frontier_truncated: frontierTruncated,
+        },
+      };
+    });
+  } finally {
+    indexer.close();
+  }
   if (json) {
-    console.log(JSON.stringify({ root: root.href, pages: report }, null, 2));
+    console.log(JSON.stringify({ root: root.href, ...report }, null, 2));
   } else {
-    for (const page of report) {
+    for (const page of report.pages) {
       console.log(
         page.error
           ? `${yellow}skip${reset} ${terminalText(page.url)} — ${terminalText(page.error)}`
@@ -865,42 +3862,104 @@ function commandStats(args: string[]) {
   );
 }
 
-function commandBrowser(args: string[]) {
+async function commandBrowser(args: string[]) {
   const profile = checkedProfile(takeOption(args, "--profile", "default"));
+  const detach = takeFlag(args, "--detach");
   if (args.length > 1) fail("browser accepts at most one URL");
   const url = args.length ? checkedUrl(args[0]).href : "about:blank";
-  const claimed = claimProfile(profile);
+  const claimed = claimProfile(profile, [], false);
   const child = Bun.spawn(
     ["firefox", "--no-remote", "--profile", claimed.root, url],
     {
-      stdin: "ignore",
+      stdin: detach ? "ignore" : "inherit",
       stdout: "ignore",
       stderr: "ignore",
     },
   );
-  writeFileSync(claimed.lock, String(child.pid), { mode: 0o600 });
-  child.unref();
-  info(`opened persistent profile '${profile}' in Firefox`);
+  if (detach) {
+    writeFileSync(claimed.lock, String(child.pid), { mode: 0o600 });
+    child.unref();
+    info(`opened detached persistent profile '${profile}' in Firefox`);
+    return;
+  }
+  info(`opened persistent profile '${profile}'; close Firefox to continue`);
+  try {
+    const exitCode = await child.exited;
+    if (exitCode !== 0) throw new Error(`Firefox exited with status ${exitCode}`);
+  } finally {
+    releaseProfile(claimed);
+  }
 }
 
 function help() {
-  console.log(`web-research — local Firefox search, extraction, crawl, and index
+  console.log(`web-research — bounded HTTP retrieval and local Firefox research
 
 Usage:
-  web-research search QUERY [--engine auto|duckduckgo|brave] [--limit N] [--json]
-  web-research scrape URL [--format markdown|text|html|json] [--output PATH] [--index]
+  web-research search QUERY [--engine auto|duckduckgo|brave|bing] [--limit N] [--json]
+  web-research search-batch QUERIES --output RESULTS.ndjson [--resume]
+  web-research scrape-batch URLS_OR_SEARCH_RESULTS --output PAGES.ndjson [--resume]
+  web-research retrieve URL... [--json] [--max-bytes N] [--timeout-ms N]
+  web-research download URL --output PATH --output-root PATH [--expected-type TYPE]
+  web-research scrape URL [--format markdown|text|html|json] [--include-frames]
   web-research map URL [--limit N] [--json]
   web-research snapshot URL --format png|pdf --output PATH
   web-research crawl URL [--limit N] [--depth N] [--delay-ms N] [--json]
   web-research local QUERY [--limit N] [--json]
   web-research stats
-  web-research browser [URL] [--profile NAME]
+  web-research browser [URL] [--profile NAME] [--detach]
 
 Browser options:
   --profile NAME          Persistent local Firefox profile (default: default)
-  --headless              No interactive challenge handling
+  --ephemeral-profile    Use a clean randomly suffixed profile for this run
+  --profile-template SRC Seed coherent prefs into a named or ephemeral profile
+  --visible               Explicitly allow a window that may request focus
   --human-timeout N       Seconds to wait for a challenge (default: 180)
-  --wait-ms N             Dynamic-content settling time (default: 350)
+  --wait-ms N             Minimum post-navigation wait (default: 350)
+  --settle-ms N           Maximum adaptive stability wait (default: 1200)
+  --navigation-timeout-ms N  Navigation deadline (default: 45000)
+  --max-content-chars N   Per-field extraction ceiling (default: 2000000)
+  --max-links N           Extracted link ceiling (default: 2000)
+  --scroll-steps N        Bounded lazy-feed scroll steps (default: 0)
+  --interaction-steps N   Bounded safe expand/load/dismiss actions (default: 0)
+  --capture-network-json  Retain bounded same-origin JSON response evidence
+
+Batch search options:
+  --output PATH           Append-only NDJSON checkpoint (required)
+  --resume                Validate output and skip completed queries
+  --retry-failures        Retry prior failed records when resuming
+  --max-queries N         Maximum pending queries this run (default: 1000)
+  --delay-ms N            Base inter-query delay (default: 1500)
+  --jitter-ms N           Deterministic delay jitter (default: 500)
+
+Batch scrape options:
+  --output PATH           Append-only page NDJSON checkpoint (required)
+  --resume                Validate output and skip completed URLs
+  --retry-failures        Retry prior failed records when resuming
+  --index                 Add successful pages to the local full-text index
+  --max-pages N           Maximum pending URLs this run (default: 1000)
+  --delay-ms N            Base inter-page delay (default: 750)
+  --jitter-ms N           Deterministic delay jitter (default: 250)
+  --origin-delay-ms N     Minimum same-origin delay (default: 2000)
+
+Frame extraction options:
+  --include-frames        Add origin-bounded child-frame text to JSON output
+  --frame-origin ORIGIN   Permit one additional frame origin; repeat as needed
+
+Direct HTTP retrieval options:
+  --allow-private         Permit private or non-public network addresses
+  --max-bytes N           Maximum response bytes per URL (default: 5242880)
+  --max-redirects N       Maximum redirects per URL (default: 10)
+  --timeout-ms N          Per-URL deadline in milliseconds (default: 30000)
+
+Authenticated download options:
+  --profile NAME          Dedicated persistent Firefox profile
+  --context-url URL       Same-origin page to open before the download
+  --allow-origin ORIGIN   Required initiating origin (default: URL origin)
+  --expected-type TYPE    pdf|zip|docx|xlsx|pptx|png|jpeg|gif
+  --replace               Atomically replace an existing regular output file
+  --allow-private         Permit a private initiating or context address
+  --max-bytes N           Maximum downloaded bytes (default: 26214400)
+  --timeout-ms N          Download completion deadline (default: 60000)
 
 Crawl obeys robots.txt, stays on the starting origin, visits one page at a time,
 and skips common state-changing links. --ignore-robots requires explicit authority.`);
@@ -919,6 +3978,10 @@ try {
     help();
   else if (args.includes("--help") || args.includes("-h")) help();
   else if (command === "search") await commandSearch(args);
+  else if (command === "search-batch") await commandSearchBatch(args);
+  else if (command === "scrape-batch") await commandScrapeBatch(args);
+  else if (command === "retrieve") await commandRetrieve(args);
+  else if (command === "download") await commandDownload(args);
   else if (command === "scrape" || command === "fetch")
     await commandScrape(args);
   else if (command === "map") await commandMap(args);
@@ -926,7 +3989,7 @@ try {
   else if (command === "crawl") await commandCrawl(args);
   else if (command === "local") commandLocal(args);
   else if (command === "stats") commandStats(args);
-  else if (command === "browser") commandBrowser(args);
+  else if (command === "browser") await commandBrowser(args);
   else fail(`unknown command: ${command}`);
 } catch (error) {
   fail(error instanceof Error ? error.message : String(error));

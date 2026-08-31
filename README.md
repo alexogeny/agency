@@ -256,7 +256,9 @@ sees it, without borrowing a warm cache or a conveniently configured home.
 ## Supporting cast
 
 - `web-research` uses a persistent local Firefox profile for JavaScript-heavy
-  or authenticated pages while leaving human challenges to a human.
+  or authenticated pages while leaving human challenges to a human. The
+  [resilient web-research workshop](Workshops/web-research-next-steps.md)
+  orders the next scale, recovery, and evidence-quality improvements.
 - `sudo-gui` carries one approved root operation through one KDE password
   dialog and one authentication attempt without capturing the password.
 - `comment-audit` finds empty, decorative, and historical comments without

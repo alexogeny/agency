@@ -153,3 +153,88 @@ challenge flows without exporting cookies. Crawls are same-origin,
 single-worker, robots-aware, and skip common state-changing links. The global
 `web-research` skill defines source handling, concurrency, and interactive-page
 boundaries.
+
+`web-research retrieve URL... --json` provides a cheaper direct-HTTP evidence
+path before browser rendering is needed. It returns one typed result per URL,
+including the final URL, redirect chain, status, content type, byte count,
+SHA-256 digest, live retrieval time, provider, safety decision, and exact
+failure code. Redirect hops are checked independently, private networks require
+`--allow-private`, and one failure does not discard successful batch results.
+
+Automated Firefox work is headless by default, so normal searches, extraction,
+crawls, snapshots, and downloads do not open over the desktop or steal keyboard
+focus. The explicit `browser` command remains attached for user-completed login
+and releases its profile lock when the window closes.
+
+Automatic search reuses one Firefox process while falling back through
+DuckDuckGo, Brave, and Bing. A challenged provider is skipped without blind
+retries or another browser launch. Page access checks distinguish visible login
+walls and challenge controls from incidental prose, so ordinary content titled
+“Just a Moment” is not treated as a CAPTCHA. Login prompts layered over
+substantial public content are labeled as soft gates and extracted; actual
+authentication redirects and dominant challenges remain hard stops.
+
+An entirely empty document gets one bounded 500-millisecond recovery sample.
+If it remains empty, extraction returns a clear incomplete-content error rather
+than a DOM exception or a successful blank record.
+
+Dynamic pages settle against observable URL, title, text, height, link, and
+open-shadow-root state after interactive readiness. Navigation, settling,
+bounded lazy-feed scrolling, content size, and link count all have explicit
+budgets, with truncation reported in JSON. Each bounded scroll is captured and
+deduplicated so virtualized feeds retain earlier evidence. Extraction also
+merges bounded page metadata and sanitized JSON-LD, recording access state,
+sources, and capture count.
+
+Optional semantic interaction steps dismiss narrowly recognized overlays and
+activate expand, read-more, or load-more controls while recording whether each
+action changed evidence. Scrolling prefers substantive feed/list containers.
+Optional Firefox BiDi response collection adds bounded same-origin JSON/API
+evidence without returning headers, cookies, or request bodies.
+
+`--ephemeral-profile` gives unauthenticated automated work a clean, randomly
+suffixed run-scoped profile and deletes it after Firefox exits. It uses the
+requested profile name only as a label and never copies the user's ordinary
+Firefox identity or session state. Fresh profiles are intended for isolation;
+a stable named profile is usually a better fit for a larger research run.
+
+`--profile-template current` may seed either a stable named profile or an
+ephemeral one with a fixed allowlist of validated, non-secret language, theme,
+browser-chrome, zoom, colour, and autoplay preferences from Firefox's
+`prefs.js`. It ignores identifiers, extensions, authentication and browsing
+state, network settings, and UA overrides. Automated contexts also normalize
+Firefox's automation-only `navigator.webdriver` value before navigation while
+leaving browser and system-derived signals intact.
+
+Resolved URLs, canonical URLs, and discovered links are sanitized before
+output or indexing. URL credentials, fragments, and token-, signature-,
+session-, or challenge-shaped query parameters are removed. Empty interactive
+code nodes are also omitted from Markdown instead of producing delimiter noise.
+
+`search-batch` and `scrape-batch` provide append-only NDJSON checkpoints for
+large research. They validate resume state, avoid launching Firefox for fully
+completed inputs, reuse a single browser, apply deterministic pacing, and open
+provider or origin circuits after real challenges. Search checkpoints feed
+directly into page extraction, and successful pages can be indexed in the same
+run. Page batches round-robin origins and apply a separate per-origin delay so
+one difficult site does not monopolize the request sequence. When a search
+checkpoint already contains evidence for a URL that later hard-gates, the page
+checkpoint retains it as a labeled partial result rather than losing it or
+claiming it was extracted from the source.
+Rate-limit pages also open the origin circuit instead of entering the index.
+
+Crawls use a bounded, tracking-normalized frontier with constant-time dequeue,
+per-page admission limits, query-complexity limits, one prepared SQLite writer,
+and explicit incomplete-frontier reporting.
+
+`web-research download` reuses a dedicated authenticated profile without
+exporting its browser state. It confines each transfer to a temporary directory
+under an explicit output root, enforces origin, time, and byte bounds, waits for
+partial files to settle, validates common document and image signatures, and
+atomically promotes only a verified file. Site-specific discovery stays outside
+the command.
+
+Optional frame extraction enumerates Firefox child browsing contexts instead
+of mistaking an iframe shell for complete content. It extracts text from
+same-origin frames, requires an explicit origin for any cross-origin frame, and
+redacts frame queries while reporting skipped and failed frames.
