@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+
+import argparse
+import hashlib
+import json
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+
+SCHEMA = "agency/repository-setup-bundle/1"
+ASSET_ROOT = (
+    Path(__file__).resolve().parents[1] / "Skills" / "setup-repository" / "assets"
+)
+PROFILES = ("python", "javascript", "typescript", "go", "rust")
+PROFILE_ASSETS = {
+    "python": ASSET_ROOT / "python-package",
+    "javascript": ASSET_ROOT / "javascript-package",
+    "typescript": ASSET_ROOT / "javascript-package",
+    "go": ASSET_ROOT / "go-package",
+    "rust": ASSET_ROOT / "rust-package",
+}
+COMMON_ASSETS = ASSET_ROOT / "python-package"
+COMPONENT_ORDER = ("ci", "community", "github-settings", "docs", "publish")
+COMMON_COMPONENT_TEMPLATES = {
+    "community": {
+        ".github/ISSUE_TEMPLATE/bug_report.yml.tmpl": (
+            "files/.github/ISSUE_TEMPLATE/bug_report.yml"
+        ),
+        ".github/ISSUE_TEMPLATE/config.yml.tmpl": (
+            "files/.github/ISSUE_TEMPLATE/config.yml"
+        ),
+        ".github/ISSUE_TEMPLATE/feature_request.yml.tmpl": (
+            "files/.github/ISSUE_TEMPLATE/feature_request.yml"
+        ),
+        ".github/pull_request_template.md.tmpl": (
+            "files/.github/pull_request_template.md"
+        ),
+    },
+    "github-settings": {"github/main-ruleset.json.tmpl": "github/main-ruleset.json"},
+}
+PROFILE_COMPONENT_TEMPLATES = {
+    "ci": ".github/workflows/ci.yml.tmpl",
+    "docs": ".github/workflows/docs.yml.tmpl",
+    "publish": ".github/workflows/publish.yml.tmpl",
+}
+DEFAULT_CHECKS = {
+    "python": (
+        ("Ruff lint", "uv run --no-sync ruff check ."),
+        ("Ruff format", "uv run --no-sync ruff format --check ."),
+        ("Ty", "uv run --no-sync ty check"),
+        ("Tests", "uv run --no-sync pytest"),
+    ),
+    "javascript": (
+        ("Prettier", "bunx --no-install prettier --check ."),
+        ("ESLint", "bunx --no-install eslint ."),
+        ("Tests", "bun test"),
+    ),
+    "typescript": (
+        ("Prettier", "bunx --no-install prettier --check ."),
+        ("ESLint", "bunx --no-install eslint ."),
+        ("TypeScript", "bunx --no-install tsc --noEmit"),
+        ("Tests", "bun test"),
+    ),
+    "go": (
+        ("Go format", 'test -z "$(gofmt -l .)"'),
+        ("Go vet", "go vet ./..."),
+        ("Tests", "go test ./..."),
+    ),
+    "rust": (
+        ("Rustfmt", "cargo fmt --all --check"),
+        ("Clippy", "cargo clippy --all-targets --all-features -- -D warnings"),
+        ("Tests", "cargo test --all-features --locked"),
+    ),
+}
+PROFILE_COMMUNITY = {
+    "python": ("Python and platform", "python -VV", "python"),
+    "javascript": ("Bun and platform", "bun --version", "javascript"),
+    "typescript": ("Bun and platform", "bun --version", "typescript"),
+    "go": ("Go and platform", "go version", "go"),
+    "rust": ("Rust and platform", "rustc -Vv", "rust"),
+}
+PLACEHOLDER = re.compile(r"__[A-Z][A-Z_]*__")
+
+
+def fail(message, code=1):
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def one_line(label, value):
+    if not value or "\n" in value or "\r" in value:
+        fail(f"{label} must be a non-empty single line", 2)
+    return value
+
+
+def relative_path(label, value):
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts or value in ("", "."):
+        fail(f"{label} must be a non-empty relative path without '..'", 2)
+    return path.as_posix().rstrip("/")
+
+
+def selected_components(arguments):
+    selected = list(arguments.component or ("ci", "community", "github-settings"))
+    if arguments.docs_command is not None and "docs" not in selected:
+        selected.append("docs")
+    if arguments.publish and "publish" not in selected:
+        selected.append("publish")
+    return [component for component in COMPONENT_ORDER if component in selected]
+
+
+def effective_checks(arguments, components):
+    if "ci" not in components:
+        return []
+    if arguments.custom_checks:
+        return arguments.check
+    return [*DEFAULT_CHECKS[arguments.profile], *arguments.check]
+
+
+def validate_render(arguments, components, checks):
+    one_line("project", arguments.project)
+    one_line("repository", arguments.repository)
+    one_line("runtime version", arguments.runtime_version)
+    one_line("branch", arguments.branch)
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9][A-Za-z0-9._-]*",
+        arguments.repository,
+    ):
+        fail("repository must use OWNER/REPO form", 2)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", arguments.project):
+        fail("project must use a package-style name", 2)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", arguments.runtime_version):
+        fail("runtime version contains unsupported characters", 2)
+    if arguments.profile == "python" and not re.fullmatch(
+        r"[0-9]+\.[0-9]+", arguments.runtime_version
+    ):
+        fail("Python runtime version must use MAJOR.MINOR form", 2)
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", arguments.branch):
+        fail("branch contains unsupported characters", 2)
+    if "ci" in components and not checks:
+        fail("CI requires at least one check", 2)
+    if "ci" not in components and (arguments.check or arguments.custom_checks):
+        fail("--check requires the ci component", 2)
+    if arguments.custom_checks and not arguments.check:
+        fail("--custom-checks requires at least one --check NAME COMMAND pair", 2)
+    for name, command in checks:
+        one_line("check name", name)
+        one_line(f"check command for {name}", command)
+    docs_supplied = (
+        arguments.docs_command is not None and arguments.docs_output is not None
+    )
+    if (arguments.docs_command is None) != (arguments.docs_output is None):
+        fail("--docs-command and --docs-output must be supplied together", 2)
+    if "docs" in components and not docs_supplied:
+        fail("the docs component requires --docs-command and --docs-output", 2)
+    if docs_supplied:
+        one_line("docs command", arguments.docs_command)
+        output = relative_path("docs output", arguments.docs_output)
+        if not re.fullmatch(r"[A-Za-z0-9._/-]+", output):
+            fail("docs output contains unsupported characters", 2)
+    if arguments.distribution is not None:
+        if "publish" not in components:
+            fail("--distribution requires the publish component", 2)
+        one_line("distribution", arguments.distribution)
+        distribution_pattern = (
+            r"(?:@[A-Za-z0-9._-]+/)?[A-Za-z0-9][A-Za-z0-9._-]*"
+            if arguments.profile in ("javascript", "typescript")
+            else r"[A-Za-z0-9][A-Za-z0-9._-]*"
+        )
+        if not re.fullmatch(distribution_pattern, arguments.distribution):
+            fail("distribution must use a package-style name", 2)
+    if "publish" in components and arguments.profile == "go":
+        fail(
+            "Go modules are published by immutable version tags; "
+            "the Go profile has no registry publish workflow",
+            2,
+        )
+
+
+def check_steps(checks):
+    blocks = []
+    for name, command in checks:
+        blocks.extend(
+            (
+                f"      - name: {json.dumps(name)}",
+                "        run: |",
+                "          set -euo pipefail",
+                f"          {command}",
+            )
+        )
+    return "\n".join(blocks)
+
+
+def component_templates(profile, components):
+    templates = {}
+    for component in components:
+        if component in COMMON_COMPONENT_TEMPLATES:
+            templates.update(
+                {
+                    COMMON_ASSETS / source: destination
+                    for source, destination in COMMON_COMPONENT_TEMPLATES[
+                        component
+                    ].items()
+                }
+            )
+            continue
+        source = PROFILE_ASSETS[profile] / PROFILE_COMPONENT_TEMPLATES[component]
+        destination = (
+            "github/main-ruleset.json"
+            if component == "github-settings"
+            else f"files/.github/workflows/{component}.yml"
+        )
+        templates[source] = destination
+    return templates
+
+
+def rendered_files(arguments, components, checks):
+    templates = component_templates(arguments.profile, components)
+    environment_label, environment_command, example_language = PROFILE_COMMUNITY[
+        arguments.profile
+    ]
+    replacements = {
+        "__PROJECT__": arguments.project,
+        "__REPOSITORY__": arguments.repository,
+        "__PYTHON__": arguments.runtime_version,
+        "__RUNTIME_VERSION__": arguments.runtime_version,
+        "__DEFAULT_BRANCH__": arguments.branch,
+        "__CHECK_STEPS__": check_steps(checks),
+        "__DOCS_COMMAND__": arguments.docs_command or "",
+        "__DOCS_OUTPUT__": arguments.docs_output or "",
+        "__DISTRIBUTION__": arguments.distribution or arguments.project,
+        "__ENVIRONMENT_LABEL__": environment_label,
+        "__ENVIRONMENT_COMMAND__": environment_command,
+        "__EXAMPLE_LANGUAGE__": example_language,
+    }
+    rendered = {}
+    for source, destination in templates.items():
+        try:
+            text = source.read_text()
+        except FileNotFoundError:
+            fail(
+                f"the {arguments.profile} profile does not support "
+                f"the {Path(destination).stem} component",
+                2,
+            )
+        for placeholder, value in replacements.items():
+            text = text.replace(placeholder, value)
+        unresolved = sorted(set(PLACEHOLDER.findall(text)))
+        if unresolved:
+            fail(f"unresolved placeholders in {source}: {', '.join(unresolved)}", 2)
+        rendered[destination] = text.encode()
+    return rendered
+
+
+def write_bundle(output, rendered, manifest):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+    try:
+        for path, data in rendered.items():
+            destination = temporary / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+        (temporary / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
+        temporary.rename(output)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def command_render(arguments):
+    components = selected_components(arguments)
+    checks = effective_checks(arguments, components)
+    validate_render(arguments, components, checks)
+    output = arguments.output.resolve()
+    if output.exists():
+        fail(f"output already exists: {output}", 2)
+    rendered = rendered_files(arguments, components, checks)
+    records = [
+        {
+            "path": path,
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        for path, data in sorted(rendered.items())
+    ]
+    manifest = {
+        "schema": SCHEMA,
+        "project": arguments.project,
+        "repository": arguments.repository,
+        "profile": arguments.profile,
+        "runtime_version": arguments.runtime_version,
+        "default_branch": arguments.branch,
+        "components": components,
+        "configuration": {
+            "checks": [{"name": name, "command": command} for name, command in checks],
+            "docs": (
+                {
+                    "command": arguments.docs_command,
+                    "output": arguments.docs_output,
+                }
+                if arguments.docs_command is not None
+                else None
+            ),
+            "publish": (
+                {"distribution": arguments.distribution or arguments.project}
+                if "publish" in components
+                else None
+            ),
+        },
+        "files": records,
+    }
+    write_bundle(output, rendered, manifest)
+    if arguments.json:
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+    else:
+        print(f"Rendered {len(records)} files to {output}")
+
+
+def load_bundle(bundle):
+    manifest_path = bundle / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as error:
+        fail(f"cannot read bundle manifest: {error}", 2)
+    if manifest.get("schema") != SCHEMA:
+        fail(f"unsupported bundle schema: {manifest.get('schema')!r}", 2)
+    sources = []
+    for record in manifest.get("files", []):
+        path = Path(record.get("path", ""))
+        if path.is_absolute() or ".." in path.parts or not path.parts:
+            fail(f"unsafe bundle path: {path}", 2)
+        source = bundle / path
+        try:
+            data = source.read_bytes()
+        except FileNotFoundError:
+            fail(f"bundle file is missing: {path}", 2)
+        if hashlib.sha256(data).hexdigest() != record.get("sha256"):
+            fail(f"bundle hash mismatch: {path}", 2)
+        if path.parts[0] == "files":
+            sources.append((Path(*path.parts[1:]), data))
+    return sources
+
+
+def classify_destination(target, relative, data, conflict_policy):
+    destination = target / relative
+    parent = target
+    if target.is_symlink():
+        return {
+            "action": "unsafe",
+            "path": relative.as_posix(),
+            "risk": "critical",
+            "reason": "target is a symbolic link",
+        }
+    if target.exists() and not target.is_dir():
+        return {
+            "action": "unsafe",
+            "path": relative.as_posix(),
+            "risk": "critical",
+            "reason": "target is not a directory",
+        }
+    for part in relative.parts[:-1]:
+        parent /= part
+        if parent.is_symlink():
+            return {
+                "action": "unsafe",
+                "path": relative.as_posix(),
+                "risk": "critical",
+                "reason": "destination parent is a symbolic link",
+            }
+        if parent.exists() and not parent.is_dir():
+            return {
+                "action": "unsafe",
+                "path": relative.as_posix(),
+                "risk": "critical",
+                "reason": "destination parent is not a directory",
+            }
+    if destination.is_symlink():
+        return {
+            "action": "unsafe",
+            "path": relative.as_posix(),
+            "risk": "critical",
+            "reason": "destination is a symbolic link",
+        }
+    if not destination.exists():
+        return {
+            "action": "create",
+            "path": relative.as_posix(),
+            "risk": "low",
+        }
+    if not destination.is_file():
+        return {
+            "action": "unsafe",
+            "path": relative.as_posix(),
+            "risk": "critical",
+            "reason": "destination is not a regular file",
+        }
+    current_data = destination.read_bytes()
+    if current_data == data:
+        return {
+            "action": "unchanged",
+            "path": relative.as_posix(),
+            "risk": "none",
+        }
+    hashes = {
+        "current_sha256": hashlib.sha256(current_data).hexdigest(),
+        "proposed_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if conflict_policy == "abort":
+        return {
+            "action": "conflict",
+            "path": relative.as_posix(),
+            "risk": "high",
+            **hashes,
+        }
+    if conflict_policy == "keep":
+        return {
+            "action": "keep",
+            "path": relative.as_posix(),
+            "risk": "medium",
+            **hashes,
+        }
+    return {
+        "action": "replace",
+        "path": relative.as_posix(),
+        "risk": "high",
+        **hashes,
+    }
+
+
+def apply_report(target, arguments, actions):
+    blocked = any(action["action"] in ("conflict", "unsafe") for action in actions)
+    conflicts = sorted(
+        action["path"]
+        for action in actions
+        if action["action"] in ("conflict", "unsafe")
+    )
+    report = {
+        "schema": "agency/repository-setup-apply/2",
+        "target": str(target),
+        "dry_run": arguments.dry_run,
+        "conflict_policy": arguments.conflict,
+        "blocked": blocked,
+        "actions": actions,
+    }
+    if blocked:
+        report.update({"error": "destination conflict", "conflicts": conflicts})
+    return report
+
+
+def command_apply(arguments):
+    bundle = arguments.bundle.resolve()
+    target = arguments.target.expanduser().absolute()
+    sources = load_bundle(bundle)
+    actions = [
+        classify_destination(target, relative, data, arguments.conflict)
+        for relative, data in sources
+    ]
+    report = apply_report(target, arguments, actions)
+    if report["blocked"]:
+        if arguments.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            for action in actions:
+                if action["action"] in ("conflict", "unsafe"):
+                    reason = f": {action['reason']}" if "reason" in action else ""
+                    print(
+                        f"{action['action']}: {action['path']} "
+                        f"({action['risk']}){reason}",
+                        file=sys.stderr,
+                    )
+        raise SystemExit(3)
+    if not arguments.dry_run:
+        for (relative, data), action in zip(sources, actions, strict=True):
+            if action["action"] not in ("create", "replace"):
+                continue
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            current = classify_destination(target, relative, data, arguments.conflict)
+            if current != action:
+                fail(f"destination changed while applying: {relative}", 3)
+            destination.write_bytes(data)
+    report.update(
+        {
+            key: sorted(
+                action["path"] for action in actions if action["action"] == action_name
+            )
+            for key, action_name in (
+                ("created", "create"),
+                ("unchanged", "unchanged"),
+                ("kept", "keep"),
+                ("replaced", "replace"),
+            )
+        }
+    )
+    if arguments.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    elif arguments.dry_run:
+        for action in actions:
+            print(f"{action['action']}: {action['path']} ({action['risk']})")
+    else:
+        print(
+            f"Created {len(report['created'])} files; "
+            f"replaced {len(report['replaced'])}; kept {len(report['kept'])}; "
+            f"{len(report['unchanged'])} already matched"
+        )
+
+
+def parser():
+    root = argparse.ArgumentParser(
+        description="Render and safely apply Agency repository setup bundles."
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    render = commands.add_parser("render", help="render a reviewable setup bundle")
+    render.add_argument("--output", required=True, type=Path)
+    render.add_argument("--project", required=True)
+    render.add_argument("--repository", required=True, metavar="OWNER/REPO")
+    render.add_argument("--profile", choices=PROFILES, default="python")
+    render.add_argument(
+        "--runtime-version",
+        "--python",
+        dest="runtime_version",
+        required=True,
+        metavar="VERSION",
+    )
+    render.add_argument("--branch", default="main")
+    render.add_argument(
+        "--component",
+        action="append",
+        choices=COMPONENT_ORDER,
+        help="restrict the bundle; repeatable (default: ci, community, github-settings)",
+    )
+    render.add_argument(
+        "--check",
+        action="append",
+        nargs=2,
+        metavar=("NAME", "COMMAND"),
+        default=[],
+    )
+    render.add_argument(
+        "--custom-checks",
+        action="store_true",
+        help="replace profile defaults with the supplied --check values",
+    )
+    render.add_argument("--docs-command")
+    render.add_argument("--docs-output")
+    render.add_argument("--publish", action="store_true")
+    render.add_argument("--distribution")
+    render.add_argument("--json", action="store_true")
+    render.set_defaults(handler=command_render)
+
+    apply = commands.add_parser(
+        "apply", help="plan or install repository files from a bundle"
+    )
+    apply.add_argument("bundle", type=Path)
+    apply.add_argument("target", type=Path)
+    apply.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report every filesystem action without writing",
+    )
+    apply.add_argument(
+        "--conflict",
+        choices=("abort", "keep", "replace"),
+        default="abort",
+        help="handle divergent regular files (default: abort)",
+    )
+    apply.add_argument("--json", action="store_true")
+    apply.set_defaults(handler=command_apply)
+    return root
+
+
+def main():
+    arguments = parser().parse_args()
+    arguments.handler(arguments)
+
+
+if __name__ == "__main__":
+    main()

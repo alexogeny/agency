@@ -119,6 +119,7 @@ agency_plan_user_links() {
     instruction-bench
     perf-diagnose
     repo-map
+    repository-setup
     report-build
     system-context
     sudo-gui

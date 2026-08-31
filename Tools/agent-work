@@ -287,6 +287,7 @@ def serialize_task(connection, row, claims=None):
         "worktree": row["worktree"],
         "branch": row["branch"],
         "scratch": row["scratch"],
+        "claim_kind": "write",
         "claims": claims
         if claims is not None
         else claims_by_task(connection, [row["id"]])[row["id"]],
@@ -335,7 +336,7 @@ def emit(value, as_json):
     print(f"{PURPLE}◇ {value['id']}{RESET}  {value['status']} · {left}")
     print(f"  {value['task']}")
     print(f"  worktree  {value['worktree']}")
-    print(f"  scope     {', '.join(value['claims'])}")
+    print(f"  writes    {', '.join(value['claims'])}")
     print(f"  scratch   {value['scratch']}")
     if value["owner"]:
         print(f"  owner     {value['owner']}")
@@ -360,7 +361,7 @@ def emit_table(tasks):
         return
     print(
         f"{PURPLE}{'TASK':<31} {'STATE':<10} {'LEFT':>8}  "
-        f"{'OWNER':<18} {'SCOPE'}{RESET}"
+        f"{'OWNER':<18} {'WRITES'}{RESET}"
     )
     for task in tasks:
         remaining = task["seconds_remaining"]
@@ -444,14 +445,21 @@ def command_start(arguments, as_json):
         if as_json:
             print(
                 json.dumps(
-                    {"error": "scope conflict", "conflicts": conflicts}, indent=2
+                    {
+                        "error": "scope conflict",
+                        "claim_kind": "write",
+                        "read_allowed": True,
+                        "conflicts": conflicts,
+                    },
+                    indent=2,
                 )
             )
         else:
             for conflict in conflicts:
                 print(
                     f"{conflict['requested']} overlaps {conflict['existing']} "
-                    f"claimed by {conflict['task_id']} ({conflict['task']})",
+                    f"write-claimed by {conflict['task_id']} ({conflict['task']}); "
+                    "read-only access remains allowed",
                     file=sys.stderr,
                 )
         raise SystemExit(3)
@@ -517,7 +525,7 @@ def command_claim(arguments, as_json):
     row = task_record(connection, task_id)
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
-        fail(f"cannot add scope to {row['status']} task {row['id']}", 2)
+        fail(f"cannot add write scope to {row['status']} task {row['id']}", 2)
     root = Path(row["repo_root"])
     claims = sorted({normalize_claim(root, value) for value in paths})
     conflicts = find_conflicts(connection, row["repo_id"], claims, row["id"])
@@ -526,13 +534,20 @@ def command_claim(arguments, as_json):
         if as_json:
             print(
                 json.dumps(
-                    {"error": "scope conflict", "conflicts": conflicts}, indent=2
+                    {
+                        "error": "scope conflict",
+                        "claim_kind": "write",
+                        "read_allowed": True,
+                        "conflicts": conflicts,
+                    },
+                    indent=2,
                 )
             )
         else:
             for conflict in conflicts:
                 print(
-                    f"{conflict['requested']} overlaps {conflict['existing']} claimed by {conflict['task_id']}",
+                    f"{conflict['requested']} overlaps {conflict['existing']} "
+                    f"write-claimed by {conflict['task_id']}; read-only access remains allowed",
                     file=sys.stderr,
                 )
         raise SystemExit(3)
@@ -639,6 +654,14 @@ def command_status(arguments, as_json):
 
 def command_inspect(arguments, as_json):
     connection = database()
+    if arguments.task_id or arguments.task_option:
+        emit(
+            serialize_task(
+                connection, task_record(connection, task_id_from(arguments))
+            ),
+            as_json,
+        )
+        return
     states = (*ACTIVE_STATES, *TERMINAL_STATES) if arguments.all else ACTIVE_STATES
     tasks = serialize_tasks(connection, board_rows(connection, arguments, states))
     if as_json or not sys.stdout.isatty() or not shutil.which("fzf"):
@@ -674,7 +697,7 @@ def command_inspect(arguments, as_json):
             "--with-nth=1,2,3,4,5,6,7",
             "--prompt=  task › ",
             "--pointer=♥",
-            "--header=TASK · STATE · LEFT · OWNER · DESCRIPTION · SCOPE · NOTE",
+            "--header=TASK · STATE · LEFT · OWNER · DESCRIPTION · WRITES · NOTE",
         ],
         input="\n".join(choices) + "\n",
         text=True,
@@ -781,10 +804,15 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
 
     start = commands.add_parser(
-        "start", help="register a timeboxed task and atomically claim scope"
+        "start", help="register a timeboxed task and atomically claim write scope"
     )
     start.add_argument("--task", required=True, metavar="DESCRIPTION")
-    start.add_argument("--scope", action="append", required=True)
+    start.add_argument(
+        "--scope",
+        action="append",
+        required=True,
+        help="path reserved for writes; repeatable; reads never require a claim",
+    )
     start.add_argument("--timebox", default="1h")
     start.add_argument("--worktree", default=os.getcwd())
     start.add_argument("--pid", type=int)
@@ -793,7 +821,7 @@ def parser():
     start.set_defaults(handler=command_start)
 
     claim = commands.add_parser(
-        "claim", help="add non-overlapping scope to an active task"
+        "claim", help="add non-overlapping write scope to an active task"
     )
     claim.add_argument("values", nargs="+", metavar="TASK_ID_OR_PATH")
     claim.add_argument(
@@ -832,7 +860,10 @@ def parser():
     add_board_options(status)
     status.set_defaults(handler=command_status)
 
-    inspect = commands.add_parser("inspect", help="show the active board")
+    inspect = commands.add_parser(
+        "inspect", help="show one task or choose from the active board"
+    )
+    add_task_option(inspect)
     add_board_options(inspect)
     inspect.set_defaults(handler=command_inspect)
 

@@ -1,0 +1,36 @@
+name: Feature request
+description: Something __PROJECT__ should make possible or easier.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: Describe what you are trying to do and where the project stops you.
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: What you do today
+      description: Describe the workaround, dependency, or manual process.
+    validations:
+      required: true
+
+  - type: textarea
+    id: shape
+    attributes:
+      label: Possible shape
+      description: Optional API or interface sketch.
+      render: __EXAMPLE_LANGUAGE__
+
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues and documentation.
+          required: true
+        - label: I can answer follow-up questions about this request.
+          required: true

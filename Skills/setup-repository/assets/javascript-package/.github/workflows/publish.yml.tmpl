@@ -1,0 +1,49 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '__RUNTIME_VERSION__'
+      - name: Install locked development environment
+        run: bun install --frozen-lockfile
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Install an npm CLI with trusted publishing support
+        run: npm install --global npm@latest
+      - name: Match the release tag to package metadata
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="$(node --print 'require("./package.json").version')"
+          [ "$RELEASE_TAG" = "v$version" ] || {
+            echo "::error::release tag $RELEASE_TAG does not match package version $version"
+            exit 1
+          }
+      - name: Inspect __DISTRIBUTION__ publication contents
+        run: npm pack --dry-run
+      - name: Publish __DISTRIBUTION__ to npm
+        run: npm publish --provenance

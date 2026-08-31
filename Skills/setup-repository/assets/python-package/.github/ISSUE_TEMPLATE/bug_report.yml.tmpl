@@ -1,0 +1,52 @@
+name: Bug report
+description: Something __PROJECT__ does incorrectly or unexpectedly.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: __PROJECT__ version
+      description: The installed version or commit SHA.
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: __ENVIRONMENT_LABEL__
+      description: Include `__ENVIRONMENT_COMMAND__`, your operating system, and architecture.
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened
+      description: State the observed and expected behaviour.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Smallest reproducible example
+      description: Prefer a runnable example with all required inputs.
+      render: __EXAMPLE_LANGUAGE__
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Complete traceback or output
+      render: shell
+
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I can answer follow-up questions about this report.
+          required: true

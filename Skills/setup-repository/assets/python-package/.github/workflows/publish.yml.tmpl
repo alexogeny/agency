@@ -1,0 +1,57 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '__PYTHON__'
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: Match the release tag to project metadata
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          [ "$RELEASE_TAG" = "v$version" ] || {
+            echo "::error::release tag $RELEASE_TAG does not match project version $version"
+            exit 1
+          }
+      - name: Build __DISTRIBUTION__
+        run: uv build
+      - name: Show the immutable publication set
+        run: ls -l dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: distributions
+          path: dist
+      - name: Publish __DISTRIBUTION__ to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

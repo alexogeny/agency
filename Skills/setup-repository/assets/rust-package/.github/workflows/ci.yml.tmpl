@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [__DEFAULT_BRANCH__]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '__RUNTIME_VERSION__'
+          components: clippy, rustfmt
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+__CHECK_STEPS__

@@ -1,6 +1,6 @@
 ---
 name: coordinate
-description: Coordinate parallel agent tasks across a repository and its worktrees with atomic scope claims, unique scratch space, heartbeats, timeboxes, completion evidence, and handoffs. Use when multiple agents may work concurrently or when starting, checking, transferring, or closing coordinated work.
+description: Coordinate parallel agent tasks across a repository and its worktrees with atomic write claims, unique scratch space, heartbeats, timeboxes, completion evidence, and handoffs. Use when multiple agents may work concurrently or when starting, checking, transferring, or closing coordinated work.
 ---
 
 # Coordinate parallel work
@@ -58,7 +58,8 @@ Inspect active work first:
 agent-work --json status --repo "$PWD"
 ```
 
-Register a concrete task, its narrowest honest scope, and a realistic timebox:
+Register a concrete task, its narrowest honest write scope, and a realistic
+timebox:
 
 ```console
 agent-work --json start --task "describe the outcome" \
@@ -69,10 +70,16 @@ Use the returned task ID for later commands and the returned scratch directory
 for every temporary or exploratory artifact. Do not invent another scratch
 name. Supply `--pid` only when the persistent worker PID is actually known.
 
-Treat a scope conflict as coordination information. Do not evade it with a
-broader worktree, a differently spelled path, or an unregistered edit. Narrow
-the task, wait, or ask the user to resolve ownership. Claim newly necessary
-paths before editing them:
+Claims reserve writes, not reads. Read, search, diff, cite, review, and run
+read-only analysis across another task's claims whenever useful; do not claim a
+path merely to inspect it, and do not defer requested inspection because it is
+claimed. Treat the contents as potentially in flight and avoid presenting them
+as a stable final result without checking the owning task's state.
+
+Treat a write-scope conflict as coordination information. Do not evade it with
+a broader worktree, a differently spelled path, or an unregistered edit.
+Narrow the task, wait, or ask the user to resolve write ownership. Claim newly
+necessary paths before editing them:
 
 ```console
 agent-work --json claim TASK_ID another/path
@@ -99,9 +106,12 @@ checks, and prepare a handoff. A timebox is not permission to mark incomplete
 work complete or to discard another agent's changes.
 
 Use `agent-work --json stale` to inspect overdue, silent, or dead tasks. This is
-read-only evidence. Correlate suspicious records with `oldtasks` and repository
-state; never kill a process, release a claim, delete scratch data, or close
-another agent's task merely because it appears stale.
+read-only evidence. Inspect one record with `agent-work --json inspect TASK_ID`
+and its stage sequence with `agent-work --json history TASK_ID`. Correlate
+suspicious records with repository state and the record's `process_alive` and
+`pid` fields when present. Do not invoke shell-specific process aliases. Never
+kill a process, release a claim, delete scratch data, or close another agent's
+task merely because it appears stale.
 
 ## Close with evidence
 

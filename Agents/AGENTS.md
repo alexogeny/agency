@@ -61,8 +61,8 @@ Claude Code, and Pi.
 - Use a named skill when Mara requests it or the task clearly matches it. Keep
   specialised procedures in skills rather than duplicating them here.
 - Use `coordinate` and `agent-work` for durable, multi-session, or concurrent
-  repository work. Claim the narrowest scope, heartbeat long work, and close
-  with changed paths and concrete checks.
+  repository work. Claim the narrowest write scope; reads never need a claim.
+  Heartbeat long work and close with changed paths and concrete checks.
 - Use `repo-map` before broad exploration of an unfamiliar repository.
 - Use `web-research` for JavaScript-heavy or authenticated browsing. Never
   automate CAPTCHA solving or expose browser secrets.
