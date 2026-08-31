@@ -38,12 +38,36 @@ if status is-interactive
     function gpl --description 'Safely fast-forward a repository'
         if test (count $argv) -eq 0
             set --local branch (git symbolic-ref --quiet --short HEAD)
-            set --local remote (git config --get "branch.$branch.remote")
-            set --local merge_ref (git config --get "branch.$branch.merge")
-
-            if test -z "$branch" -o -z "$remote" -o "$remote" = . -o -z "$merge_ref"
+            if test -z "$branch"
                 git pull --ff-only
                 return
+            end
+
+            set --local remote (git config --get "branch.$branch.remote")
+            set --local merge_ref (git config --get "branch.$branch.merge")
+            set --local tracking_missing false
+
+            if test "$remote" = .
+                git pull --ff-only
+                return
+            end
+
+            if test -z "$remote"
+                set tracking_missing true
+                set --local remotes (git remote)
+                if contains -- origin $remotes
+                    set remote origin
+                else if test (count $remotes) -eq 1
+                    set remote $remotes[1]
+                else
+                    git pull --ff-only
+                    return
+                end
+            end
+
+            if test -z "$merge_ref"
+                set tracking_missing true
+                set merge_ref "refs/heads/$branch"
             end
 
             git fetch --prune "$remote"
@@ -74,7 +98,11 @@ if status is-interactive
                 end
 
                 set --local default_branch (string replace -- "refs/remotes/$remote/" '' "$default_ref")
-                printf "Upstream '%s/%s' was deleted; switching to '%s'.\n" "$remote" "$upstream_branch" "$default_branch"
+                if test "$tracking_missing" = true
+                    printf "Remote branch '%s/%s' does not exist; switching to '%s'.\n" "$remote" "$upstream_branch" "$default_branch"
+                else
+                    printf "Upstream '%s/%s' was deleted; switching to '%s'.\n" "$remote" "$upstream_branch" "$default_branch"
+                end
 
                 if git show-ref --verify --quiet "refs/heads/$default_branch"
                     git switch "$default_branch"

@@ -116,6 +116,31 @@ class GitPullFunctionTests(unittest.TestCase):
             0,
         )
 
+    def test_pruned_branch_without_tracking_switches_to_remote_default(self):
+        self.git(
+            "-C",
+            str(self.remote),
+            "update-ref",
+            "-d",
+            "refs/heads/test/pruned-upstream",
+        )
+        self.git(
+            "-C",
+            str(self.checkout),
+            "config",
+            "--remove-section",
+            "branch.test/pruned-upstream",
+        )
+
+        result = self.gpl()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current_branch(), "main")
+        self.assertIn(
+            "does not exist; switching to 'main'",
+            result.stdout,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

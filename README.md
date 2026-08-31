@@ -89,12 +89,14 @@ performance-design        perf-diagnosis              benchmark
 choose the shape    →     locate costly work    →     substantiate the claim
 ```
 
-[`performance-design`](Skills/performance-design/SKILL.md) starts with the
-workload and applies the highest-leverage cost reduction first: skip work, do it
-fewer times, move less data, keep memory access compact and sequential, batch
-boundaries, and only then tune instruction-level details. Guard clauses and
-deterministic ordering are treated as structural choices unless they avoid
-material work or improve a measured path.
+[`performance-design`](Skills/performance-design/SKILL.md) runs as a lightweight
+preflight whenever an agent writes executable code, so expected scale, call
+frequency, complexity, allocation, and expensive boundaries shape the first
+implementation. Deeper performance work applies the highest-leverage cost
+reduction first: skip work, do it fewer times, move less data, keep memory access
+compact and sequential, batch boundaries, and only then tune instruction-level
+details. Guard clauses and deterministic ordering are treated as structural
+choices unless they avoid material work or improve a measured path.
 
 [`perf-diagnosis`](Skills/perf-diagnosis/SKILL.md) and `perf-diagnose` collect
 counters or profiles when the costly path is uncertain:
@@ -233,10 +235,10 @@ a timestamped tree under `~/.local/state/agency/backups`. Correct links remain
 untouched.
 
 A normal rerun installs missing tools but leaves existing stable Rust, yay,
-h2load, Codex, Claude Code, Pi, Gantry, Thoreau, and podman-compose versions
-untouched. It prints a warning so an older installation cannot look freshly
-updated. Pass `--update` to check and update those tools, or combine
-`--dry-run --update` to inspect that plan first.
+h2load, 1Password desktop and CLI, Codex, Claude Code, Pi, Gantry, Thoreau, and
+podman-compose versions untouched. It prints a warning so an older installation
+cannot look freshly updated. Pass `--update` to check and update those tools, or
+combine `--dry-run --update` to inspect that plan first.
 
 `~/Scratch` is the durable home for reproducible task material. Installation
 migrates an older `~/scratch` without overwriting conflicts. Disposable outputs
@@ -255,11 +257,12 @@ runtime for vendor launchers.
   Git tooling, and a rose-coloured Fish and Starship shell.
 - **Containers:** rootless, daemonless Podman with Pasta networking and Compose
   installed through uv. Docker and nerdctl frontends are removed.
-- **Inspection:** ripgrep, fd, jq, btop, bottom, hyperfine, perf, strace, lsof,
-  sysstat, iotop-c, powertop, bandwhich, dust, PDF rendering, OCR, profiling,
-  benchmarking, document checking, and comment auditing.
-- **Desktop:** 1Password, Firefox privacy policy, uBlock Origin, browser
-  integration, encrypted DNS, LAVD scheduling, and hardware-aware power policy.
+- **Inspection:** ripgrep, fd, jq, btop, bottom, hyperfine, ShellCheck, perf,
+  strace, lsof, sysstat, iotop-c, powertop, bandwhich, dust, PDF rendering, OCR,
+  profiling, benchmarking, document checking, and comment auditing.
+- **Desktop:** 1Password desktop and CLI, its automatically installed Firefox
+  extension, Firefox privacy policy, uBlock Origin, browser integration,
+  encrypted DNS, LAVD scheduling, and hardware-aware power policy.
 - **Maintenance:** a global ignore file, weekly `fstrim.timer`, timestamped
   backups, and normal-user AUR builds for yay and nghttp2. The nghttp2 recipe
   accepts CachyOS's `zlib-ng-compat` provider.

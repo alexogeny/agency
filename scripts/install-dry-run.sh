@@ -192,6 +192,8 @@ agency_print_install_plan() {
   printf '  [%-16s] verified Computer Modern Unicode fonts\n' "install fonts"
   if $update; then
     printf '  [%-16s] yay and patched nghttp2/h2load AUR builds\n' "update AUR tools"
+    printf '  [%-16s] 1Password desktop AUR build\n' "update AUR tool"
+    printf '  [%-16s] 1Password CLI AUR build\n' "update AUR tool"
     printf '  [%-16s] stable Rust toolchain\n' "update toolchain"
     printf '  [%-16s] Codex, Claude Code, and Pi through Bun\n' \
       "update installed CLIs"
@@ -199,6 +201,10 @@ agency_print_install_plan() {
       "update installed CLIs"
   else
     printf '  [%-16s] yay and patched nghttp2/h2load; retain installed versions\n' \
+      "install missing"
+    printf '  [%-16s] 1Password desktop; retain installed version\n' \
+      "install missing"
+    printf '  [%-16s] 1Password CLI; retain installed version\n' \
       "install missing"
     printf '  [%-16s] stable Rust; retain the installed default\n' "install missing"
     printf '  [%-16s] Codex, Claude Code, and Pi; retain installed versions\n' \
@@ -216,6 +222,8 @@ agency_print_install_plan() {
   agency_plan_link "$AGENCY_DIR/config/containers/containers.conf" \
     "$HOME/.config/containers/containers.conf"
   printf '  [%-16s] Firefox enterprise policy and per-profile user.js\n' "configure"
+  printf '  [%-16s] 1Password Firefox extension through managed policy\n' \
+    "auto-install"
   printf '  [%-16s] /usr/lib/firefox/distribution/policies.json\n' "install root"
   printf '  [%-16s] /etc/systemd/resolved.conf.d/60-cloudflare-family.conf\n' \
     "install root"
@@ -229,7 +237,6 @@ agency_print_install_plan() {
   printf '  [%-16s] /etc/scx_loader.toml; enable/restart scx_loader.service\n' \
     "configure root"
   printf '  [%-16s] fstrim.timer\n' "enable"
-  printf '  [%-16s] 1Password desktop and CLI when absent\n' "install AUR"
 
   if $update; then
     printf '\n\033[1;35mNo changes were made.\033[0m Run ./install.sh --update to apply this plan.\n'

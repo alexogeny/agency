@@ -12,8 +12,8 @@ Usage: ./install.sh [--dry-run] [--update]
   --update   Update installed versioned tools managed outside pacman.
   --help     Show this help.
 
-Without --update, existing stable Rust, yay, h2load, Codex, Claude Code, Pi,
-Gantry, Thoreau, and podman-compose are retained and reported instead.
+Without --update, existing stable Rust, yay, h2load, 1Password, Codex, Claude
+Code, Pi, Gantry, Thoreau, and podman-compose are retained and reported instead.
 EOF
 }
 
@@ -162,6 +162,6 @@ agency_as_root systemctl enable --now scx_loader.service
 agency_as_root systemctl restart scx_loader.service
 agency_as_root systemctl enable --now fstrim.timer
 
-"$AGENCY_DIR/scripts/install-1password.sh"
+"$AGENCY_DIR/scripts/install-1password.sh" "${update_arguments[@]}"
 
 printf '\n\033[1;35m✨ Workstation bootstrap complete. Restart Firefox to apply policy.\033[0m\n'
