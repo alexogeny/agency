@@ -133,16 +133,22 @@ under `~/Scratch`, and records its deadline, heartbeat, changed paths, checks,
 and terminal handoff in a machine-local SQLite ledger.
 
 ```console
-agent-work --json status
-agent-work --json start --task "repair the parser" --scope src/parser --timebox 45m
-agent-work --json heartbeat TASK_ID
+agent-work --json status --repo "$PWD"
+agent-work --json start --task "repair the parser" --scope src/parser \
+  --timebox 45m --owner codex-root
+agent-work --json heartbeat TASK_ID --agent codex-root \
+  --note "focused tests passed; preparing integration"
 agent-work --json finish TASK_ID --status complete \
+  --agent codex-root \
   --summary "parser repair verified" --changed src/parser \
   --check "focused parser tests passed"
 ```
 
-Overlapping claims are rejected atomically. Stale records are evidence to
-inspect, never permission to kill a process or take over someone else's files.
+Heartbeats retain their actor and stage note, and `agent-work history TASK_ID`
+shows the task event sequence. Repository-scoped status is bounded by default;
+`--all-repos` requests the machine-wide board. Overlapping claims are rejected
+atomically. Stale records are evidence to inspect, never permission to kill a
+process or take over someone else's files.
 `system-context` refreshes hardware and power guidance when a session starts or
 resumes, while `oldtasks` provides an interactive, confirmation-gated view of
 old user processes.

@@ -43,7 +43,9 @@ Firejail's setuid mode.
 Coordinates parallel work across a repository and its Git worktrees with an
 atomic SQLite ledger under `~/.local/state/agent-work`. It creates unique
 scratch directories, rejects overlapping hierarchical scope claims, tracks
-heartbeats and deadlines, and records terminal handoffs without modifying Git.
+owned heartbeats and stage notes, retains task history, bounds repository-scoped
+boards, and records terminal handoffs without modifying Git. Existing ledgers
+are backed up and upgraded in place when new coordination fields are needed.
 Use `agent-work --help` for the task lifecycle and JSON interface.
 
 ## `instruction-bench`

@@ -36,6 +36,16 @@ def parse_duration(value):
     return amount * multiplier
 
 
+def positive_integer(value):
+    try:
+        number = int(value)
+    except ValueError:
+        fail(f"invalid positive integer: {value!r}", 2)
+    if number < 1:
+        fail(f"invalid positive integer: {value!r}", 2)
+    return number
+
+
 def utc_now():
     return dt.datetime.now(dt.UTC)
 
@@ -57,7 +67,8 @@ def state_root():
 
 
 def database():
-    connection = sqlite3.connect(state_root() / "tasks.sqlite3", timeout=10)
+    path = state_root() / "tasks.sqlite3"
+    connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA foreign_keys=ON")
@@ -78,6 +89,8 @@ def database():
             deadline_at TEXT NOT NULL,
             heartbeat_at TEXT NOT NULL,
             status TEXT NOT NULL,
+            owner TEXT,
+            latest_note TEXT,
             summary TEXT,
             checks_json TEXT NOT NULL DEFAULT '[]',
             changed_json TEXT NOT NULL DEFAULT '[]'
@@ -91,6 +104,42 @@ def database():
         CREATE INDEX IF NOT EXISTS tasks_repo_status ON tasks(repo_id, status);
         """
     )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+    missing = [name for name in ("owner", "latest_note") if name not in columns]
+    if missing:
+        timestamp = utc_now().strftime("%Y%m%dT%H%M%S%fZ")
+        backup = sqlite3.connect(
+            path.with_name(f"tasks.pre-migration-{timestamp}.sqlite3")
+        )
+        try:
+            connection.backup(backup)
+        finally:
+            backup.close()
+        connection.execute("BEGIN IMMEDIATE")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+        for name in missing:
+            if name not in columns:
+                connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} TEXT")
+        connection.commit()
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            occurred_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            actor TEXT,
+            status TEXT,
+            note TEXT,
+            details_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS task_events_task_time "
+        "ON task_events(task_id, occurred_at, id)"
+    )
+    connection.commit()
     return connection
 
 
@@ -172,16 +221,61 @@ def task_record(connection, task_id):
     return row
 
 
-def claims_for(connection, task_id):
-    return [
-        row[0]
-        for row in connection.execute(
-            "SELECT path FROM claims WHERE task_id = ? ORDER BY path", (task_id,)
-        )
-    ]
+def task_id_from(arguments):
+    positional = getattr(arguments, "task_id", None)
+    option = getattr(arguments, "task_option", None)
+    if positional and option and positional != option:
+        fail("task ID was supplied twice with different values", 2)
+    task_id = positional or option or os.environ.get("AGENT_WORK_ID")
+    if not task_id:
+        fail("task ID is required; pass TASK_ID or --task TASK_ID", 2)
+    return task_id
 
 
-def serialize_task(connection, row):
+def claims_by_task(connection, task_ids):
+    claims = {task_id: [] for task_id in task_ids}
+    if not task_ids:
+        return claims
+    placeholders = ",".join("?" for _ in task_ids)
+    for row in connection.execute(
+        f"SELECT task_id, path FROM claims WHERE task_id IN ({placeholders}) "
+        "ORDER BY task_id, path",
+        task_ids,
+    ):
+        claims[row["task_id"]].append(row["path"])
+    return claims
+
+
+def append_event(
+    connection,
+    task_id,
+    kind,
+    occurred_at,
+    *,
+    actor=None,
+    status=None,
+    note=None,
+    details=None,
+):
+    connection.execute(
+        """
+        INSERT INTO task_events (
+            task_id, occurred_at, kind, actor, status, note, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            occurred_at,
+            kind,
+            actor,
+            status,
+            note,
+            json.dumps(details or {}, sort_keys=True),
+        ),
+    )
+
+
+def serialize_task(connection, row, claims=None):
     now = utc_now()
     deadline = dt.datetime.fromisoformat(row["deadline_at"].replace("Z", "+00:00"))
     return {
@@ -193,7 +287,11 @@ def serialize_task(connection, row):
         "worktree": row["worktree"],
         "branch": row["branch"],
         "scratch": row["scratch"],
-        "claims": claims_for(connection, row["id"]),
+        "claims": claims
+        if claims is not None
+        else claims_by_task(connection, [row["id"]])[row["id"]],
+        "owner": row["owner"],
+        "latest_note": row["latest_note"],
         "pid": row["pid"],
         "process_alive": process_alive(row),
         "started_at": row["started_at"],
@@ -203,6 +301,24 @@ def serialize_task(connection, row):
         "summary": row["summary"],
         "checks": json.loads(row["checks_json"]),
         "changed": json.loads(row["changed_json"]),
+    }
+
+
+def serialize_tasks(connection, rows):
+    claims = claims_by_task(connection, [row["id"] for row in rows])
+    return [serialize_task(connection, row, claims[row["id"]]) for row in rows]
+
+
+def serialize_event(row):
+    return {
+        "id": row["id"],
+        "task_id": row["task_id"],
+        "occurred_at": row["occurred_at"],
+        "kind": row["kind"],
+        "actor": row["actor"],
+        "status": row["status"],
+        "note": row["note"],
+        "details": json.loads(row["details_json"]),
     }
 
 
@@ -221,6 +337,10 @@ def emit(value, as_json):
     print(f"  worktree  {value['worktree']}")
     print(f"  scope     {', '.join(value['claims'])}")
     print(f"  scratch   {value['scratch']}")
+    if value["owner"]:
+        print(f"  owner     {value['owner']}")
+    if value["latest_note"]:
+        print(f"  note      {value['latest_note']}")
     if value["summary"]:
         print(f"  summary   {value['summary']}")
 
@@ -238,14 +358,20 @@ def emit_table(tasks):
     if not tasks:
         print(f"{PINK}♡ No matching agent tasks.{RESET}")
         return
-    print(f"{PURPLE}{'TASK':<31} {'STATE':<10} {'LEFT':>8}  {'SCOPE'}{RESET}")
+    print(
+        f"{PURPLE}{'TASK':<31} {'STATE':<10} {'LEFT':>8}  "
+        f"{'OWNER':<18} {'SCOPE'}{RESET}"
+    )
     for task in tasks:
         remaining = task["seconds_remaining"]
         left = human_duration(abs(remaining))
         if remaining < 0:
             left = f"-{left}"
         scope = ", ".join(task["claims"])
-        print(f"{task['id']:<31} {task['status']:<10} {left:>8}  {scope}")
+        owner = task["owner"] or "-"
+        print(f"{task['id']:<31} {task['status']:<10} {left:>8}  {owner:<18} {scope}")
+        if task["latest_note"]:
+            print(f"  ↳ {task['latest_note']}")
 
 
 def find_conflicts(connection, repo_id, claims, exclude_task=None):
@@ -272,6 +398,34 @@ def find_conflicts(connection, repo_id, claims, exclude_task=None):
                     }
                 )
     return conflicts
+
+
+def board_repo_id(arguments):
+    if arguments.all_repos:
+        return None
+    return repository(arguments.repo or os.getcwd())[2]
+
+
+def board_rows(connection, arguments, states, *, bounded=True):
+    clauses = [f"status IN ({','.join('?' for _ in states)})"]
+    parameters = list(states)
+    repo_id = board_repo_id(arguments)
+    if repo_id:
+        clauses.append("repo_id = ?")
+        parameters.append(repo_id)
+    if arguments.since:
+        cutoff = utc_now() - dt.timedelta(seconds=parse_duration(arguments.since))
+        clauses.append("started_at >= ?")
+        parameters.append(iso_time(cutoff))
+    limit = ""
+    if bounded:
+        limit = " LIMIT ?"
+        parameters.append(arguments.limit)
+    return connection.execute(
+        f"SELECT * FROM tasks WHERE {' AND '.join(clauses)} "
+        f"ORDER BY started_at DESC, id DESC{limit}",
+        parameters,
+    ).fetchall()
 
 
 def command_start(arguments, as_json):
@@ -308,8 +462,9 @@ def command_start(arguments, as_json):
         """
         INSERT INTO tasks (
             id, repo_id, repo_root, git_common_dir, task, worktree, branch,
-            scratch, pid, pid_started, started_at, deadline_at, heartbeat_at, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            scratch, pid, pid_started, started_at, deadline_at, heartbeat_at,
+            status, owner
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
         """,
         (
             task_id,
@@ -325,11 +480,21 @@ def command_start(arguments, as_json):
             iso_time(now),
             iso_time(now + dt.timedelta(seconds=duration)),
             iso_time(now),
+            arguments.owner,
         ),
     )
     connection.executemany(
         "INSERT INTO claims (task_id, path) VALUES (?, ?)",
         [(task_id, claim) for claim in claims],
+    )
+    append_event(
+        connection,
+        task_id,
+        "start",
+        iso_time(now),
+        actor=arguments.owner,
+        status="active",
+        details={"claims": claims, "worktree": str(Path(arguments.worktree).resolve())},
     )
     connection.commit()
     record = serialize_task(connection, task_record(connection, task_id))
@@ -341,12 +506,20 @@ def command_start(arguments, as_json):
 def command_claim(arguments, as_json):
     connection = database()
     connection.execute("BEGIN IMMEDIATE")
-    row = task_record(connection, arguments.task_id)
+    if arguments.task_option:
+        task_id = arguments.task_option
+        paths = arguments.values
+    else:
+        if len(arguments.values) < 2:
+            connection.rollback()
+            fail("claim requires TASK_ID and at least one path", 2)
+        task_id, *paths = arguments.values
+    row = task_record(connection, task_id)
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
         fail(f"cannot add scope to {row['status']} task {row['id']}", 2)
     root = Path(row["repo_root"])
-    claims = sorted({normalize_claim(root, value) for value in arguments.paths})
+    claims = sorted({normalize_claim(root, value) for value in paths})
     conflicts = find_conflicts(connection, row["repo_id"], claims, row["id"])
     if conflicts:
         connection.rollback()
@@ -367,19 +540,45 @@ def command_claim(arguments, as_json):
         "INSERT OR IGNORE INTO claims (task_id, path) VALUES (?, ?)",
         [(row["id"], claim) for claim in claims],
     )
+    append_event(
+        connection,
+        row["id"],
+        "claim",
+        iso_time(utc_now()),
+        actor=row["owner"],
+        status=row["status"],
+        details={"claims": claims},
+    )
     connection.commit()
     emit(serialize_task(connection, task_record(connection, row["id"])), as_json)
 
 
 def command_heartbeat(arguments, as_json):
     connection = database()
-    row = task_record(connection, arguments.task_id)
+    connection.execute("BEGIN IMMEDIATE")
+    row = task_record(connection, task_id_from(arguments))
     if row["status"] not in ACTIVE_STATES:
+        connection.rollback()
         fail(f"cannot heartbeat {row['status']} task {row['id']}", 2)
     now = iso_time(utc_now())
     connection.execute(
-        "UPDATE tasks SET heartbeat_at = ?, status = ? WHERE id = ?",
-        (now, arguments.status, row["id"]),
+        """
+        UPDATE tasks
+        SET heartbeat_at = ?, status = ?,
+            owner = COALESCE(owner, ?),
+            latest_note = COALESCE(?, latest_note)
+        WHERE id = ?
+        """,
+        (now, arguments.status, arguments.agent, arguments.note, row["id"]),
+    )
+    append_event(
+        connection,
+        row["id"],
+        "heartbeat",
+        now,
+        actor=arguments.agent or row["owner"],
+        status=arguments.status,
+        note=arguments.note,
     )
     connection.commit()
     emit(serialize_task(connection, task_record(connection, row["id"])), as_json)
@@ -387,8 +586,10 @@ def command_heartbeat(arguments, as_json):
 
 def command_finish(arguments, as_json):
     connection = database()
-    row = task_record(connection, arguments.task_id)
+    connection.execute("BEGIN IMMEDIATE")
+    row = task_record(connection, task_id_from(arguments))
     if row["status"] not in ACTIVE_STATES:
+        connection.rollback()
         fail(f"task {row['id']} is already {row['status']}", 2)
     now = iso_time(utc_now())
     connection.execute(
@@ -406,36 +607,40 @@ def command_finish(arguments, as_json):
             row["id"],
         ),
     )
+    append_event(
+        connection,
+        row["id"],
+        "finish",
+        now,
+        actor=arguments.agent or row["owner"],
+        status=arguments.status,
+        note=arguments.summary,
+        details={"checks": arguments.check, "changed": arguments.changed},
+    )
     connection.commit()
     emit(serialize_task(connection, task_record(connection, row["id"])), as_json)
 
 
 def command_status(arguments, as_json):
     connection = database()
-    if arguments.task_id:
+    if arguments.task_id or arguments.task_option:
         emit(
-            serialize_task(connection, task_record(connection, arguments.task_id)),
+            serialize_task(
+                connection, task_record(connection, task_id_from(arguments))
+            ),
             as_json,
         )
         return
     states = (*ACTIVE_STATES, *TERMINAL_STATES) if arguments.all else ACTIVE_STATES
-    placeholders = ",".join("?" for _ in states)
-    rows = connection.execute(
-        f"SELECT * FROM tasks WHERE status IN ({placeholders}) ORDER BY started_at DESC",
-        states,
-    ).fetchall()
-    emit([serialize_task(connection, row) for row in rows], as_json)
+    emit(
+        serialize_tasks(connection, board_rows(connection, arguments, states)), as_json
+    )
 
 
 def command_inspect(arguments, as_json):
     connection = database()
     states = (*ACTIVE_STATES, *TERMINAL_STATES) if arguments.all else ACTIVE_STATES
-    placeholders = ",".join("?" for _ in states)
-    rows = connection.execute(
-        f"SELECT * FROM tasks WHERE status IN ({placeholders}) ORDER BY started_at DESC",
-        states,
-    ).fetchall()
-    tasks = [serialize_task(connection, row) for row in rows]
+    tasks = serialize_tasks(connection, board_rows(connection, arguments, states))
     if as_json or not sys.stdout.isatty() or not shutil.which("fzf"):
         emit(tasks, as_json)
         return
@@ -450,8 +655,10 @@ def command_inspect(arguments, as_json):
                     task["id"],
                     task["status"],
                     left,
+                    task["owner"] or "-",
                     task["task"],
                     ", ".join(task["claims"]),
+                    task["latest_note"] or "",
                 )
             )
         )
@@ -464,10 +671,10 @@ def command_inspect(arguments, as_json):
             "--layout=reverse",
             "--border=rounded",
             "--delimiter=\\t",
-            "--with-nth=1,2,3,4,5",
+            "--with-nth=1,2,3,4,5,6,7",
             "--prompt=  task › ",
             "--pointer=♥",
-            "--header=TASK · STATE · LEFT · DESCRIPTION · SCOPE",
+            "--header=TASK · STATE · LEFT · OWNER · DESCRIPTION · SCOPE · NOTE",
         ],
         input="\n".join(choices) + "\n",
         text=True,
@@ -482,10 +689,7 @@ def command_inspect(arguments, as_json):
 def command_stale(arguments, as_json):
     cutoff = utc_now() - dt.timedelta(seconds=parse_duration(arguments.after))
     connection = database()
-    rows = connection.execute(
-        "SELECT * FROM tasks WHERE status IN (?, ?) ORDER BY heartbeat_at",
-        ACTIVE_STATES,
-    ).fetchall()
+    rows = board_rows(connection, arguments, ACTIVE_STATES, bounded=False)
     stale = []
     for row in rows:
         heartbeat = dt.datetime.fromisoformat(
@@ -502,7 +706,71 @@ def command_stale(arguments, as_json):
         if reasons:
             record["stale_reasons"] = reasons
             stale.append(record)
-    emit(stale, as_json)
+    emit(stale[: arguments.limit], as_json)
+
+
+def command_history(arguments, as_json):
+    connection = database()
+    task_id = task_id_from(arguments)
+    task_record(connection, task_id)
+    rows = connection.execute(
+        """
+        SELECT * FROM (
+            SELECT * FROM task_events
+            WHERE task_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        ) ORDER BY id
+        """,
+        (task_id, arguments.limit),
+    ).fetchall()
+    events = [serialize_event(row) for row in rows]
+    if as_json:
+        print(json.dumps(events, indent=2, sort_keys=True))
+        return
+    if not events:
+        print(f"{PINK}♡ No recorded task events.{RESET}")
+        return
+    for event in events:
+        actor = f" · {event['actor']}" if event["actor"] else ""
+        note = f" · {event['note']}" if event["note"] else ""
+        print(f"{event['occurred_at']}  {event['kind']}{actor}{note}")
+
+
+def add_json_option(command):
+    command.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="emit stable JSON",
+    )
+
+
+def add_task_option(command):
+    command.add_argument("task_id", nargs="?", metavar="TASK_ID")
+    command.add_argument(
+        "--task",
+        dest="task_option",
+        metavar="TASK_ID",
+        help="named alternative to the positional task ID",
+    )
+
+
+def add_board_options(command, *, include_all=True):
+    if include_all:
+        command.add_argument(
+            "--all", action="store_true", help="include terminal tasks"
+        )
+    location = command.add_mutually_exclusive_group()
+    location.add_argument("--repo", metavar="PATH", help="select a repository")
+    location.add_argument(
+        "--all-repos", action="store_true", help="query the machine-wide ledger"
+    )
+    command.add_argument("--since", metavar="DURATION", help="limit by start time")
+    command.add_argument(
+        "--limit", type=positive_integer, default=100, help="maximum rows to emit"
+    )
+    add_json_option(command)
 
 
 def parser():
@@ -515,51 +783,74 @@ def parser():
     start = commands.add_parser(
         "start", help="register a timeboxed task and atomically claim scope"
     )
-    start.add_argument("--task", required=True)
+    start.add_argument("--task", required=True, metavar="DESCRIPTION")
     start.add_argument("--scope", action="append", required=True)
     start.add_argument("--timebox", default="1h")
     start.add_argument("--worktree", default=os.getcwd())
     start.add_argument("--pid", type=int)
+    start.add_argument("--owner", metavar="AGENT", help="task owner label")
+    add_json_option(start)
     start.set_defaults(handler=command_start)
 
     claim = commands.add_parser(
         "claim", help="add non-overlapping scope to an active task"
     )
-    claim.add_argument("task_id")
-    claim.add_argument("paths", nargs="+")
+    claim.add_argument("values", nargs="+", metavar="TASK_ID_OR_PATH")
+    claim.add_argument(
+        "--task",
+        dest="task_option",
+        metavar="TASK_ID",
+        help="named task ID; all positional values are paths",
+    )
+    add_json_option(claim)
     claim.set_defaults(handler=command_claim)
 
     heartbeat = commands.add_parser(
         "heartbeat", help="refresh task liveness and working state"
     )
-    heartbeat.add_argument("task_id")
+    add_task_option(heartbeat)
     heartbeat.add_argument("--status", choices=ACTIVE_STATES, default="active")
+    heartbeat.add_argument("--agent", metavar="AGENT", help="event actor label")
+    heartbeat.add_argument("--note", help="stage note retained in task history")
+    add_json_option(heartbeat)
     heartbeat.set_defaults(handler=command_heartbeat)
 
     finish = commands.add_parser(
         "finish", help="close a task with an evidence-bearing handoff"
     )
-    finish.add_argument("task_id")
+    add_task_option(finish)
     finish.add_argument("--status", choices=TERMINAL_STATES, default="complete")
     finish.add_argument("--summary", required=True)
     finish.add_argument("--check", action="append", default=[])
     finish.add_argument("--changed", action="append", default=[])
+    finish.add_argument("--agent", metavar="AGENT", help="event actor label")
+    add_json_option(finish)
     finish.set_defaults(handler=command_finish)
 
     status = commands.add_parser("status", help="show one task or the active board")
-    status.add_argument("task_id", nargs="?")
-    status.add_argument("--all", action="store_true")
+    add_task_option(status)
+    add_board_options(status)
     status.set_defaults(handler=command_status)
 
     inspect = commands.add_parser("inspect", help="show the active board")
-    inspect.add_argument("--all", action="store_true")
+    add_board_options(inspect)
     inspect.set_defaults(handler=command_inspect)
 
     stale = commands.add_parser(
         "stale", help="find overdue, unresponsive, or dead tasks without changing them"
     )
     stale.add_argument("--after", default="15m")
+    add_board_options(stale, include_all=False)
+    stale.set_defaults(all=False)
     stale.set_defaults(handler=command_stale)
+
+    history = commands.add_parser("history", help="show retained task events")
+    add_task_option(history)
+    history.add_argument(
+        "--limit", type=positive_integer, default=100, help="maximum events to emit"
+    )
+    add_json_option(history)
+    history.set_defaults(handler=command_history)
     return root
 
 
