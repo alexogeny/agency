@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import subprocess
@@ -12,6 +13,8 @@ POWER = ROOT / "scripts/configure-power.sh"
 INSTALLER = ROOT / "install.sh"
 GIT_CONFIG = ROOT / "config/git/config"
 CODEX_HOOKS = ROOT / "config/codex/hooks.json"
+FIREFOX_POLICIES = ROOT / "firefox/policies.json"
+PACKAGES = ROOT / "packages.txt"
 SCRATCH = Path(os.environ.get("AGENCY_TEST_SCRATCH", ROOT / ".cache/tests"))
 
 
@@ -20,6 +23,43 @@ class GlobalAgentGuidanceTests(unittest.TestCase):
         guidance = ROOT / "Agents/AGENTS.md"
 
         self.assertLessEqual(guidance.stat().st_size, 8 * 1024)
+
+    def test_executable_code_changes_trigger_performance_preflight(self):
+        guidance = (ROOT / "Agents/AGENTS.md").read_text()
+        skill = (ROOT / "Skills/performance-design/SKILL.md").read_text()
+
+        self.assertRegex(
+            guidance,
+            r"Whenever writing or modifying executable code, use "
+            r"`performance-design`",
+        )
+        self.assertIn("For every executable-code change", skill)
+
+
+class WorkstationManifestTests(unittest.TestCase):
+    def test_shellcheck_and_firefox_are_native_packages(self):
+        packages = {
+            line.strip()
+            for line in PACKAGES.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertIn("shellcheck", packages)
+        self.assertIn("firefox", packages)
+
+    def test_firefox_automatically_installs_the_1password_extension(self):
+        policies = json.loads(FIREFOX_POLICIES.read_text())["policies"]
+        extension = policies["ExtensionSettings"][
+            "{d634138d-c276-4fc8-924b-40a0ea21d284}"
+        ]
+
+        self.assertEqual(extension["installation_mode"], "normal_installed")
+        self.assertEqual(
+            extension["install_url"],
+            "https://addons.mozilla.org/firefox/downloads/latest/"
+            "1password-x-password-manager/latest.xpi",
+        )
+        self.assertFalse(extension["updates_disabled"])
 
 
 class InstallHelperTests(unittest.TestCase):
@@ -403,6 +443,11 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("base-devel", result.stdout)
         self.assertIn("yay", result.stdout)
         self.assertIn("h2load", result.stdout)
+        self.assertIn("shellcheck", result.stdout)
+        self.assertIn("firefox", result.stdout)
+        self.assertIn("1Password desktop", result.stdout)
+        self.assertIn("1Password CLI", result.stdout)
+        self.assertIn("1Password Firefox extension", result.stdout)
         self.assertIn("document-inspect", result.stdout)
         self.assertIn("docs-exec", result.stdout)
         self.assertIn("evidence-review", result.stdout)
@@ -441,6 +486,9 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertIn("update installed CLIs", result.stdout)
+        self.assertIn("update AUR tool", result.stdout)
+        self.assertIn("1Password desktop", result.stdout)
+        self.assertIn("1Password CLI", result.stdout)
         self.assertIn("Run ./install.sh --update", result.stdout)
 
 

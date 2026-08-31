@@ -66,8 +66,9 @@ Claude Code, and Pi.
 - Use `repo-map` before broad exploration of an unfamiliar repository.
 - Use `web-research` for JavaScript-heavy or authenticated browsing. Never
   automate CAPTCHA solving or expose browser secrets.
-- For explicit performance work, use `performance-design` to choose the shape,
-  `perf-diagnosis` to locate cost, and `benchmark` to substantiate comparisons.
+- Whenever writing or modifying executable code, use `performance-design` as a
+  lightweight preflight. Escalate to `perf-diagnosis` when the cost location is
+  uncertain and `benchmark` before making performance claims.
 - For an explicit report deliverable, use both `report-writing` and
   `report-generation`; follow their readability, audit, rendering, and
   inspection requirements.
