@@ -1,18 +1,19 @@
-# 🎀 Mara's agency
+# 🎀 Agency
 
 Agency turns a fresh CachyOS/Arch workstation into a capable, evidence-minded
-home for Codex, Claude Code, and Pi. It is part declarative bootstrap and part
-operating model: one compact global policy, specialised skills that load when
-needed, and small tools that leave useful evidence behind.
+home for Codex, Claude Code, and Pi. It combines a declarative bootstrap with an
+operating model for reliable agent work. A compact global policy handles shared
+rules. Specialised skills load when needed, and small tools leave useful
+evidence behind.
 
 The goal is not to give an agent more prose. It is to give each kind of work a
 safe path from request to checked result.
 
 ## What makes it different
 
-- **Authority stays explicit.** Agents preserve unrelated work, use Mara's Git
-  identity, never add assistant attribution, and mutate Git or a forge only
-  when the current request authorises that lifecycle.
+- **Authority stays explicit.** Agents preserve unrelated work and use the
+  configured human Git identity. They never add assistant attribution, and
+  touch Git or a forge only when the current ask allows that lifecycle.
 - **The global policy stays small.** `Agents/AGENTS.md` has an enforced 8 KiB
   budget. General rules remain always available; detailed procedures live in
   skills and load only for matching work.
@@ -24,6 +25,52 @@ safe path from request to checked result.
   idempotent installer.
 
 ## Hero stories
+
+### Scale out without worktree choreography
+
+Parallel agents need ownership, not automatic isolation. Agency keeps an atomic
+write-claims ledger. Many agents can share one checkout when they work on
+separate paths. Claims never block reads. Any agent can search, review, or learn
+from a claimed file. The ledger rejects only overlapping writes.
+
+```text
+one repository
+    ├── agent A claims src/parser     ─┐
+    ├── agent B claims Tests/parser   ├─ work in parallel
+    ├── agent C claims docs           ┘
+    └── every agent may read all three scopes
+```
+
+[`coordinate`](Skills/coordinate/SKILL.md) and `agent-work` turn that ownership
+model into a durable lifecycle. Each task gets unique scratch space. The local
+SQLite ledger records deadlines, heartbeats, changed paths, checks, and final
+handoffs.
+
+```console
+agent-work --json start --task "repair the parser" --scope src/parser \
+  --timebox 45m --owner codex-root
+agent-work --json heartbeat TASK_ID --agent codex-root \
+  --note "focused tests passed; preparing integration"
+agent-work --json status --repo "$PWD"
+agent-work --json history TASK_ID
+agent-work --json finish TASK_ID --status complete \
+  --agent codex-root --summary "parser repair verified" \
+  --changed src/parser --check "focused parser tests passed"
+```
+
+This unlocks massively parallel work. Agents do not need branch and worktree
+choreography for every task. Use a worktree for a separate branch history, an
+incompatible dependency state, or an isolated whole-tree build. Otherwise,
+narrow write claims keep integration visible and remove most handoff overhead.
+
+Heartbeats let work survive chat boundaries. History preserves the event
+sequence. Repository status stays bounded unless `--all-repos` requests the
+machine-wide board. Stale records are evidence to inspect, never permission to
+kill a process or seize another task's files.
+
+The [claim-routed messaging workshop](Workshops/claim-routing.md) sketches the
+next step: deterministic requests to claim owners, client-specific delivery,
+and atomic subtree yielding without forcing either task into another worktree.
 
 ### Give a workload a clean room
 
@@ -45,8 +92,8 @@ sandbox --publish tcp:8080 -- COMMAND...
 ```
 
 This is a strong boundary against accidental ambient state, not a separate
-kernel. Genuinely hostile code belongs in a VM. Credentials remain outside the
-sandbox unless Mara explicitly exposes a narrow input.
+kernel. Genuinely hostile code belongs in a VM. Credentials stay outside the
+sandbox unless the current task explicitly exposes a narrow input.
 
 ### Carry a dirty tree to a supervised PR
 
@@ -67,7 +114,7 @@ identify repository, branch, author, base, and any live PR
     ↓
 run focused and repository checks
     ↓
-commit with Mara's configured identity → push → create or update PR
+commit with the configured human identity → push → create or update PR
     ↓
 watch checks → inspect failures → fix in new commits → resume watching
     ↓
@@ -124,34 +171,35 @@ Git state, and output-equivalence evidence. A lower instruction count supports
 a claim about less executed work—not automatically lower latency, energy, or
 cost.
 
-### Let long work survive the chat
+### Stamp out repository plumbing
 
-The [`coordinate`](Skills/coordinate/SKILL.md) skill and `agent-work` give
-durable, multi-session, or concurrent repository work a real lifecycle. Each
-task claims the narrowest honest scope across worktrees, receives a directory
-under `~/Scratch`, and records its deadline, heartbeat, changed paths, checks,
-and terminal handoff in a machine-local SQLite ledger.
+The [`setup-repository`](Skills/setup-repository/SKILL.md) skill turns Agency's
+repository profiles for Python, JavaScript, TypeScript, Go, and Rust into CI,
+optional Pages and trusted publishing, contributor forms, and a reviewed
+GitHub ruleset. The `repository-setup` command renders a hashed bundle in
+`~/Scratch`; apply can preview every action and makes conflict handling
+explicit.
 
 ```console
-agent-work --json status --repo "$PWD"
-agent-work --json start --task "repair the parser" --scope src/parser \
-  --timebox 45m --owner codex-root
-agent-work --json heartbeat TASK_ID --agent codex-root \
-  --note "focused tests passed; preparing integration"
-agent-work --json finish TASK_ID --status complete \
-  --agent codex-root \
-  --summary "parser repair verified" --changed src/parser \
-  --check "focused parser tests passed"
+task_scratch=/home/USER/Scratch/TASK
+repository-setup render --output "$task_scratch/repository-setup" \
+  --project example --repository OWNER/example \
+  --profile python --runtime-version 3.14 --json
+repository-setup apply "$task_scratch/repository-setup" "$PWD" \
+  --dry-run --conflict abort --json
 ```
 
-Heartbeats retain their actor and stage note, and `agent-work history TASK_ID`
-shows the task event sequence. Repository-scoped status is bounded by default;
-`--all-repos` requests the machine-wide board. Overlapping claims are rejected
-atomically. Stale records are evidence to inspect, never permission to kill a
-process or take over someone else's files.
-`system-context` refreshes hardware and power guidance when a session starts or
-resumes, while `oldtasks` provides an interactive, confirmation-gated view of
-old user processes.
+Python defaults to Ruff lint and format checks, ty, and pytest. JavaScript and
+TypeScript use Bun, Prettier, ESLint, tests, and TypeScript checking where
+applicable; Go uses gofmt, vet, and tests; Rust uses rustfmt, Clippy, and tests.
+After the preview, `keep` can no-op divergent files or an explicitly authorised
+`replace` can overwrite regular files. Symlinks and non-regular destinations
+remain blocked under every policy.
+
+The skill audits GitHub's live merge policy, Actions permissions, environments,
+Pages, labels, security settings, and default-branch rules before changing
+them. Required status checks are activated only after GitHub has observed the
+workflow context, preventing a fresh ruleset from locking the default branch.
 
 For paid remote CPU or GPU work, [`gantry`](Skills/gantry/SKILL.md) carries an
 approved workload through budgeted launch, supervision, result collection, and
@@ -273,10 +321,10 @@ runtime for vendor launchers.
   backups, and normal-user AUR builds for yay and nghttp2. The nghttp2 recipe
   accepts CachyOS's `zlib-ng-compat` provider.
 
-Personal Git identity lives in untracked `~/.config/git/identity`. If absent,
-installation imports an existing global name, email, and signing key. Other
-machine-specific settings remain in `~/.config/git/local` and are included by
-the managed configuration.
+Git identity lives in untracked `~/.config/git/identity`. If absent,
+installation imports an existing global name, email, and signing key. The
+managed configuration includes other machine-specific settings from
+`~/.config/git/local`.
 
 ## Layout
 

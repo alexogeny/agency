@@ -1,0 +1,45 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '__RUNTIME_VERSION__'
+      - name: Match the release tag to package metadata
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; assert len(packages) == 1, "tailor the release workflow for a workspace"; print(packages[0]["version"])')"
+          [ "$RELEASE_TAG" = "v$version" ] || {
+            echo "::error::release tag $RELEASE_TAG does not match package version $version"
+            exit 1
+          }
+      - name: Inspect __DISTRIBUTION__ publication contents
+        run: cargo package --locked
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@v1.0.5
+      - name: Publish __DISTRIBUTION__ to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

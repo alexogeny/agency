@@ -135,6 +135,16 @@ class AgentWorkTests(unittest.TestCase):
             {current["id"], other["id"]},
         )
 
+    def test_inspect_accepts_a_task_id(self):
+        task = self.start("Inspect exact task", "src/parser")
+
+        inspected = json.loads(
+            self.run_tool("inspect", task["id"], "--json").stdout
+        )
+
+        self.assertEqual(inspected["id"], task["id"])
+        self.assertEqual(inspected["status"], "active")
+
     def test_status_history_is_bounded(self):
         tasks = [self.start(f"Task {index}", f"scope/{index}") for index in range(3)]
         for task in tasks:
@@ -194,6 +204,21 @@ class AgentWorkTests(unittest.TestCase):
         self.assertEqual([event["kind"] for event in history], ["start", "claim"])
         self.assertEqual(history[-1]["details"], {"claims": ["tests/parser"]})
 
+    def test_claim_conflict_identifies_a_write_boundary(self):
+        owner = self.start("Own README", "README.md")
+        worker = self.start("Repair parser", "src/parser")
+
+        conflict = self.run_tool(
+            "claim", worker["id"], "README.md", "--json", check=False
+        )
+
+        self.assertEqual(conflict.returncode, 3)
+        payload = json.loads(conflict.stdout)
+        self.assertEqual(payload["error"], "scope conflict")
+        self.assertEqual(payload["claim_kind"], "write")
+        self.assertTrue(payload["read_allowed"])
+        self.assertEqual(payload["conflicts"][0]["task_id"], owner["id"])
+
     def test_linked_worktree_cannot_bypass_scope_conflicts(self):
         self.git("-C", self.repo, "config", "user.name", "Test Fixture")
         self.git("-C", self.repo, "config", "user.email", "fixture@example.invalid")
@@ -216,7 +241,12 @@ class AgentWorkTests(unittest.TestCase):
         self.assertEqual(conflict.returncode, 3)
         payload = json.loads(conflict.stdout)
         self.assertEqual(payload["error"], "scope conflict")
+        self.assertEqual(payload["claim_kind"], "write")
+        self.assertTrue(payload["read_allowed"])
         self.assertEqual(payload["conflicts"][0]["task_id"], owner["id"])
+
+        record = json.loads(self.run_tool("status", owner["id"], "--json").stdout)
+        self.assertEqual(record["claim_kind"], "write")
 
     def test_legacy_database_migrates_without_losing_tasks(self):
         self.state.mkdir()

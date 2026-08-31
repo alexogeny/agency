@@ -81,6 +81,7 @@ agency_link "$AGENCY_DIR/Tools/evidence-review" "$HOME/.local/bin/evidence-revie
 agency_link "$AGENCY_DIR/Tools/instruction-bench" "$HOME/.local/bin/instruction-bench"
 agency_link "$AGENCY_DIR/Tools/perf-diagnose" "$HOME/.local/bin/perf-diagnose"
 agency_link "$AGENCY_DIR/Tools/repo-map" "$HOME/.local/bin/repo-map"
+agency_link "$AGENCY_DIR/Tools/repository-setup" "$HOME/.local/bin/repository-setup"
 agency_link "$AGENCY_DIR/Tools/report-build" "$HOME/.local/bin/report-build"
 agency_link "$AGENCY_DIR/Tools/system-context" "$HOME/.local/bin/system-context"
 agency_link "$AGENCY_DIR/Tools/sudo-gui" "$HOME/.local/bin/sudo-gui"

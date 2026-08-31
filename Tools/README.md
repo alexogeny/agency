@@ -42,11 +42,26 @@ Firejail's setuid mode.
 
 Coordinates parallel work across a repository and its Git worktrees with an
 atomic SQLite ledger under `~/.local/state/agent-work`. It creates unique
-scratch directories, rejects overlapping hierarchical scope claims, tracks
+scratch directories, rejects overlapping hierarchical write-scope claims, tracks
 owned heartbeats and stage notes, retains task history, bounds repository-scoped
 boards, and records terminal handoffs without modifying Git. Existing ledgers
 are backed up and upgraded in place when new coordination fields are needed.
-Use `agent-work --help` for the task lifecycle and JSON interface.
+Claims reserve writes only: reading, searching, reviewing, or otherwise
+inspecting a claimed path remains allowed. `inspect TASK_ID` reads one exact
+record; `inspect` without an ID opens or emits the active board. Use
+`agent-work --help` for the task lifecycle and JSON interface.
+
+## `repository-setup`
+
+Renders Agency's Python, JavaScript, TypeScript, Go, and Rust repository
+profiles into a reviewable, hashed bundle. The bundle contains CI, optional
+Pages and trusted-publishing workflows, issue and pull-request templates, plus
+a separate default-branch ruleset payload. `apply --dry-run` reports every
+planned action and risk without writing. Divergent regular files use an
+explicit `abort`, `keep`, or `replace` policy; symlinks and non-regular files
+are always blocked. The tool can restrict output to selected components and
+never mutates GitHub settings; the `setup-repository` skill owns the live
+audit, human-facing preview, authorisation, ordering, and read-back workflow.
 
 ## `instruction-bench`
 
