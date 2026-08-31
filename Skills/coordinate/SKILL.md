@@ -5,9 +5,16 @@ description: Coordinate parallel agent tasks across a repository and its worktre
 
 # Coordinate parallel work
 
-Use the installed `agent-work` command. Its machine-local ledger groups Git
-worktrees by their shared repository, so separate worktrees do not bypass scope
-collision checks.
+Use the PATH-installed `agent-work` command. This skill contains instructions,
+not a skill-local executable: never infer a `scripts/agent-work` path or invoke
+one with Python. Resolve the command once with `command -v agent-work`. If a
+command reports a usage error, read `agent-work SUBCOMMAND --help` before
+retrying instead of guessing another interface.
+
+The machine-local ledger groups Git worktrees by their shared repository, so
+separate worktrees do not bypass scope collision checks. Board queries default
+to the repository containing the current directory; use `--repo PATH` to select
+another repository or `--all-repos` only when a machine-wide view is needed.
 
 ## Delegate bounded work
 
@@ -48,14 +55,14 @@ another worker's writes, or is too coupled to produce an independent result.
 Inspect active work first:
 
 ```console
-agent-work --json status
+agent-work --json status --repo "$PWD"
 ```
 
 Register a concrete task, its narrowest honest scope, and a realistic timebox:
 
 ```console
 agent-work --json start --task "describe the outcome" \
-  --scope path/or/subsystem --timebox 45m
+  --scope path/or/subsystem --timebox 45m --owner AGENT_NAME
 ```
 
 Use the returned task ID for later commands and the returned scratch directory
@@ -77,11 +84,16 @@ Heartbeat at meaningful stage boundaries and at least every fifteen minutes
 during long work:
 
 ```console
-agent-work --json heartbeat TASK_ID
-agent-work --json heartbeat TASK_ID --status waiting
+agent-work --json heartbeat TASK_ID --agent AGENT_NAME \
+  --note "focused checks passed; starting integration"
+agent-work --json heartbeat --task TASK_ID --agent AGENT_NAME --status waiting \
+  --note "waiting for the parent integration pass"
 ```
 
-Read `seconds_remaining` each time. As the deadline approaches, stop expanding
+The positional task ID and `--task TASK_ID` forms are equivalent. Heartbeats
+retain their actor and note in task history; use `agent-work --json history TASK_ID`
+when a resumed session needs the stage sequence. Read
+`seconds_remaining` each time. As the deadline approaches, stop expanding
 scope, preserve usable partial results, run the most consequential available
 checks, and prepare a handoff. A timebox is not permission to mark incomplete
 work complete or to discard another agent's changes.
@@ -97,6 +109,7 @@ Finish only when work has reached a genuine terminal state:
 
 ```console
 agent-work --json finish TASK_ID --status complete \
+  --agent AGENT_NAME \
   --summary "specific outcome" \
   --changed path/to/file \
   --check "exact command and result"
