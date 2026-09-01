@@ -37,6 +37,12 @@ this order:
 4. Batch I/O, calls, transfers, and synchronisation.
 5. Reduce individual instruction cost only after the larger costs are controlled.
 
+Name the resource the change should reduce before choosing evidence. Equivalent
+work with materially fewer allocated or copied bytes, a smaller resident
+footprint, less I/O, or fewer transfers is a performance win even if retired
+instructions barely move. Use instructions for executed CPU work, not as a veto
+over a directly measured resource reduction.
+
 Read [references/patterns.md](references/patterns.md) when choosing or reviewing
 an implementation strategy for this deeper work. Apply only the patterns
 supported by the workload and language runtime; do not remove useful
@@ -44,5 +50,6 @@ abstraction or add caches by habit.
 
 Preserve observable behaviour with focused tests. Use `perf-diagnosis` when the
 cost location is uncertain. Use `benchmark` for before-and-after, regression,
-complexity, throughput, latency, or other performance claims. Code inspection
-can motivate a hypothesis but cannot establish an improvement.
+complexity, throughput, latency, footprint, allocation, data-movement, or other
+performance claims. Code inspection can motivate a hypothesis but cannot
+establish an improvement.

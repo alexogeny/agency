@@ -86,6 +86,12 @@ Claude Code, and Pi.
 - Apply performance patterns only when workload and constraints justify them.
   Guard clauses and deterministic ordering are not improvements by themselves;
   preserve useful abstraction outside demonstrated hot paths.
+- Treat performance as a vector of resource costs, not an instruction-count
+  contest. With equivalent behaviour, materially lower allocation count or
+  bytes, copied or transferred bytes, peak or steady RSS/PSS, I/O, or
+  synchronisation is a real win even when retired instructions are flat. Match
+  each claim to a direct metric; report absolute and relative deltas plus
+  material regressions, and do not infer an unmeasured downstream benefit.
 - Never claim a performance improvement from inspection or one run. Diagnose
   uncertainty and retain repeated, equivalent before/after evidence.
 - Start from zero comments and docstrings. Make code carry its own meaning.

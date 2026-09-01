@@ -22,10 +22,12 @@ profiling. Verify that the command reaches the suspected path and that selected
 events are supported; an unsupported or multiplexed event is a limitation, not
 a zero.
 
-Counters, samples, cycles, cache events, and profiles help locate work. They do
-not prove a speed, energy, throughput, or optimisation claim. Use the
-`benchmark` skill and `instruction-bench` for such comparisons, with equivalent
-output and repeated interleaved retired-instruction samples.
+Counters and profiles from a single diagnostic run help locate work; they do
+not establish an improvement. Use the `benchmark` skill and `resource-bench`
+for repeated, interleaved comparisons with equivalent output. Choose the
+claim-bearing metric from the resource at issue: instructions for executed CPU
+work, RSS/PSS for resident footprint, or an instrumented direct metric for
+allocation, copying, I/O, transfers, latency, or throughput.
 
 Report the command, CPU, events, unsupported counters, profile or JSON path,
 hot symbols or hypotheses, and the next discriminating check.

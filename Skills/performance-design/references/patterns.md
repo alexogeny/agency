@@ -47,3 +47,6 @@ decision aid, not a checklist that every implementation must satisfy.
   when they fit the data model; do not trade obvious behaviour for cleverness.
 - A smaller instruction count means less executed work. It does not by itself
   prove lower latency, energy use, or monetary cost.
+- Flat instructions do not invalidate a directly measured reduction in
+  allocation traffic, copied bytes, resident footprint, I/O, or transfers.
+  Claim the resource actually measured and report important trade-offs.
