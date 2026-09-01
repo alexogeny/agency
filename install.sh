@@ -70,6 +70,7 @@ mkdir -p \
   "$HOME/.claude/agents" \
   "$HOME/.pi/agent"
 mkdir -p "$HOME/.local/bin"
+agency_link "$AGENCY_DIR/Tools/agency-ui" "$HOME/.local/bin/agency-ui"
 agency_link "$AGENCY_DIR/Tools/git-get" "$HOME/.local/bin/git-get"
 agency_link "$AGENCY_DIR/Tools/long-processes" "$HOME/.local/bin/long-processes"
 agency_link "$AGENCY_DIR/Tools/sandbox" "$HOME/.local/bin/sandbox"

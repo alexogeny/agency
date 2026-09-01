@@ -35,11 +35,27 @@ if status is-interactive
         and cd "$destination"
     end
 
+    function __agency_present --argument-names mode label success failure
+        set --local options --indent 2 --label "$label" --success "$success" --failure "$failure"
+        if test "$mode" = capture
+            set --append options --capture
+        end
+        agency-ui run $options -- $argv[5..]
+    end
+
     function gpl --description 'Safely fast-forward a repository'
         if test (count $argv) -eq 0
+            set --local repository_root (git rev-parse --show-toplevel 2>/dev/null)
+            or begin
+                agency-ui status error "This directory is not a Git repository"
+                return 1
+            end
+            set --local repository (path basename "$repository_root")
+            agency-ui status phase "Updating $repository"
+
             set --local branch (git symbolic-ref --quiet --short HEAD)
             if test -z "$branch"
-                git pull --ff-only
+                __agency_present passthrough "Refreshing detached checkout" "Checkout is current" "Could not update checkout" git pull --quiet --ff-only
                 return
             end
 
@@ -48,7 +64,7 @@ if status is-interactive
             set --local tracking_missing false
 
             if test "$remote" = .
-                git pull --ff-only
+                __agency_present capture "Fast-forwarding $branch" "$branch is current" "Could not update $branch" git pull --quiet --ff-only
                 return
             end
 
@@ -60,7 +76,7 @@ if status is-interactive
                 else if test (count $remotes) -eq 1
                     set remote $remotes[1]
                 else
-                    git pull --ff-only
+                    __agency_present passthrough "Refreshing $branch" "$branch is current" "Could not update $branch" git pull --quiet --ff-only
                     return
                 end
             end
@@ -70,7 +86,13 @@ if status is-interactive
                 set merge_ref "refs/heads/$branch"
             end
 
-            git fetch --prune "$remote"
+            set --local fetch_mode capture
+            set --local remote_url (git remote get-url "$remote")
+            if string match --quiet --regex '^(ssh://|[^/]+@[^:]+:)' "$remote_url"
+                set fetch_mode passthrough
+                agency-ui status note "Using interactive SSH authentication" --indent 2
+            end
+            __agency_present "$fetch_mode" "Fetching $remote" "$remote is refreshed" "Could not fetch $remote" git fetch --quiet --prune "$remote"
             or return
 
             set --local upstream_branch (string replace -- 'refs/heads/' '' "$merge_ref")
@@ -93,7 +115,7 @@ if status is-interactive
                 end
 
                 if test -z "$default_ref"
-                    printf "Upstream '%s/%s' was deleted, but the remote's default branch could not be found.\n" "$remote" "$upstream_branch" >&2
+                    agency-ui status error "Upstream $remote/$upstream_branch was deleted and no default branch was found"
                     return 1
                 end
 
@@ -101,7 +123,7 @@ if status is-interactive
                 set --local local_default_ref "refs/heads/$default_branch"
                 if git show-ref --verify --quiet "$local_default_ref"
                     if not git merge-base --is-ancestor "$local_default_ref" "$default_ref"
-                        printf "Local branch '%s' has diverged from '%s/%s'; refusing to switch.\n" "$default_branch" "$remote" "$default_branch" >&2
+                        agency-ui status error "Local $default_branch diverged from $remote/$default_branch; refusing to switch"
                         return 1
                     end
 
@@ -113,23 +135,32 @@ if status is-interactive
                     or return
                 end
 
-                if test "$tracking_missing" = true
-                    printf "Remote branch '%s/%s' does not exist; switching to '%s'.\n" "$remote" "$upstream_branch" "$default_branch"
-                else
-                    printf "Upstream '%s/%s' was deleted; switching to '%s'.\n" "$remote" "$upstream_branch" "$default_branch"
-                end
-
                 if git show-ref --verify --quiet "$local_default_ref"
-                    git switch "$default_branch"
+                    __agency_present capture "Switching to $default_branch" "Now on $default_branch" "Could not switch to $default_branch" git switch --quiet "$default_branch"
                 else
-                    git switch --track "$remote/$default_branch"
+                    __agency_present capture "Creating $default_branch" "Now on $default_branch" "Could not create $default_branch" git switch --quiet --track "$remote/$default_branch"
                 end
                 or return
 
+                if test "$tracking_missing" = true
+                    agency-ui status note "Recovered missing remote branch $remote/$upstream_branch through $default_branch" --indent 2
+                else
+                    agency-ui status note "Recovered deleted upstream $remote/$upstream_branch through $default_branch" --indent 2
+                end
+
+                set branch "$default_branch"
                 set upstream_ref "$default_ref"
             end
 
-            git merge --ff-only "$upstream_ref"
+            set --local head_oid (git rev-parse HEAD)
+            or return
+            set --local target_oid (git rev-parse "$upstream_ref")
+            or return
+            set --local success "$branch is already current"
+            if test "$head_oid" != "$target_oid"
+                set success "$branch "(string sub --length 7 "$head_oid")" → "(string sub --length 7 "$target_oid")
+            end
+            __agency_present capture "Fast-forwarding $branch" "$success" "Could not update $branch" git merge --quiet --ff-only "$upstream_ref"
         else
             set --local destination (git-get $argv)
             and cd "$destination"

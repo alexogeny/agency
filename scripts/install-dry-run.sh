@@ -108,6 +108,7 @@ agency_plan_git() {
 agency_plan_user_links() {
   local tool skill_dir skill_name
   local -a tools=(
+    agency-ui
     git-get
     long-processes
     sandbox

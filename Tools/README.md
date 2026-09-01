@@ -4,13 +4,27 @@ Reusable, machine-agnostic utilities graduate here from `~/Scratch` once they
 are useful beyond a single task. Each tool should be documented and independently
 runnable; transient experiments stay out of this directory.
 
+## `agency-ui`
+
+Renders phased terminal work with a soft pink-and-purple palette and a bounded
+spinner that settles into one final result line. `agency-ui run --capture`
+stores child output in temporary files, discards it on success, and replays it
+on failure while preserving the command's exit status. Plain passthrough mode
+keeps prompts and confirmations interactive.
+
+Human TTYs receive animation. Redirected output, CI, and `TERM=dumb` remain
+static; `AGENCY_UI=plain`, `AGENCY_UI=quiet`, `AGENCY_MOTION=reduce`, and
+`NO_COLOR` provide explicit accessibility and automation controls. Status and
+animation use stderr, leaving child stdout available for data and composition.
+
 ## `git-get`
 
 Accepts GitHub `owner/repository` shorthand or a complete Git URL. It clones
 into `${CODE_ROOT:-~/Code}/repository`, or runs a safe fast-forward-only pull
 when the matching checkout already exists. Fish exposes it as `gcl`; `gpl`
 pulls the current checkout when called without an argument and otherwise has
-the same locate-or-clone behaviour.
+the same locate-or-clone behaviour. Both paths use `agency-ui` to collapse Git
+transport chatter into named fetch, recovery, switch, and fast-forward phases.
 
 ## `long-processes`
 
