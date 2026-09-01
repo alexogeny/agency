@@ -43,6 +43,14 @@ if status is-interactive
         agency-ui run $options -- $argv[5..]
     end
 
+    function __agency_remote_identity --argument-names value
+        set value (string replace --regex -- '\.git/?$' '' "$value")
+        set value (string replace --regex -- '^[[:alpha:]][[:alnum:]+.-]*://' '' "$value")
+        set value (string replace --regex -- '^[^/@]+@' '' "$value")
+        set value (string replace --regex -- '^([^/:]+):' '$1/' "$value")
+        string lower -- "$value"
+    end
+
     function gpl --description 'Safely fast-forward a repository'
         if test (count $argv) -eq 0
             set --local repository_root (git rev-parse --show-toplevel 2>/dev/null)
@@ -62,6 +70,24 @@ if status is-interactive
             set --local remote (git config --get "branch.$branch.remote")
             set --local merge_ref (git config --get "branch.$branch.merge")
             set --local tracking_missing false
+            set --local remotes (git remote)
+
+            if test -n "$remote"; and test "$remote" != .; and not contains -- "$remote" $remotes
+                set --local requested_remote "$remote"
+                set --local requested_identity (__agency_remote_identity "$requested_remote")
+                for candidate in $remotes
+                    set --local candidate_url (git config --get "remote.$candidate.url")
+                    if test (__agency_remote_identity "$candidate_url") = "$requested_identity"
+                        set remote "$candidate"
+                        break
+                    end
+                end
+
+                if not contains -- "$remote" $remotes
+                    agency-ui status error "Tracking URL $requested_remote does not match a configured Git remote"
+                    return 1
+                end
+            end
 
             if test "$remote" = .
                 __agency_present capture "Fast-forwarding $branch" "$branch is current" "Could not update $branch" git pull --quiet --ff-only
@@ -70,7 +96,6 @@ if status is-interactive
 
             if test -z "$remote"
                 set tracking_missing true
-                set --local remotes (git remote)
                 if contains -- origin $remotes
                     set remote origin
                 else if test (count $remotes) -eq 1
