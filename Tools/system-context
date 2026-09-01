@@ -3,11 +3,16 @@
 import argparse
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 
 LAPTOP_CHASSIS_TYPES = {8, 9, 10, 11, 14, 30, 31, 32}
 AC_SUPPLY_TYPES = {"Mains", "USB", "USB_C", "Wireless"}
+ACCELERATOR_CACHE_VERSION = 1
+COMMAND_TIMEOUT_SECONDS = 1
 
 
 def read_text(path):
@@ -63,6 +68,8 @@ def power_source(device, supplies):
         return "ac"
     if device == "laptop" and battery_statuses:
         return "battery"
+    if device == "desktop":
+        return "ac"
     return "unknown"
 
 
@@ -104,9 +111,157 @@ def memory_gib(procfs):
     return None
 
 
-def accelerator(dev_root):
-    if (dev_root / "nvidia0").exists():
-        return "nvidia-device (runtime unverified)"
+def cache_root():
+    override = os.environ.get("AGENCY_CACHE_ROOT")
+    if override:
+        return Path(override)
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        return Path(xdg_cache) / "agency"
+    return Path.home() / ".cache/agency"
+
+
+def file_signature(path):
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except (FileNotFoundError, OSError):
+        return None
+    return {
+        "path": str(path),
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "mode": stat.st_mode,
+        "rdev": stat.st_rdev,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def executable(name):
+    path = shutil.which(name)
+    return Path(path) if path else None
+
+
+def command_output(command):
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    output = completed.stdout.strip()
+    return output or None
+
+
+def nvidia_runtime(nvidia_smi, nvidia_settings):
+    if nvidia_smi is None:
+        return None
+    output = command_output(
+        [
+            str(nvidia_smi),
+            "--id=0",
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    if output is None:
+        return None
+    fields = output.splitlines()[0].rsplit(",", 1)
+    if len(fields) != 2 or not fields[0].strip():
+        return None
+    name, memory_mib = (field.strip() for field in fields)
+    details = []
+    try:
+        memory_gib = round(int(memory_mib) / 1024)
+        if memory_gib > 0:
+            details.append(f"{memory_gib} GiB VRAM")
+    except ValueError:
+        pass
+    if nvidia_settings is not None:
+        cores_output = command_output(
+            [str(nvidia_settings), "-q", "[gpu:0]/CUDACores", "-t"]
+        )
+        try:
+            cuda_cores = int((cores_output or "").splitlines()[0])
+            if cuda_cores > 0:
+                details.append(f"{cuda_cores:,} CUDA cores")
+        except (IndexError, ValueError):
+            pass
+    if not details:
+        return name
+    return f"{name} ({', '.join(details)})"
+
+
+def read_accelerator_cache(path, fingerprint):
+    try:
+        payload = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    value = payload.get("value")
+    if payload.get("fingerprint") != fingerprint or not isinstance(value, str):
+        return None
+    return value
+
+
+def write_accelerator_cache(path, fingerprint, value):
+    temporary = None
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(
+                {"fingerprint": fingerprint, "value": value},
+                output,
+                sort_keys=True,
+            )
+            output.write("\n")
+        os.replace(temporary, path)
+        temporary = None
+    except OSError:
+        pass
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+
+
+def accelerator(dev_root, refresh=False):
+    nvidia_device = dev_root / "nvidia0"
+    if nvidia_device.exists():
+        nvidia_smi = executable("nvidia-smi")
+        nvidia_settings = executable("nvidia-settings")
+        fingerprint = {
+            "version": ACCELERATOR_CACHE_VERSION,
+            "device": file_signature(nvidia_device),
+            "nvidia_smi": file_signature(nvidia_smi),
+            "nvidia_settings": file_signature(nvidia_settings),
+        }
+        cache_path = cache_root() / "system-context-accelerator.json"
+        if not refresh:
+            cached = read_accelerator_cache(cache_path, fingerprint)
+            if cached is not None:
+                return cached
+        runtime = nvidia_runtime(nvidia_smi, nvidia_settings)
+        if runtime is None:
+            return "nvidia-device (runtime unverified)"
+        write_accelerator_cache(cache_path, fingerprint, runtime)
+        return runtime
     if (dev_root / "kfd").exists():
         return "amd-kfd-device (runtime unverified)"
     return "none-detected"
@@ -139,7 +294,7 @@ def resource_policy(device, power):
     )
 
 
-def collect_context():
+def collect_context(refresh=False):
     sysfs = Path(os.environ.get("AGENCY_SYSFS_ROOT", "/sys"))
     procfs = Path(os.environ.get("AGENCY_PROCFS_ROOT", "/proc"))
     dev_root = Path(os.environ.get("AGENCY_DEV_ROOT", "/dev"))
@@ -152,7 +307,7 @@ def collect_context():
         "battery_percent": battery_percent(supplies),
         "logical_cpus": logical_cpus(),
         "memory_gib": memory_gib(procfs),
-        "compute_accelerator": accelerator(dev_root),
+        "compute_accelerator": accelerator(dev_root, refresh=refresh),
         "resource_policy": resource_policy(device, power),
     }
 
@@ -178,8 +333,13 @@ def main():
         description="Report local hardware and power constraints to coding agents."
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="refresh cached accelerator details",
+    )
     arguments = parser.parse_args()
-    context = collect_context()
+    context = collect_context(refresh=arguments.refresh)
     if arguments.json:
         print(json.dumps(context, sort_keys=True))
     else:

@@ -205,6 +205,63 @@ For paid remote CPU or GPU work, [`gantry`](Skills/gantry/SKILL.md) carries an
 approved workload through budgeted launch, supervision, result collection, and
 confirmed release.
 
+### Turn the live web into durable evidence
+
+[`web-research`](Skills/web-research/SKILL.md) is Agency's local research
+system for the parts of the web that ordinary HTTP clients cannot reliably
+read. It starts with the cheapest useful path, escalates to the installed
+Firefox only when rendering or first-party browser state matters, and keeps the
+result inspectable on the workstation.
+
+```text
+focused query → direct retrieval → rendered Firefox → bounded human handoff
+                    ↓                    ↓                       ↓
+             typed HTTP facts       extracted evidence       resumed named profile
+                    └── append-only checkpoints + local full-text index ──┘
+```
+
+```console
+web-research search "QUERY" --json --profile TASK
+web-research search "QUERY" --domain example.org --json
+web-research retrieve URL... --json
+web-research scrape URL --format json --capture --index --profile TASK
+web-research replay CAPTURE_ID --json
+web-research local "SEARCH TERMS" --json
+```
+
+Direct retrieval records redirects, status, content type, byte count, digest,
+retrieval time, and a typed failure for each URL. Browser work adds adaptive
+page settling, bounded scrolling and interaction, main-content extraction,
+optional frame or same-origin JSON evidence, snapshots, link maps, and scoped
+crawls. Resolved URLs and discovered links are sanitized before they reach
+output or the SQLite full-text index.
+
+Larger searches use resumable, append-only NDJSON checkpoints and persistent
+provider and origin health sidecars. They reuse one browser, pace requests
+deterministically, round-robin page origins, and honour challenges, rate limits,
+and bounded `Retry-After` signals across restarts. Crawls remain same-origin,
+single-worker, robots-aware, and bounded by depth, page count, queue size, and
+per-page admission limits.
+
+Opt-in captures store sanitized extraction inputs as deduplicated,
+content-addressed objects. Offline replay verifies their schemas and hashes,
+then reruns fusion without Firefox or network access. JSON fields carry
+provenance, while named quality observations explain weak, conflicting, or
+truncated evidence without hiding it behind a scalar score.
+
+Strict search options prevent misspelled flags from becoming query text, and
+explicit domain filters keep scoped corpora on the intended destination hosts.
+
+Persistent named profiles retain ordinary first-party state for a research
+task without exporting cookies or credentials. Automated work stays headless.
+When a site genuinely needs a login or human challenge, the tool reports that
+boundary; an explicit `browser` session lets the user complete it and then
+hands the same named profile back to the research workflow. It never treats a
+CAPTCHA as something to defeat unattended.
+
+The [web-research resilience record](Workshops/web-research-resilience.md)
+documents what shipped and which scale or live-testing ideas are WONTDO.
+
 ### Finish reports as inspected documents
 
 Report prose and report production remain separate responsibilities:
@@ -255,10 +312,6 @@ sees it, without borrowing a warm cache or a conveniently configured home.
 
 ## Supporting cast
 
-- `web-research` uses a persistent local Firefox profile for JavaScript-heavy
-  or authenticated pages while leaving human challenges to a human. The
-  [resilient web-research workshop](Workshops/web-research-next-steps.md)
-  orders the next scale, recovery, and evidence-quality improvements.
 - `sudo-gui` carries one approved root operation through one KDE password
   dialog and one authentication attempt without capturing the password.
 - `comment-audit` finds empty, decorative, and historical comments without

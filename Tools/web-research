@@ -73,6 +73,22 @@ type NetworkEvidence = {
   mimeType: string;
   body: unknown;
 };
+type EvidenceReference = {
+  source:
+    | "rendered-dom"
+    | "page-metadata"
+    | "json-ld"
+    | "frame"
+    | "network-json"
+    | "search-result";
+  capture: string;
+};
+type QualityObservation = {
+  code: string;
+  fields: string[];
+  observation: string;
+  recommendation?: string;
+};
 type Page = {
   title: string;
   url: string;
@@ -91,6 +107,14 @@ type Page = {
   actions?: PageAction[];
   scroll_targets?: string[];
   network?: NetworkEvidence[];
+  frames?: JsonObject[];
+  provenance?: Record<string, EvidenceReference[]>;
+  quality?: QualityObservation[];
+  capture_id?: string;
+  outcome?: "partial";
+  constraint?: "navigation-timeout";
+  failed_stage?: "navigation";
+  navigation_attempts?: number;
   truncated?: {
     text: boolean;
     markdown: boolean;
@@ -206,6 +230,20 @@ function takeNumber(
     fail(`${name} must be an integer from ${minimum} to ${maximum}`);
   }
   return value;
+}
+
+function takeLiteralArguments(args: string[]) {
+  const separator = args.indexOf("--");
+  if (separator < 0) return [];
+  return args.splice(separator).slice(1);
+}
+
+function rejectUnknownOptions(args: string[], command: string) {
+  const unknown = args.find((value) => value.startsWith("-"));
+  if (!unknown) return;
+  fail(
+    `unknown ${command} option: ${unknown}; use -- before intentional query text beginning with a hyphen`,
+  );
 }
 
 function checkedUrl(value: string) {
@@ -841,6 +879,7 @@ function releaseProfile(claimed: ReturnType<typeof claimProfile>) {
 
 class Bidi {
   socket: WebSocket;
+  capabilities: JsonObject = {};
   nextId = 0;
   pending = new Map<
     number,
@@ -885,7 +924,8 @@ class Bidi {
         { once: true },
       );
     });
-    await this.command("session.new", { capabilities: {} });
+    const session = await this.command("session.new", { capabilities: {} });
+    this.capabilities = session?.capabilities || {};
   }
 
   command(method: string, params: JsonObject, timeout = 90_000) {
@@ -979,11 +1019,13 @@ type BrowserOptions = {
   waitMs: number;
   settleMs: number;
   navigationTimeoutMs: number;
+  navigationRetries: number;
   maxContentChars: number;
   maxLinks: number;
   scrollSteps: number;
   interactionSteps: number;
   captureNetworkJson: boolean;
+  capture: boolean;
 };
 
 const ordinaryBrowserPreload = String.raw`() => {
@@ -1133,6 +1175,54 @@ function sanitizedNetworkJson(value: unknown) {
     return result;
   };
   return visit(value, 0);
+}
+
+function boundedRetryAfter(value: unknown, now = Date.now()) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const seconds = /^\d+$/.test(text)
+    ? Number(text)
+    : (Date.parse(text) - now) / 1000;
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.max(1, Math.min(24 * 60 * 60, Math.ceil(seconds)));
+}
+
+async function startNavigationHealth(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  targetUrl: string,
+) {
+  let targetOrigin = "";
+  try {
+    targetOrigin = new URL(targetUrl).origin;
+  } catch {}
+  let retryAfterSeconds: number | null = null;
+  try {
+    await browser.bidi.subscribe("network.responseCompleted", browser.context);
+  } catch {
+    return { snapshot: () => ({ retryAfterSeconds: null }), close: () => {} };
+  }
+  const stopListening = browser.bidi.on("network.responseCompleted", (params) => {
+    if (retryAfterSeconds !== null || params?.context !== browser.context) return;
+    const status = Number(params?.response?.status || 0);
+    const url = String(params?.request?.url || "");
+    if (status !== 429) return;
+    try {
+      if (new URL(url).origin !== targetOrigin) return;
+    } catch {
+      return;
+    }
+    for (const header of params?.response?.headers || []) {
+      if (String(header?.name || "").toLowerCase() !== "retry-after") continue;
+      retryAfterSeconds = boundedRetryAfter(
+        header?.value?.value ?? header?.value,
+      );
+      break;
+    }
+  });
+  return {
+    snapshot: () => ({ retryAfterSeconds }),
+    close: stopListening,
+  };
 }
 
 async function startNetworkCapture(
@@ -2033,6 +2123,386 @@ const scrollExpression = String.raw`(() => {
   return JSON.stringify({ target: 'document', moved: window.scrollY !== before })
 })()`;
 
+type PageCaptureInput = {
+  schema: "agency/web-capture-input/1";
+  requested_url: string;
+  options: {
+    max_content_chars: number;
+    max_links: number;
+  };
+  captures: Page[];
+  access_states: PageAccessKind[];
+  actions: PageAction[];
+  scroll_targets: string[];
+  network: NetworkEvidence[];
+  frames: JsonObject[];
+  navigation?: {
+    outcome: "timeout";
+    failed_stage: "navigation";
+    attempts: number;
+  };
+};
+
+const pageCaptures = new WeakMap<Page, PageCaptureInput>();
+
+function addEvidenceReference(
+  provenance: Record<string, EvidenceReference[]>,
+  field: string,
+  reference: EvidenceReference,
+) {
+  const references = provenance[field] || [];
+  if (
+    !references.some(
+      (candidate) =>
+        candidate.source === reference.source &&
+        candidate.capture === reference.capture,
+    )
+  ) {
+    references.push(reference);
+  }
+  provenance[field] = references;
+}
+
+const topicStopWords = new Set([
+  "about",
+  "after",
+  "before",
+  "from",
+  "into",
+  "page",
+  "requested",
+  "that",
+  "their",
+  "this",
+  "with",
+]);
+
+function topicTerms(value: string, maximumCharacters: number) {
+  const terms = value
+    .slice(0, maximumCharacters)
+    .toLocaleLowerCase()
+    .match(/[\p{L}\p{N}]{4,}/gu) || [];
+  return new Set(terms.filter((term) => !topicStopWords.has(term)));
+}
+
+function fusePageCapture(input: PageCaptureInput, identity = "live") {
+  const maxContentChars = input.options.max_content_chars;
+  const maxLinks = input.options.max_links;
+  const mergeBlocks = (values: string[]) => {
+    const seen = new Set<string>();
+    const blocks: string[] = [];
+    let length = 0;
+    let wasTruncated = false;
+    let duplicates = 0;
+    for (const value of values) {
+      for (const rawBlock of value.split(/\n{2,}/)) {
+        const block = rawBlock.trim();
+        if (!block) continue;
+        const key = block.replace(/\s+/g, " ");
+        if (seen.has(key)) {
+          duplicates += 1;
+          continue;
+        }
+        seen.add(key);
+        const separator = blocks.length ? "\n\n" : "";
+        const remaining = maxContentChars - length - separator.length;
+        if (remaining <= 0) {
+          wasTruncated = true;
+          continue;
+        }
+        const kept = block.slice(0, remaining);
+        blocks.push(kept);
+        length += separator.length + kept.length;
+        if (kept.length < block.length) wasTruncated = true;
+      }
+    }
+    return { value: blocks.join("\n\n"), wasTruncated, duplicates };
+  };
+  const textResult = mergeBlocks(input.captures.map((capture) => capture.text));
+  const markdownResult = mergeBlocks(
+    input.captures.map((capture) => cleanExtractedMarkdown(capture.markdown)),
+  );
+  const metadata: Record<string, string> = {};
+  const jsonLd: unknown[] = [];
+  const seenJsonLd = new Set<string>();
+  const sources = new Set<string>();
+  const provenance: Record<string, EvidenceReference[]> = {};
+  for (const [index, capture] of input.captures.entries()) {
+    const renderedReference: EvidenceReference = {
+      source: "rendered-dom",
+      capture: `${identity}:page:${index}`,
+    };
+    if (capture.text) addEvidenceReference(provenance, "text", renderedReference);
+    if (capture.markdown) {
+      addEvidenceReference(provenance, "markdown", renderedReference);
+    }
+    if (capture.links.length) {
+      addEvidenceReference(provenance, "links", renderedReference);
+    }
+    for (const source of capture.sources || []) sources.add(source);
+    for (const [name, value] of Object.entries(
+      capture.structured?.metadata || {},
+    )) {
+      if (!metadata[name] && value) metadata[name] = value;
+      if (value) {
+        addEvidenceReference(provenance, `structured.metadata.${name}`, {
+          source: "page-metadata",
+          capture: `${identity}:page:${index}`,
+        });
+      }
+    }
+    for (const value of capture.structured?.jsonLd || []) {
+      const key = JSON.stringify(value);
+      if (seenJsonLd.has(key)) continue;
+      seenJsonLd.add(key);
+      const retainedIndex = jsonLd.length;
+      jsonLd.push(value);
+      addEvidenceReference(provenance, `structured.jsonLd.${retainedIndex}`, {
+        source: "json-ld",
+        capture: `${identity}:page:${index}`,
+      });
+    }
+  }
+  const structured =
+    Object.keys(metadata).length || jsonLd.length
+      ? { metadata, jsonLd }
+      : undefined;
+  let text = textResult.value;
+  let markdown = markdownResult.value;
+  let textWasTruncated = textResult.wasTruncated;
+  let markdownWasTruncated = markdownResult.wasTruncated;
+  if (structured && text.length < 500) {
+    const evidence = [
+      ...Object.entries(structured.metadata).map(
+        ([name, value]) => `${name}: ${value}`,
+      ),
+      ...structured.jsonLd.map((value) => JSON.stringify(value)),
+    ].join("\n");
+    if (evidence) {
+      const fusedText = mergeBlocks([text, evidence]);
+      const fusedMarkdown = mergeBlocks([
+        markdown,
+        `## Structured page evidence\n\n${evidence}`,
+      ]);
+      text = fusedText.value;
+      markdown = fusedMarkdown.value;
+      textWasTruncated ||= fusedText.wasTruncated;
+      markdownWasTruncated ||= fusedMarkdown.wasTruncated;
+      for (const [field, references] of Object.entries(provenance)) {
+        if (!field.startsWith("structured.")) continue;
+        for (const reference of references) {
+          addEvidenceReference(provenance, "text", reference);
+          addEvidenceReference(provenance, "markdown", reference);
+        }
+      }
+    }
+  }
+  const finalIndex = input.captures.length - 1;
+  const finalPage = input.captures[finalIndex];
+  const finalReference: EvidenceReference = {
+    source: "rendered-dom",
+    capture: `${identity}:page:${finalIndex}`,
+  };
+  for (const field of [
+    "title",
+    "url",
+    "canonicalUrl",
+    "published",
+    "byline",
+    "html",
+  ]) {
+    if (String(finalPage[field as keyof Page] || "")) {
+      addEvidenceReference(provenance, field, finalReference);
+    }
+  }
+  const url = redactedOutputUrl(finalPage.url);
+  const canonicalUrl = redactedOutputUrl(finalPage.canonicalUrl) || url;
+  const html = finalPage.html.slice(0, maxContentChars);
+  const uniqueLinkSet = new Set<string>();
+  for (const capture of input.captures) {
+    for (const link of capture.links) {
+      const redacted = redactedOutputUrl(link);
+      if (redacted) uniqueLinkSet.add(redacted);
+    }
+  }
+  const uniqueLinks = [...uniqueLinkSet];
+  const links = uniqueLinks.slice(0, maxLinks);
+  const accessState: PageAccessState = input.access_states.includes(
+    "soft-challenge",
+  )
+    ? "soft-challenge"
+    : input.access_states.includes("soft-login")
+      ? "soft-login"
+      : "public";
+  const state =
+    accessState !== "public"
+      ? "soft-gated-content"
+      : text || markdown
+        ? "public-content"
+        : "structured-only";
+  const truncated = {
+    text:
+      textWasTruncated ||
+      input.captures.some((capture) => capture.truncated?.text),
+    markdown:
+      markdownWasTruncated ||
+      input.captures.some((capture) => capture.truncated?.markdown),
+    html:
+      input.captures.some((capture) => capture.truncated?.html) ||
+      finalPage.html.length > maxContentChars,
+    links:
+      input.captures.some((capture) => capture.truncated?.links) ||
+      uniqueLinks.length > maxLinks,
+  };
+  const page: Page = {
+    ...finalPage,
+    url,
+    canonicalUrl,
+    text,
+    markdown,
+    html,
+    links,
+    ...(structured ? { structured } : {}),
+    sources: [...sources],
+    access: { state: accessState },
+    state,
+    captures: input.captures.length,
+    actions: input.actions,
+    scroll_targets: input.scroll_targets,
+    truncated,
+    provenance,
+    quality: [],
+  };
+  attachNetworkEvidence(page, input.network, {
+    maxContentChars,
+  });
+  for (const [index] of input.network.entries()) {
+    const reference: EvidenceReference = {
+      source: "network-json",
+      capture: `${identity}:network:${index}`,
+    };
+    addEvidenceReference(provenance, `network.${index}`, reference);
+    if (page.text.includes(JSON.stringify(input.network[index].body))) {
+      addEvidenceReference(provenance, "text", reference);
+      addEvidenceReference(provenance, "markdown", reference);
+    }
+  }
+  if (input.frames.length) {
+    page.frames = input.frames.map((frame, index) => {
+      if (frame.status !== "extracted") return frame;
+      const reference: EvidenceReference = {
+        source: "frame",
+        capture: `${identity}:frame:${index}`,
+      };
+      return {
+        ...frame,
+        provenance: {
+          ...(frame.title ? { title: [reference] } : {}),
+          ...(frame.text ? { text: [reference] } : {}),
+        },
+      };
+    });
+  }
+  const duplicateBlocks = Math.max(
+    textResult.duplicates,
+    markdownResult.duplicates,
+  );
+  if (duplicateBlocks) {
+    page.quality!.push({
+      code: "repeated-blocks",
+      fields: ["text", "markdown"],
+      observation: `${duplicateBlocks} repeated content block${duplicateBlocks === 1 ? " was" : "s were"} removed during fusion`,
+    });
+  }
+  const titleCandidates = [metadata["og:title"], metadata["twitter:title"]]
+    .filter(Boolean)
+    .filter(
+      (candidate) =>
+        candidate.trim().toLocaleLowerCase() !==
+        finalPage.title.trim().toLocaleLowerCase(),
+    );
+  if (finalPage.title && titleCandidates.length) {
+    page.quality!.push({
+      code: "title-disagreement",
+      fields: ["title", "structured.metadata.og:title"],
+      observation: "Rendered and structured title fields disagree",
+    });
+  }
+  const renderedText = textResult.value.trim();
+  if (renderedText.length < 400) {
+    page.quality!.push({
+      code: "thin-content",
+      fields: ["text", "markdown"],
+      observation: `Only ${renderedText.length} rendered main-text characters were retained`,
+      recommendation:
+        "Inspect linked content pages or retry with bounded --interaction-steps and --capture-network-json",
+    });
+  }
+  const topicTitleField = metadata["og:title"]
+    ? "structured.metadata.og:title"
+    : metadata["twitter:title"]
+      ? "structured.metadata.twitter:title"
+      : "title";
+  const topicTitle =
+    metadata["og:title"] || metadata["twitter:title"] || finalPage.title;
+  const titleTerms = topicTerms(topicTitle, 500);
+  const bodyTerms = topicTerms(renderedText, 20_000);
+  const sharedTitleTerms = [...titleTerms].filter((term) => bodyTerms.has(term));
+  if (
+    renderedText.length >= 80 &&
+    titleTerms.size >= 2 &&
+    sharedTitleTerms.length / titleTerms.size < 0.25
+  ) {
+    page.quality!.push({
+      code: "title-body-mismatch",
+      fields: [topicTitleField, "text", "markdown"],
+      observation:
+        "The retained main text has little topic overlap with the rendered page title",
+      recommendation:
+        "Inspect linked content pages or retry with bounded --interaction-steps and --capture-network-json",
+    });
+  }
+  if (state === "structured-only") {
+    page.quality!.push({
+      code: "weak-structured-only",
+      fields: ["text", "structured"],
+      observation: "The page retained structured evidence without rendered main content",
+    });
+  }
+  if (links.length >= 20 && text.length < links.length * 80) {
+    page.quality!.push({
+      code: "link-heavy-content",
+      fields: ["text", "links"],
+      observation: `${links.length} links were retained with ${text.length} text characters`,
+    });
+  }
+  const truncatedFields = Object.entries(truncated)
+    .filter(([, value]) => value)
+    .map(([field]) => field);
+  if (truncatedFields.length) {
+    page.quality!.push({
+      code: "truncated-fields",
+      fields: truncatedFields,
+      observation: `Configured bounds truncated: ${truncatedFields.join(", ")}`,
+    });
+  }
+  if (input.navigation?.outcome === "timeout") {
+    page.outcome = "partial";
+    page.constraint = "navigation-timeout";
+    page.failed_stage = input.navigation.failed_stage;
+    page.navigation_attempts = input.navigation.attempts;
+    page.quality!.push({
+      code: "navigation-timeout",
+      fields: ["text", "markdown", "network"],
+      observation:
+        "Navigation exceeded its deadline; retained evidence may represent an incompletely loaded page",
+      recommendation:
+        "Review the retained fields, increase --navigation-timeout-ms, or retry with --navigation-retries 1",
+    });
+  }
+  return page;
+}
+
 async function extractPage(
   browser: Awaited<ReturnType<typeof startBrowser>>,
   options: BrowserOptions,
@@ -2117,141 +2587,29 @@ async function extractPage(
       break;
     }
   }
-  const mergeBlocks = (values: string[]) => {
-    const seen = new Set<string>();
-    const blocks: string[] = [];
-    let length = 0;
-    let wasTruncated = false;
-    for (const value of values) {
-      for (const rawBlock of value.split(/\n{2,}/)) {
-        const block = rawBlock.trim();
-        if (!block) continue;
-        const key = block.replace(/\s+/g, " ");
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const separator = blocks.length ? "\n\n" : "";
-        const remaining = options.maxContentChars - length - separator.length;
-        if (remaining <= 0) {
-          wasTruncated = true;
-          continue;
-        }
-        const kept = block.slice(0, remaining);
-        blocks.push(kept);
-        length += separator.length + kept.length;
-        if (kept.length < block.length) wasTruncated = true;
-      }
-    }
-    return { value: blocks.join("\n\n"), wasTruncated };
-  };
-  const textResult = mergeBlocks(captures.map((capture) => capture.text));
-  const markdownResult = mergeBlocks(
-    captures.map((capture) => cleanExtractedMarkdown(capture.markdown)),
-  );
-  const metadata: Record<string, string> = {};
-  const jsonLd: unknown[] = [];
-  const seenJsonLd = new Set<string>();
-  const sources = new Set<string>();
-  for (const capture of captures) {
-    for (const source of capture.sources || []) sources.add(source);
-    for (const [name, value] of Object.entries(
-      capture.structured?.metadata || {},
-    )) {
-      if (!metadata[name] && value) metadata[name] = value;
-    }
-    for (const value of capture.structured?.jsonLd || []) {
-      const key = JSON.stringify(value);
-      if (seenJsonLd.has(key)) continue;
-      seenJsonLd.add(key);
-      jsonLd.push(value);
-    }
-  }
-  const structured =
-    Object.keys(metadata).length || jsonLd.length
-      ? { metadata, jsonLd }
-      : undefined;
-  let text = textResult.value;
-  let markdown = markdownResult.value;
-  let textWasTruncated = textResult.wasTruncated;
-  let markdownWasTruncated = markdownResult.wasTruncated;
-  if (structured && text.length < 500) {
-    const evidence = [
-      ...Object.entries(structured.metadata).map(
-        ([name, value]) => `${name}: ${value}`,
-      ),
-      ...structured.jsonLd.map((value) => JSON.stringify(value)),
-    ].join("\n");
-    if (evidence) {
-      const fusedText = mergeBlocks([text, evidence]);
-      const fusedMarkdown = mergeBlocks([
-        markdown,
-        `## Structured page evidence\n\n${evidence}`,
-      ]);
-      text = fusedText.value;
-      markdown = fusedMarkdown.value;
-      textWasTruncated ||= fusedText.wasTruncated;
-      markdownWasTruncated ||= fusedMarkdown.wasTruncated;
-    }
-  }
-  const finalPage = captures[captures.length - 1];
-  const url = redactedOutputUrl(finalPage.url);
-  const canonicalUrl = redactedOutputUrl(finalPage.canonicalUrl) || url;
-  const html = finalPage.html.slice(0, options.maxContentChars);
-  const uniqueLinkSet = new Set<string>();
-  for (const capture of captures) {
-    for (const link of capture.links) {
-      const redacted = redactedOutputUrl(link);
-      if (redacted) uniqueLinkSet.add(redacted);
-    }
-  }
-  const uniqueLinks = [...uniqueLinkSet];
-  const links = uniqueLinks.slice(0, options.maxLinks);
-  const accessState: PageAccessState = accessStates.includes("soft-challenge")
-    ? "soft-challenge"
-    : accessStates.includes("soft-login")
-      ? "soft-login"
-      : "public";
-  const state =
-    accessState !== "public"
-      ? "soft-gated-content"
-      : text || markdown
-        ? "public-content"
-        : "structured-only";
-  const truncated = {
-    text:
-      textWasTruncated || captures.some((capture) => capture.truncated?.text),
-    markdown:
-      markdownWasTruncated ||
-      captures.some((capture) => capture.truncated?.markdown),
-    html:
-      captures.some((capture) => capture.truncated?.html) ||
-      finalPage.html.length > options.maxContentChars,
-    links:
-      captures.some((capture) => capture.truncated?.links) ||
-      uniqueLinks.length > options.maxLinks,
-  };
-  return {
-    ...finalPage,
-    url,
-    canonicalUrl,
-    text,
-    markdown,
-    html,
-    links,
-    ...(structured ? { structured } : {}),
-    sources: [...sources],
-    access: { state: accessState },
-    state,
-    captures: captures.length,
+  const input: PageCaptureInput = {
+    schema: "agency/web-capture-input/1",
+    requested_url: redactedOutputUrl(captures[0].url),
+    options: {
+      max_content_chars: options.maxContentChars,
+      max_links: options.maxLinks,
+    },
+    captures,
+    access_states: accessStates,
     actions,
     scroll_targets: scrollTargets,
-    truncated,
+    network: [],
+    frames: [],
   };
+  const fused = fusePageCapture(input);
+  pageCaptures.set(fused, input);
+  return fused;
 }
 
 function attachNetworkEvidence(
   page: Page,
   evidence: NetworkEvidence[],
-  options: BrowserOptions,
+  options: { maxContentChars: number },
 ) {
   if (!evidence.length) return page;
   page.network = evidence;
@@ -2288,23 +2646,115 @@ async function navigateAndExtract(
   url: string,
   options: BrowserOptions,
 ) {
+  const navigationHealth = await startNavigationHealth(browser, url);
   const networkCapture = await startNetworkCapture(
     browser,
     url,
     options.captureNetworkJson,
   );
   let finished = false;
+  let navigationTimedOut = false;
+  let navigationAttempts = 0;
   try {
-    await browser.bidi.navigate(
-      browser.context,
-      url,
-      options.navigationTimeoutMs,
-    );
-    const page = await extractPage(browser, options);
+    for (let attempt = 0; attempt <= options.navigationRetries; attempt += 1) {
+      navigationAttempts += 1;
+      try {
+        await browser.bidi.navigate(
+          browser.context,
+          url,
+          options.navigationTimeoutMs,
+        );
+        navigationTimedOut = false;
+        break;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/(?:navigation|browsingContext\.navigate).*timed out/i.test(message)) {
+          throw error;
+        }
+        navigationTimedOut = true;
+        if (attempt < options.navigationRetries) {
+          info(
+            `navigation timed out; retrying (${attempt + 1}/${options.navigationRetries})`,
+          );
+        }
+      }
+    }
+    let page: Page;
+    try {
+      page = await extractPage(browser, options);
+    } catch (extractionError) {
+      if (!navigationTimedOut) throw extractionError;
+      const evidence = await networkCapture.finish();
+      finished = true;
+      if (!evidence.length) throw extractionError;
+      const sanitizedUrl = redactedOutputUrl(url);
+      const input: PageCaptureInput = {
+        schema: "agency/web-capture-input/1",
+        requested_url: sanitizedUrl,
+        options: {
+          max_content_chars: options.maxContentChars,
+          max_links: options.maxLinks,
+        },
+        captures: [
+          {
+            title: "",
+            url: sanitizedUrl,
+            canonicalUrl: sanitizedUrl,
+            published: "",
+            byline: "",
+            text: "",
+            markdown: "",
+            html: "",
+            links: [],
+            sources: [],
+            truncated: {
+              text: false,
+              markdown: false,
+              html: false,
+              links: false,
+            },
+          },
+        ],
+        access_states: [],
+        actions: [],
+        scroll_targets: [],
+        network: evidence,
+        frames: [],
+        navigation: {
+          outcome: "timeout",
+          failed_stage: "navigation",
+          attempts: navigationAttempts,
+        },
+      };
+      const fused = fusePageCapture(input);
+      pageCaptures.set(fused, input);
+      return fused;
+    }
     const evidence = await networkCapture.finish();
     finished = true;
-    return attachNetworkEvidence(page, evidence, options);
+    const input = pageCaptures.get(page);
+    if (!input) throw new Error("page capture state is unavailable");
+    input.network = evidence;
+    if (navigationTimedOut) {
+      input.navigation = {
+        outcome: "timeout",
+        failed_stage: "navigation",
+        attempts: navigationAttempts,
+      };
+    }
+    if (!evidence.length && !navigationTimedOut) return page;
+    const fused = fusePageCapture(input);
+    pageCaptures.set(fused, input);
+    return fused;
+  } catch (error) {
+    const { retryAfterSeconds } = navigationHealth.snapshot();
+    if (retryAfterSeconds !== null && error && typeof error === "object") {
+      (error as Error & { retryAfterSeconds?: number }).retryAfterSeconds =
+        retryAfterSeconds;
+    }
+    throw error;
   } finally {
+    navigationHealth.close();
     if (!finished) await networkCapture.close();
   }
 }
@@ -2396,6 +2846,197 @@ async function extractFrames(
   return frames;
 }
 
+type CaptureManifest = {
+  schema: "agency/web-capture-manifest/1";
+  id: string;
+  captured_at: string;
+  requested_url: string;
+  final_url: string;
+  firefox_version: string;
+  extraction_options: PageCaptureInput["options"];
+  object_sha256: string;
+  evidence_sources: string[];
+  truncation: Page["truncated"];
+};
+
+function captureDirectories() {
+  const root = join(dataRoot, "captures");
+  const objects = join(root, "objects");
+  const manifests = join(root, "manifests");
+  mkdirSync(objects, { recursive: true, mode: 0o700 });
+  mkdirSync(manifests, { recursive: true, mode: 0o700 });
+  return { root, objects, manifests };
+}
+
+function captureInputForStorage(input: PageCaptureInput): PageCaptureInput {
+  const sanitizeHtml = (value: string) =>
+    value.replace(/https?:\/\/[^\s"'<>]+/gi, (url) => redactedOutputUrl(url));
+  return {
+    ...input,
+    requested_url: redactedOutputUrl(input.requested_url),
+    captures: input.captures.map((capture) => ({
+      title: terminalText(capture.title),
+      url: redactedOutputUrl(capture.url),
+      canonicalUrl: redactedOutputUrl(capture.canonicalUrl),
+      published: terminalText(capture.published),
+      byline: terminalText(capture.byline),
+      text: terminalText(capture.text),
+      markdown: cleanExtractedMarkdown(capture.markdown),
+      html: sanitizeHtml(capture.html),
+      links: capture.links.map(redactedOutputUrl).filter(Boolean),
+      ...(capture.structured
+        ? {
+            structured: sanitizedNetworkJson(
+              capture.structured,
+            ) as StructuredEvidence,
+          }
+        : {}),
+      ...(capture.sources ? { sources: capture.sources } : {}),
+      ...(capture.truncated ? { truncated: capture.truncated } : {}),
+    })),
+    network: input.network.map((item) => ({
+      url: redactedOutputUrl(item.url),
+      status: item.status,
+      mimeType: terminalText(item.mimeType),
+      body: sanitizedNetworkJson(item.body),
+    })),
+    frames: input.frames.map((frame) => ({
+      status: terminalText(frame.status),
+      ...(frame.reason ? { reason: terminalText(frame.reason) } : {}),
+      origin: terminalText(frame.origin),
+      path: terminalText(frame.path),
+      ...(frame.title ? { title: terminalText(frame.title) } : {}),
+      ...(frame.text ? { text: terminalText(frame.text) } : {}),
+    })),
+  };
+}
+
+function storedCapture(
+  page: Page,
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  frames: JsonObject[] = [],
+) {
+  const input = pageCaptures.get(page);
+  if (!input) throw new Error("page capture state is unavailable");
+  input.frames = frames;
+  const storedInput = captureInputForStorage(input);
+  const serialized = `${JSON.stringify(storedInput)}\n`;
+  const objectSha256 = createHash("sha256").update(serialized).digest("hex");
+  const directories = captureDirectories();
+  const objectPath = join(directories.objects, `${objectSha256}.json`);
+  if (existsSync(objectPath)) {
+    const existing = readFileSync(objectPath);
+    if (createHash("sha256").update(existing).digest("hex") !== objectSha256) {
+      throw new Error(`capture object hash mismatch: ${objectSha256}`);
+    }
+  } else {
+    writeFileSync(objectPath, serialized, { flag: "wx", mode: 0o600 });
+  }
+  const capturedAt = new Date().toISOString();
+  const finalPage = storedInput.captures[storedInput.captures.length - 1];
+  const core = {
+    schema: "agency/web-capture-manifest/1" as const,
+    captured_at: capturedAt,
+    requested_url: storedInput.requested_url,
+    final_url: redactedOutputUrl(finalPage.url),
+    firefox_version: String(browser.bidi.capabilities.browserVersion || "unknown"),
+    extraction_options: storedInput.options,
+    object_sha256: objectSha256,
+    evidence_sources: [...new Set(page.sources || [])],
+    truncation: page.truncated,
+  };
+  let suffix = 0;
+  let id = "";
+  let manifestPath = "";
+  do {
+    id = createHash("sha256")
+      .update(`${JSON.stringify(core)}\n${suffix}`)
+      .digest("hex");
+    manifestPath = join(directories.manifests, `${id}.json`);
+    suffix += 1;
+  } while (existsSync(manifestPath));
+  const manifest: CaptureManifest = { ...core, id };
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  const fused = fusePageCapture(storedInput, objectSha256);
+  fused.capture_id = id;
+  pageCaptures.set(fused, storedInput);
+  return fused;
+}
+
+function checkedCaptureId(value: string) {
+  if (!/^[a-f0-9]{64}$/.test(value)) {
+    fail("capture ID must be a 64-character lowercase SHA-256 digest");
+  }
+  return value;
+}
+
+function loadedCapture(idValue: string) {
+  const id = checkedCaptureId(idValue);
+  const directories = captureDirectories();
+  const manifestPath = join(directories.manifests, `${id}.json`);
+  if (!existsSync(manifestPath)) fail(`capture manifest not found: ${id}`);
+  let manifest: any;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch {
+    fail(`capture manifest is invalid JSON: ${id}`);
+  }
+  if (manifest.schema !== "agency/web-capture-manifest/1") {
+    fail(`unsupported capture manifest schema: ${String(manifest.schema || "missing")}`);
+  }
+  if (
+    manifest.id !== id ||
+    typeof manifest.object_sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(manifest.object_sha256)
+  ) {
+    fail(`capture manifest is invalid: ${id}`);
+  }
+  const objectPath = join(
+    directories.objects,
+    `${manifest.object_sha256}.json`,
+  );
+  if (!existsSync(objectPath)) {
+    fail(`capture object is missing: ${manifest.object_sha256}`);
+  }
+  const serialized = readFileSync(objectPath);
+  const actualSha256 = createHash("sha256").update(serialized).digest("hex");
+  if (actualSha256 !== manifest.object_sha256) {
+    fail(`capture object hash mismatch: ${manifest.object_sha256}`);
+  }
+  let input: any;
+  try {
+    input = JSON.parse(serialized.toString("utf8"));
+  } catch {
+    fail(`capture object is invalid JSON: ${manifest.object_sha256}`);
+  }
+  if (input.schema !== "agency/web-capture-input/1") {
+    fail(`unsupported capture object schema: ${String(input.schema || "missing")}`);
+  }
+  if (
+    typeof input.requested_url !== "string" ||
+    !Array.isArray(input.captures) ||
+    !input.captures.length ||
+    !Array.isArray(input.access_states) ||
+    !Array.isArray(input.actions) ||
+    !Array.isArray(input.scroll_targets) ||
+    !Array.isArray(input.network) ||
+    !Array.isArray(input.frames) ||
+    !Number.isInteger(input.options?.max_content_chars) ||
+    !Number.isInteger(input.options?.max_links)
+  ) {
+    fail(`capture object is invalid: ${manifest.object_sha256}`);
+  }
+  const page = fusePageCapture(
+    input as PageCaptureInput,
+    manifest.object_sha256,
+  );
+  page.capture_id = id;
+  return { manifest: manifest as CaptureManifest, page };
+}
+
 function browserOptions(args: string[]): BrowserOptions {
   const visible = takeFlag(args, "--visible");
   const legacyHeadless = takeFlag(args, "--headless");
@@ -2417,6 +3058,7 @@ function browserOptions(args: string[]): BrowserOptions {
       1_000,
       180_000,
     ),
+    navigationRetries: takeNumber(args, "--navigation-retries", 0, 0, 2),
     maxContentChars: takeNumber(
       args,
       "--max-content-chars",
@@ -2428,6 +3070,47 @@ function browserOptions(args: string[]): BrowserOptions {
     scrollSteps: takeNumber(args, "--scroll-steps", 0, 0, 20),
     interactionSteps: takeNumber(args, "--interaction-steps", 0, 0, 10),
     captureNetworkJson: takeFlag(args, "--capture-network-json"),
+    capture: takeFlag(args, "--capture"),
+  };
+}
+
+function checkedDomain(value: string) {
+  const candidate = value.trim().toLowerCase().replace(/\.$/, "");
+  if (
+    !candidate ||
+    candidate.includes("://") ||
+    /[/?#@:*]/.test(candidate)
+  ) {
+    fail(`--domain requires a hostname without a scheme, port, path, or wildcard: ${value}`);
+  }
+  let hostname = "";
+  try {
+    hostname = new URL(`https://${candidate}`).hostname.toLowerCase();
+  } catch {
+    fail(`invalid --domain hostname: ${value}`);
+  }
+  if (hostname !== candidate) fail(`invalid --domain hostname: ${value}`);
+  return hostname;
+}
+
+function resultMatchesDomains(result: SearchResult, domains: string[]) {
+  if (!domains.length) return true;
+  try {
+    const hostname = new URL(result.url).hostname.toLowerCase().replace(/\.$/, "");
+    return domains.some(
+      (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function searchScope(query: string, domains: string[]) {
+  return {
+    domains,
+    site_qualifier: /(?:^|\s)site:\S+/i.test(query)
+      ? "best-effort"
+      : "not-present",
   };
 }
 
@@ -2505,14 +3188,15 @@ function searchExpression(engine: string, limit: number) {
 
 type SearchAttempt = {
   engine: string;
-  outcome: "challenged" | "empty" | "failed" | "searched";
+  outcome: "challenged" | "empty" | "failed" | "rate-limited" | "searched";
   message?: string;
+  duration_ms: number;
+  retry_after_seconds?: number;
 };
 
 type SearchProviderHealth = {
   failures: number;
   cooldownUntil: number;
-  disabled: boolean;
 };
 
 type SearchRunState = {
@@ -2520,8 +3204,21 @@ type SearchRunState = {
   preferred: string;
 };
 
-function newSearchRunState(): SearchRunState {
-  return { health: new Map(), preferred: "" };
+function newSearchRunState(checkpoint?: HealthCheckpoint): SearchRunState {
+  const health = new Map<string, SearchProviderHealth>();
+  if (checkpoint) {
+    for (const engine of ["duckduckgo", "brave", "bing"]) {
+      const event = checkpoint.latest("provider", engine);
+      if (!event) continue;
+      health.set(engine, {
+        failures: event.consecutive_failures,
+        cooldownUntil: event.cooldown_until
+          ? Date.parse(event.cooldown_until)
+          : 0,
+      });
+    }
+  }
+  return { health, preferred: "" };
 }
 
 function searchEngines(requested: string) {
@@ -2533,7 +3230,7 @@ function searchEngines(requested: string) {
 function orderedSearchEngines(
   requested: string,
   state: SearchRunState,
-  queryIndex: number,
+  now = Date.now(),
 ) {
   const engines = searchEngines(requested);
   if (state.preferred && engines.includes(state.preferred)) {
@@ -2542,31 +3239,31 @@ function orderedSearchEngines(
   }
   return engines.filter((engine) => {
     const health = state.health.get(engine);
-    return !health?.disabled && (!health || health.cooldownUntil <= queryIndex);
+    return !health || health.cooldownUntil <= now;
   });
 }
 
 function updateSearchHealth(
   state: SearchRunState,
   engine: string,
-  queryIndex: number,
   message: string,
 ) {
   const previous = state.health.get(engine) || {
     failures: 0,
     cooldownUntil: 0,
-    disabled: false,
   };
   const failures = previous.failures + 1;
   const challenged = message.includes("interactive challenge required");
+  const rateLimited = message.includes("origin rate limited");
   state.health.set(engine, {
     failures,
     cooldownUntil: challenged
-      ? Number.MAX_SAFE_INTEGER
-      : queryIndex + Math.min(16, 2 ** Math.min(failures, 4)),
-    disabled: challenged,
+      ? Date.now() + 24 * 60 * 60 * 1000
+      : rateLimited
+        ? Date.now() + 15 * 60 * 1000
+        : Date.now() + Math.min(60 * 60 * 1000, 60_000 * 2 ** Math.min(failures - 1, 6)),
   });
-  return challenged;
+  return challenged ? "challenged" : rateLimited ? "rate-limited" : "failed";
 }
 
 async function searchOne(
@@ -2575,14 +3272,20 @@ async function searchOne(
   query: string,
   requestedEngine: string,
   limit: number,
+  domains: string[],
   state: SearchRunState,
-  queryIndex: number,
+  recordAttempt?: (attempt: SearchAttempt) => void,
 ) {
-  const engines = orderedSearchEngines(requestedEngine, state, queryIndex);
+  const engines = orderedSearchEngines(requestedEngine, state);
   if (!engines.length) throw new Error("no healthy search provider remains");
   const attempts: SearchAttempt[] = [];
   let firstError = "";
   for (const [position, candidate] of engines.entries()) {
+    const attemptStarted = performance.now();
+    const navigationHealth = await startNavigationHealth(
+      browser,
+      searchUrl(candidate, query),
+    );
     try {
       await browser.bidi.navigate(
         browser.context,
@@ -2594,51 +3297,81 @@ async function searchOne(
         browser,
         finalCandidate ? options : { ...options, headless: true },
       );
-      const results = JSON.parse(
+      const discoveredResults = JSON.parse(
         String(
           await browser.bidi.evaluate(
             browser.context,
-            searchExpression(candidate, limit),
+            searchExpression(candidate, domains.length ? 50 : limit),
           ),
         ),
       ) as SearchResult[];
+      const results = discoveredResults
+        .filter((result) => resultMatchesDomains(result, domains))
+        .slice(0, limit);
       if (!results.length) {
-        attempts.push({ engine: candidate, outcome: "empty" });
+        const attempt = {
+          engine: candidate,
+          outcome: "empty",
+          duration_ms: Math.round((performance.now() - attemptStarted) * 1000) / 1000,
+        } satisfies SearchAttempt;
+        attempts.push(attempt);
+        recordAttempt?.(attempt);
         if (!finalCandidate) {
+          navigationHealth.close();
           info(
             `${candidate} returned no results; trying ${engines[position + 1]}`,
           );
           continue;
         }
       } else {
-        attempts.push({ engine: candidate, outcome: "searched" });
+        const attempt = {
+          engine: candidate,
+          outcome: "searched",
+          duration_ms: Math.round((performance.now() - attemptStarted) * 1000) / 1000,
+        } satisfies SearchAttempt;
+        attempts.push(attempt);
+        recordAttempt?.(attempt);
       }
       state.preferred = candidate;
       state.health.set(candidate, {
         failures: 0,
         cooldownUntil: 0,
-        disabled: false,
       });
+      navigationHealth.close();
       return { engine: candidate, results, attempts };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const challenged = updateSearchHealth(
+      const healthOutcome = updateSearchHealth(
         state,
         candidate,
-        queryIndex,
         message,
       );
-      attempts.push({
+      const { retryAfterSeconds } = navigationHealth.snapshot();
+      navigationHealth.close();
+      if (retryAfterSeconds !== null) {
+        const current = state.health.get(candidate);
+        state.health.set(candidate, {
+          failures: current?.failures || 1,
+          cooldownUntil: Date.now() + retryAfterSeconds * 1000,
+        });
+      }
+      const attempt = {
         engine: candidate,
-        outcome: challenged ? "challenged" : "failed",
+        outcome: healthOutcome,
         message,
-      });
+        duration_ms: Math.round((performance.now() - attemptStarted) * 1000) / 1000,
+        ...(retryAfterSeconds === null
+          ? {}
+          : { retry_after_seconds: retryAfterSeconds }),
+      } satisfies SearchAttempt;
+      attempts.push(attempt);
+      recordAttempt?.(attempt);
       if (position === engines.length - 1) {
         const details = firstError
           ? `${firstError}; ${candidate}: ${message}`
           : `${candidate}: ${message}`;
         if (
-          !orderedSearchEngines(requestedEngine, state, queryIndex + 1).length
+          !orderedSearchEngines(requestedEngine, state).length
         ) {
           throw new Error(`no healthy search provider remains (${details})`);
         }
@@ -2806,15 +3539,23 @@ function parseRobots(text: string) {
 }
 
 async function commandSearch(args: string[]) {
+  const literalQuery = takeLiteralArguments(args);
+  const explicitProfile = args.includes("--profile") || args.includes("--ephemeral-profile");
   const options = browserOptions(args);
   const requestedEngine = takeOption(args, "--engine", "auto");
   const limit = takeNumber(args, "--limit", 10, 1, 50);
   const json = takeFlag(args, "--json");
-  const query = args.join(" ").trim();
+  const domains = takeOptions(args, "--domain").map(checkedDomain);
+  rejectUnknownOptions(args, "search");
+  const query = [...args, ...literalQuery].join(" ").trim();
   if (!query) fail("search requires a query");
   if (query.length > 1000) fail("search query must be at most 1000 characters");
   if (!new Set(["auto", "duckduckgo", "brave", "bing"]).has(requestedEngine)) {
     fail("--engine must be auto, duckduckgo, brave, or bing");
+  }
+  if (!explicitProfile) {
+    options.profile = "search";
+    options.ephemeral = true;
   }
   const outcome = await withBrowser(options, async (browser) => {
     return searchOne(
@@ -2823,14 +3564,18 @@ async function commandSearch(args: string[]) {
       query,
       requestedEngine,
       limit,
+      domains,
       newSearchRunState(),
-      0,
     );
   });
   const { engine, results } = outcome;
+  const scope = searchScope(query, domains);
   if (json) {
-    console.log(JSON.stringify({ query, engine, results }, null, 2));
+    console.log(JSON.stringify({ query, engine, scope, results }, null, 2));
     return;
+  }
+  if (scope.site_qualifier === "best-effort" && !domains.length) {
+    info("site: query text is provider best-effort; use --domain HOSTNAME for strict filtering");
   }
   console.log(`${purple}◇ ${query}${reset}`);
   for (const [position, result] of results.entries()) {
@@ -2857,6 +3602,277 @@ function checkedBatchOutput(value: string, resume: boolean, command: string) {
     writeFileSync(output, "", { flag: "wx", mode: 0o600 });
   }
   return output;
+}
+
+type HealthScope = "provider" | "origin";
+type HealthOutcome =
+  | "success"
+  | "empty"
+  | "partial"
+  | "failed"
+  | "challenged"
+  | "login-required"
+  | "rate-limited";
+type HealthEvent = {
+  schema: "agency/web-health-event/1";
+  scope: HealthScope;
+  key: string;
+  outcome: HealthOutcome;
+  last_attempt_at: string;
+  consecutive_failures: number;
+  observed_latency_ms: number;
+  cooldown_until: string | null;
+  retry_after_seconds: number | null;
+  failed_stage?: "navigation";
+};
+
+class HealthCheckpoint {
+  path: string;
+  events = new Map<string, HealthEvent>();
+
+  constructor(path: string) {
+    this.path = path;
+  }
+
+  eventKey(scope: HealthScope, key: string) {
+    return `${scope}\n${key}`;
+  }
+
+  latest(scope: HealthScope, key: string) {
+    return this.events.get(this.eventKey(scope, key));
+  }
+
+  cooling(scope: HealthScope, key: string, now = Date.now()) {
+    const deadline = this.latest(scope, key)?.cooldown_until;
+    return Boolean(deadline && Date.parse(deadline) > now);
+  }
+
+  record(
+    scope: HealthScope,
+    key: string,
+    outcome: HealthOutcome,
+    observedLatencyMs: number,
+    retryAfterSeconds: number | null = null,
+    failedStage?: "navigation",
+  ) {
+    const previous = this.latest(scope, key);
+    const successful = outcome === "success" || outcome === "empty";
+    const consecutiveFailures = successful
+      ? 0
+      : (previous?.consecutive_failures || 0) + 1;
+    const boundedRetryAfter =
+      retryAfterSeconds === null
+        ? null
+        : Math.max(1, Math.min(24 * 60 * 60, Math.round(retryAfterSeconds)));
+    let cooldownMs = 0;
+    if (outcome === "rate-limited") {
+      cooldownMs = (boundedRetryAfter || 15 * 60) * 1000;
+    } else if (outcome === "challenged" || outcome === "login-required") {
+      cooldownMs = 24 * 60 * 60 * 1000;
+    } else if (!successful) {
+      cooldownMs = Math.min(
+        60 * 60 * 1000,
+        60_000 * 2 ** Math.min(consecutiveFailures - 1, 6),
+      );
+    }
+    const attemptedAt = new Date();
+    const event: HealthEvent = {
+      schema: "agency/web-health-event/1",
+      scope,
+      key,
+      outcome,
+      last_attempt_at: attemptedAt.toISOString(),
+      consecutive_failures: consecutiveFailures,
+      observed_latency_ms:
+        Math.round(Math.max(0, observedLatencyMs) * 1000) / 1000,
+      cooldown_until: cooldownMs
+        ? new Date(attemptedAt.getTime() + cooldownMs).toISOString()
+        : null,
+      retry_after_seconds: boundedRetryAfter,
+      ...(failedStage ? { failed_stage: failedStage } : {}),
+    };
+    writeFileSync(this.path, `${JSON.stringify(event)}\n`, { flag: "a" });
+    this.events.set(this.eventKey(scope, key), event);
+    return event;
+  }
+}
+
+function healthCheckpoint(
+  output: string,
+  resume: boolean,
+  command: "search-batch" | "scrape-batch",
+  profile: string,
+  ephemeral: boolean,
+  input: string,
+  appendInput = false,
+) {
+  const path = `${output}.health.ndjson`;
+  const currentInput = readFileSync(input);
+  const inputSha256 = createHash("sha256").update(currentInput).digest("hex");
+  const inputBytes = currentInput.byteLength;
+  const checkpoint = new HealthCheckpoint(path);
+  if (!existsSync(path)) {
+    if (appendInput && statSync(output).size > 0) {
+      fail(
+        `${command} cannot verify --append-input without its existing health checkpoint; restore the original input or create a new output`,
+      );
+    }
+    const run = {
+      schema: "agency/web-health-run/1",
+      command,
+      profile,
+      profile_mode: ephemeral ? "ephemeral" : "persistent",
+      input_sha256: inputSha256,
+      input_bytes: inputBytes,
+      created_at: new Date().toISOString(),
+    };
+    writeFileSync(path, `${JSON.stringify(run)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    return checkpoint;
+  }
+  if (!resume) fail(`${command} health checkpoint exists; use --resume`);
+  const lines = readFileSync(path, "utf8").split(/\r?\n/).filter(Boolean);
+  let acceptedInputSha256 = "";
+  let acceptedInputBytes: number | null = null;
+  const outcomes = new Set<HealthOutcome>([
+    "success",
+    "empty",
+    "partial",
+    "failed",
+    "challenged",
+    "login-required",
+    "rate-limited",
+  ]);
+  for (const [index, line] of lines.entries()) {
+    let record: any;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      fail(`${command} health checkpoint has invalid JSON on line ${index + 1}`);
+    }
+    if (index === 0) {
+      if (record.schema !== "agency/web-health-run/1") {
+        fail(`unsupported health checkpoint schema on line 1: ${String(record.schema || "missing")}`);
+      }
+      if (
+        record.command !== command ||
+        record.profile !== profile ||
+        record.profile_mode !== (ephemeral ? "ephemeral" : "persistent")
+      ) {
+        fail(
+          `${command} health checkpoint profile fingerprint changed; use the original profile or create a new output`,
+        );
+      }
+      if (resume && ephemeral) {
+        fail(`${command} cannot resume health state with an ephemeral profile`);
+      }
+      if (
+        typeof record.input_sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(record.input_sha256) ||
+        !(
+          record.input_bytes === undefined ||
+          (Number.isInteger(record.input_bytes) && record.input_bytes >= 0)
+        )
+      ) {
+        fail(`${command} health checkpoint has an invalid run record`);
+      }
+      acceptedInputSha256 = record.input_sha256;
+      acceptedInputBytes = record.input_bytes ?? null;
+      continue;
+    }
+    if (record.schema === "agency/web-health-input/1") {
+      if (
+        record.previous_sha256 !== acceptedInputSha256 ||
+        record.previous_bytes !== acceptedInputBytes ||
+        typeof record.input_sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(record.input_sha256) ||
+        !Number.isInteger(record.input_bytes) ||
+        record.input_bytes <= (acceptedInputBytes ?? -1) ||
+        typeof record.accepted_at !== "string" ||
+        !Number.isFinite(Date.parse(record.accepted_at))
+      ) {
+        fail(`${command} health checkpoint has an invalid input record on line ${index + 1}`);
+      }
+      acceptedInputSha256 = record.input_sha256;
+      acceptedInputBytes = record.input_bytes;
+      continue;
+    }
+    if (record.schema !== "agency/web-health-event/1") {
+      fail(`unsupported health checkpoint schema on line ${index + 1}: ${String(record.schema || "missing")}`);
+    }
+    if (
+      !new Set(["provider", "origin"]).has(record.scope) ||
+      typeof record.key !== "string" ||
+      !record.key ||
+      !outcomes.has(record.outcome) ||
+      typeof record.last_attempt_at !== "string" ||
+      !Number.isInteger(record.consecutive_failures) ||
+      record.consecutive_failures < 0 ||
+      typeof record.observed_latency_ms !== "number" ||
+      !Number.isFinite(record.observed_latency_ms) ||
+      !(
+        record.cooldown_until === null ||
+        (typeof record.cooldown_until === "string" &&
+          Number.isFinite(Date.parse(record.cooldown_until)))
+      ) ||
+      !(
+        record.retry_after_seconds === null ||
+        (Number.isInteger(record.retry_after_seconds) &&
+          record.retry_after_seconds >= 1 &&
+          record.retry_after_seconds <= 24 * 60 * 60)
+      ) ||
+      !(
+        record.failed_stage === undefined ||
+        record.failed_stage === "navigation"
+      )
+    ) {
+      fail(`${command} health checkpoint has an invalid event on line ${index + 1}`);
+    }
+    const event = record as HealthEvent;
+    checkpoint.events.set(checkpoint.eventKey(event.scope, event.key), event);
+  }
+  if (
+    acceptedInputSha256 === inputSha256 &&
+    (acceptedInputBytes === null || acceptedInputBytes === inputBytes)
+  ) {
+    return checkpoint;
+  }
+  if (!appendInput) {
+    fail(
+      `${command} input fingerprint changed (expected ${acceptedInputSha256.slice(0, 12)}, got ${inputSha256.slice(0, 12)}); restore the original input, create a new output, or use --append-input with --resume for an unchanged prefix`,
+    );
+  }
+  if (acceptedInputBytes === null) {
+    fail(
+      `${command} cannot verify an append against this older checkpoint; restore the original input or create a new output`,
+    );
+  }
+  const prefixSha256 = createHash("sha256")
+    .update(currentInput.subarray(0, acceptedInputBytes))
+    .digest("hex");
+  if (
+    inputBytes <= acceptedInputBytes ||
+    prefixSha256 !== acceptedInputSha256
+  ) {
+    fail(
+      `${command} --append-input requires the previously accepted input to remain an unchanged byte prefix; restore it or create a new output`,
+    );
+  }
+  writeFileSync(
+    path,
+    `${JSON.stringify({
+      schema: "agency/web-health-input/1",
+      previous_sha256: acceptedInputSha256,
+      previous_bytes: acceptedInputBytes,
+      input_sha256: inputSha256,
+      input_bytes: inputBytes,
+      accepted_at: new Date().toISOString(),
+    })}\n`,
+    { flag: "a" },
+  );
+  return checkpoint;
 }
 
 function batchQueries(value: string) {
@@ -2919,6 +3935,9 @@ async function commandSearchBatch(args: string[]) {
   const maxQueries = takeNumber(args, "--max-queries", 1_000, 1, 100_000);
   const resume = takeFlag(args, "--resume");
   const retryFailures = takeFlag(args, "--retry-failures");
+  const appendInput = takeFlag(args, "--append-input");
+  const domains = takeOptions(args, "--domain").map(checkedDomain);
+  if (appendInput && !resume) fail("--append-input requires --resume");
   if (!outputValue) fail("search-batch requires --output PATH");
   if (args.length !== 1) fail("search-batch requires one query file");
   if (!new Set(["auto", "duckduckgo", "brave", "bing"]).has(requestedEngine)) {
@@ -2930,6 +3949,15 @@ async function commandSearchBatch(args: string[]) {
     fail("search-batch input and output must be different files");
   }
   const previouslyCompleted = completedBatchQueries(output, retryFailures);
+  const health = healthCheckpoint(
+    output,
+    resume,
+    "search-batch",
+    options.profile,
+    options.ephemeral,
+    input,
+    appendInput,
+  );
   const pending = queries
     .filter((query) => !previouslyCompleted.has(query))
     .slice(0, maxQueries);
@@ -2942,6 +3970,7 @@ async function commandSearchBatch(args: string[]) {
     attempted: 0,
     completed: 0,
     failed: 0,
+    deferred: 0,
     pending: pending.length,
     stopped: false,
   };
@@ -2949,7 +3978,13 @@ async function commandSearchBatch(args: string[]) {
     console.log(JSON.stringify(summary, null, 2));
     return;
   }
-  const state = newSearchRunState();
+  const state = newSearchRunState(health);
+  if (!orderedSearchEngines(requestedEngine, state).length) {
+    summary.deferred = pending.length;
+    summary.stopped = true;
+    console.log(JSON.stringify(summary, null, 2));
+    return;
+  }
   await withBrowser(options, async (browser) => {
     for (const [index, query] of pending.entries()) {
       summary.attempted += 1;
@@ -2960,8 +3995,21 @@ async function commandSearchBatch(args: string[]) {
           query,
           requestedEngine,
           limit,
+          domains,
           state,
-          index,
+          (attempt) => {
+            health.record(
+              "provider",
+              attempt.engine,
+              attempt.outcome === "searched"
+                ? "success"
+                : attempt.outcome === "challenged"
+                  ? "challenged"
+                  : attempt.outcome,
+              attempt.duration_ms,
+              attempt.retry_after_seconds ?? null,
+            );
+          },
         );
         writeFileSync(
           output,
@@ -2970,6 +4018,7 @@ async function commandSearchBatch(args: string[]) {
             query,
             outcome: "searched",
             engine: result.engine,
+            scope: searchScope(query, domains),
             results: result.results,
             attempts: result.attempts,
             completed_at: new Date().toISOString(),
@@ -3139,11 +4188,42 @@ function interleaveUrlsByOrigin(urls: string[]) {
   return ordered;
 }
 
+function retainedDiscoveryEvidence(
+  evidence: DiscoveryEvidence[],
+): JsonObject[] {
+  return evidence.map((item, index) => {
+    const capture = `search:${createHash("sha256")
+      .update(`${item.query}\n${item.engine}\n${item.url}\n${index}`)
+      .digest("hex")}`;
+    const reference: EvidenceReference = {
+      source: "search-result",
+      capture,
+    };
+    return {
+      ...item,
+      provenance: {
+        title: [reference],
+        url: [reference],
+        snippet: [reference],
+      },
+      quality: [
+        {
+          code: "search-snippet-only",
+          fields: ["title", "url", "snippet"],
+          observation:
+            "Discovery evidence was retained without rendered source extraction; freshness is unverified",
+        },
+      ],
+    };
+  });
+}
+
 async function commandScrapeBatch(args: string[]) {
   const options = browserOptions(args);
   const outputValue = takeOption(args, "--output");
   const resume = takeFlag(args, "--resume");
   const retryFailures = takeFlag(args, "--retry-failures");
+  const appendInput = takeFlag(args, "--append-input");
   const shouldIndex = takeFlag(args, "--index");
   const delayMs = takeNumber(args, "--delay-ms", 750, 0, 60_000);
   const jitterMs = takeNumber(args, "--jitter-ms", 250, 0, 60_000);
@@ -3155,6 +4235,7 @@ async function commandScrapeBatch(args: string[]) {
     120_000,
   );
   const maxPages = takeNumber(args, "--max-pages", 1_000, 1, 100_000);
+  if (appendInput && !resume) fail("--append-input requires --resume");
   if (!outputValue) fail("scrape-batch requires --output PATH");
   if (args.length !== 1) fail("scrape-batch requires one URL or search-result file");
   const { input, urls, discoveryEvidence } = batchUrls(args[0]);
@@ -3163,6 +4244,15 @@ async function commandScrapeBatch(args: string[]) {
     fail("scrape-batch input and output must be different files");
   }
   const previouslyCompleted = completedBatchUrls(output, retryFailures);
+  const health = healthCheckpoint(
+    output,
+    resume,
+    "scrape-batch",
+    options.profile,
+    options.ephemeral,
+    input,
+    appendInput,
+  );
   const allPending = urls.filter((url) => !previouslyCompleted.has(url));
   const work = interleaveUrlsByOrigin(allPending.slice(0, maxPages));
   const summary = {
@@ -3182,15 +4272,23 @@ async function commandScrapeBatch(args: string[]) {
     console.log(JSON.stringify(summary, null, 2));
     return;
   }
-  const blockedOrigins = new Set<string>();
+  const readyWork = work.filter((requestedUrl) => {
+    if (!health.cooling("origin", new URL(requestedUrl).origin)) return true;
+    summary.deferred += 1;
+    return false;
+  });
+  if (!readyWork.length) {
+    console.log(JSON.stringify(summary, null, 2));
+    return;
+  }
   const originReadyAt = new Map<string, number>();
   let requestReadyAt = 0;
   const indexer = shouldIndex ? pageIndexer() : null;
   try {
     await withBrowser(options, async (browser) => {
-      for (const requestedUrl of work) {
+      for (const requestedUrl of readyWork) {
         const origin = new URL(requestedUrl).origin;
-        if (blockedOrigins.has(origin)) {
+        if (health.cooling("origin", origin)) {
           summary.deferred += 1;
           continue;
         }
@@ -3198,21 +4296,48 @@ async function commandScrapeBatch(args: string[]) {
         const readyAt = Math.max(requestReadyAt, originReadyAt.get(origin) || 0);
         if (readyAt > now) await sleep(readyAt - now);
         summary.attempted += 1;
+        const attemptStarted = performance.now();
         try {
-          const page = await navigateAndExtract(browser, requestedUrl, options);
-          indexer?.write(page);
+          let page = await navigateAndExtract(browser, requestedUrl, options);
+          if (options.capture) page = storedCapture(page, browser);
+          const partial = page.outcome === "partial";
+          if (!partial) indexer?.write(page);
           writeFileSync(
             output,
             `${JSON.stringify({
               schema: "agency/web-page-result/1",
               requested_url: requestedUrl,
-              outcome: "scraped",
+              outcome: partial ? "partial" : "scraped",
+              ...(partial
+                ? {
+                    constraint: page.constraint,
+                    failed_stage: page.failed_stage,
+                  }
+                : {}),
               page,
               completed_at: new Date().toISOString(),
             })}\n`,
             { flag: "a" },
           );
-          summary.completed += 1;
+          if (partial) {
+            summary.partial += 1;
+            health.record(
+              "origin",
+              origin,
+              "partial",
+              performance.now() - attemptStarted,
+              null,
+              "navigation",
+            );
+          } else {
+            summary.completed += 1;
+            health.record(
+              "origin",
+              origin,
+              "success",
+              performance.now() - attemptStarted,
+            );
+          }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const hardGate = message.includes("interactive challenge required")
@@ -3231,7 +4356,7 @@ async function commandScrapeBatch(args: string[]) {
                 requested_url: requestedUrl,
                 outcome: "partial",
                 constraint: hardGate,
-                evidence: retainedEvidence,
+                evidence: retainedDiscoveryEvidence(retainedEvidence),
                 completed_at: new Date().toISOString(),
               })}\n`,
               { flag: "a" },
@@ -3251,13 +4376,22 @@ async function commandScrapeBatch(args: string[]) {
             );
             summary.failed += 1;
           }
-          if (
-            message.includes("interactive challenge required") ||
-            message.includes("interactive login required") ||
-            message.includes("origin rate limited")
-          ) {
-            blockedOrigins.add(origin);
-          }
+          health.record(
+            "origin",
+            origin,
+            hardGate === "hard-challenge"
+              ? "challenged"
+              : hardGate === "hard-login"
+                ? "login-required"
+                : hardGate === "rate-limited"
+                  ? "rate-limited"
+                  : "failed",
+            performance.now() - attemptStarted,
+            error && typeof error === "object"
+              ? ((error as { retryAfterSeconds?: number }).retryAfterSeconds ??
+                  null)
+              : null,
+          );
         }
         const completedAt = Date.now();
         requestReadyAt =
@@ -3397,6 +4531,7 @@ async function commandDownload(args: string[]) {
       scrollSteps: 0,
       interactionSteps: 0,
       captureNetworkJson: false,
+      capture: false,
     };
     const downloadedPath = await withBrowser(
       browserOptions,
@@ -3574,24 +4709,38 @@ async function commandScrape(args: string[]) {
   if (includeFrames && format !== "json") {
     fail("--include-frames requires --format json");
   }
+  if (options.capture && format !== "json") {
+    fail(
+      "--capture requires --format json; use: web-research scrape URL --format json --capture --profile TASK",
+    );
+  }
   if (args.length !== 1) fail("scrape requires one URL");
   const url = checkedUrl(args[0]);
   const page = await withBrowser(options, async (browser) => {
-    const extracted: Page & { frames?: JsonObject[] } = await navigateAndExtract(
+    let extracted = await navigateAndExtract(
       browser,
       url.href,
       options,
     );
+    let frames: JsonObject[] = [];
     if (includeFrames) {
       let topOrigin = url.origin;
       try {
         topOrigin = new URL(extracted.url).origin;
       } catch {}
-      extracted.frames = await extractFrames(browser, topOrigin, frameOrigins);
+      frames = await extractFrames(browser, topOrigin, frameOrigins);
+    }
+    const input = pageCaptures.get(extracted);
+    if (!input) throw new Error("page capture state is unavailable");
+    input.frames = frames;
+    extracted = fusePageCapture(input);
+    pageCaptures.set(extracted, input);
+    if (options.capture) {
+      extracted = storedCapture(extracted, browser, frames);
     }
     return extracted;
   });
-  if (shouldIndex) indexPage(page);
+  if (shouldIndex && page.outcome !== "partial") indexPage(page);
   const content =
     format === "json"
       ? JSON.stringify(page, null, 2)
@@ -3607,6 +4756,92 @@ async function commandScrape(args: string[]) {
   } else {
     console.log(terminalText(content));
   }
+}
+
+function commandReplay(args: string[]) {
+  const json = takeFlag(args, "--json");
+  if (args.length !== 1) fail("replay requires one capture ID");
+  const { page } = loadedCapture(args[0]);
+  console.log(json ? JSON.stringify(page, null, 2) : terminalText(page.markdown));
+}
+
+function commandCaptureGc(args: string[]) {
+  if (!args.includes("--max-manifests")) {
+    fail("capture-gc requires --max-manifests N");
+  }
+  const maxManifests = takeNumber(
+    args,
+    "--max-manifests",
+    0,
+    0,
+    1_000_000,
+  );
+  const apply = takeFlag(args, "--apply");
+  const json = takeFlag(args, "--json");
+  if (args.length) fail("capture-gc accepts no positional arguments");
+  const directories = captureDirectories();
+  const manifests = readdirSync(directories.manifests)
+    .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
+    .map((name) => {
+      const path = join(directories.manifests, name);
+      const status = lstatSync(path);
+      if (!status.isFile() || status.isSymbolicLink()) {
+        fail(`capture manifest is not a regular file: ${name}`);
+      }
+      let manifest: any;
+      try {
+        manifest = JSON.parse(readFileSync(path, "utf8"));
+      } catch {
+        fail(`capture manifest is invalid JSON: ${name}`);
+      }
+      if (
+        manifest.schema !== "agency/web-capture-manifest/1" ||
+        typeof manifest.captured_at !== "string" ||
+        !Number.isFinite(Date.parse(manifest.captured_at)) ||
+        typeof manifest.object_sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(manifest.object_sha256)
+      ) {
+        fail(`capture manifest is invalid: ${name}`);
+      }
+      return { name, path, manifest };
+    })
+    .sort(
+      (left, right) =>
+        Date.parse(right.manifest.captured_at) -
+          Date.parse(left.manifest.captured_at) ||
+        right.name.localeCompare(left.name),
+    );
+  const retained = manifests.slice(0, maxManifests);
+  const removedManifests = manifests.slice(maxManifests);
+  const referenced = new Set(
+    retained.map((item) => item.manifest.object_sha256 as string),
+  );
+  const removedObjects = readdirSync(directories.objects)
+    .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
+    .filter((name) => !referenced.has(name.slice(0, -5)))
+    .map((name) => join(directories.objects, name));
+  if (apply) {
+    for (const item of removedManifests) unlinkSync(item.path);
+    for (const path of removedObjects) {
+      const status = lstatSync(path);
+      if (!status.isFile() || status.isSymbolicLink()) {
+        fail(`capture object is not a regular file: ${basename(path)}`);
+      }
+      unlinkSync(path);
+    }
+  }
+  const report = {
+    schema: "agency/web-capture-gc/1",
+    applied: apply,
+    retained_manifests: retained.length,
+    removed_manifests: removedManifests.map((item) => item.name.slice(0, -5)),
+    removed_objects: removedObjects.map((path) => basename(path, ".json")),
+  };
+  console.log(
+    json
+      ? JSON.stringify(report, null, 2)
+      : `${apply ? "removed" : "would remove"} ${removedManifests.length} manifests and ${removedObjects.length} objects`,
+  );
 }
 
 async function commandMap(args: string[]) {
@@ -3894,12 +5129,14 @@ function help() {
   console.log(`web-research — bounded HTTP retrieval and local Firefox research
 
 Usage:
-  web-research search QUERY [--engine auto|duckduckgo|brave|bing] [--limit N] [--json]
-  web-research search-batch QUERIES --output RESULTS.ndjson [--resume]
-  web-research scrape-batch URLS_OR_SEARCH_RESULTS --output PAGES.ndjson [--resume]
+  web-research search QUERY [--domain HOSTNAME] [--profile NAME] [--json] [-- QUERY_TEXT]
+  web-research search-batch QUERIES --output RESULTS.ndjson [--domain HOSTNAME] [--resume]
+  web-research scrape-batch URLS_OR_SEARCH_RESULTS --output PAGES.ndjson [--resume] [--append-input]
   web-research retrieve URL... [--json] [--max-bytes N] [--timeout-ms N]
   web-research download URL --output PATH --output-root PATH [--expected-type TYPE]
   web-research scrape URL [--format markdown|text|html|json] [--include-frames]
+  web-research replay CAPTURE_ID [--json]
+  web-research capture-gc --max-manifests N [--apply] [--json]
   web-research map URL [--limit N] [--json]
   web-research snapshot URL --format png|pdf --output PATH
   web-research crawl URL [--limit N] [--depth N] [--delay-ms N] [--json]
@@ -3908,7 +5145,7 @@ Usage:
   web-research browser [URL] [--profile NAME] [--detach]
 
 Browser options:
-  --profile NAME          Persistent local Firefox profile (default: default)
+  --profile NAME          Persistent profile (default: automatic ephemeral for search)
   --ephemeral-profile    Use a clean randomly suffixed profile for this run
   --profile-template SRC Seed coherent prefs into a named or ephemeral profile
   --visible               Explicitly allow a window that may request focus
@@ -3916,16 +5153,20 @@ Browser options:
   --wait-ms N             Minimum post-navigation wait (default: 350)
   --settle-ms N           Maximum adaptive stability wait (default: 1200)
   --navigation-timeout-ms N  Navigation deadline (default: 45000)
+  --navigation-retries N  Retry navigation timeouts 0–2 times (default: 0)
   --max-content-chars N   Per-field extraction ceiling (default: 2000000)
   --max-links N           Extracted link ceiling (default: 2000)
   --scroll-steps N        Bounded lazy-feed scroll steps (default: 0)
   --interaction-steps N   Bounded safe expand/load/dismiss actions (default: 0)
   --capture-network-json  Retain bounded same-origin JSON response evidence
+  --capture               Retain sanitized extraction inputs for offline replay
 
 Batch search options:
   --output PATH           Append-only NDJSON checkpoint (required)
   --resume                Validate output and skip completed queries
+  --append-input          Accept new lines after an unchanged resumed input
   --retry-failures        Retry prior failed records when resuming
+  --domain HOSTNAME       Strictly retain this host and its subdomains; repeatable
   --max-queries N         Maximum pending queries this run (default: 1000)
   --delay-ms N            Base inter-query delay (default: 1500)
   --jitter-ms N           Deterministic delay jitter (default: 500)
@@ -3933,6 +5174,7 @@ Batch search options:
 Batch scrape options:
   --output PATH           Append-only page NDJSON checkpoint (required)
   --resume                Validate output and skip completed URLs
+  --append-input          Accept new lines after an unchanged resumed input
   --retry-failures        Retry prior failed records when resuming
   --index                 Add successful pages to the local full-text index
   --max-pages N           Maximum pending URLs this run (default: 1000)
@@ -3983,6 +5225,8 @@ try {
   else if (command === "download") await commandDownload(args);
   else if (command === "scrape" || command === "fetch")
     await commandScrape(args);
+  else if (command === "replay") commandReplay(args);
+  else if (command === "capture-gc") commandCaptureGc(args);
   else if (command === "map") await commandMap(args);
   else if (command === "snapshot") await commandSnapshot(args);
   else if (command === "crawl") await commandCrawl(args);

@@ -19,7 +19,12 @@ class SystemContextTests(unittest.TestCase):
         self.workspace = Path(self.temporary.name)
         self.sysfs = self.workspace / "sys"
         self.procfs = self.workspace / "proc"
+        self.dev_root = self.workspace / "dev"
+        self.bin_root = self.workspace / "bin"
+        self.cache_root = self.workspace / "cache"
         self.procfs.mkdir()
+        self.dev_root.mkdir()
+        self.bin_root.mkdir()
         (self.procfs / "meminfo").write_text("MemTotal:       16777216 kB\n")
 
     def tearDown(self):
@@ -30,7 +35,10 @@ class SystemContextTests(unittest.TestCase):
             **os.environ,
             "AGENCY_SYSFS_ROOT": str(self.sysfs),
             "AGENCY_PROCFS_ROOT": str(self.procfs),
+            "AGENCY_DEV_ROOT": str(self.dev_root),
+            "AGENCY_CACHE_ROOT": str(self.cache_root),
             "AGENCY_LOGICAL_CPUS": "8",
+            "PATH": f"{self.bin_root}:{os.environ.get('PATH', '')}",
         }
         return subprocess.run(
             [TOOL, *arguments],
@@ -46,6 +54,11 @@ class SystemContextTests(unittest.TestCase):
         (supply / "type").write_text(f"{supply_type}\n")
         for key, value in values.items():
             (supply / key).write_text(f"{value}\n")
+
+    def add_command(self, name, body):
+        command = self.bin_root / name
+        command.write_text(f"#!/bin/sh\n{body}\n")
+        command.chmod(0o755)
 
     def test_laptop_on_battery_gets_strict_high_load_guidance(self):
         chassis = self.sysfs / "class/dmi/id/chassis_type"
@@ -113,6 +126,71 @@ class SystemContextTests(unittest.TestCase):
         self.assertEqual(payload["device_class"], "desktop")
         self.assertEqual(payload["power_source"], "ac")
         self.assertNotIn("thermally constrained laptop", payload["resource_policy"])
+
+    def test_desktop_without_power_supply_telemetry_is_treated_as_ac(self):
+        chassis = self.sysfs / "class/dmi/id/chassis_type"
+        chassis.parent.mkdir(parents=True)
+        chassis.write_text("3\n")
+
+        payload = json.loads(self.run_context("--json").stdout)
+
+        self.assertEqual(payload["device_class"], "desktop")
+        self.assertEqual(payload["power_source"], "ac")
+
+    def test_nvidia_runtime_reports_model_vram_and_cuda_cores(self):
+        (self.dev_root / "nvidia0").touch()
+        self.add_command(
+            "nvidia-smi",
+            "printf '%s\\n' 'NVIDIA GeForce RTX 4090, 24564'",
+        )
+        self.add_command("nvidia-settings", "printf '%s\\n' '16384'")
+
+        payload = json.loads(self.run_context("--json").stdout)
+
+        self.assertEqual(
+            payload["compute_accelerator"],
+            "NVIDIA GeForce RTX 4090 (24 GiB VRAM, 16,384 CUDA cores)",
+        )
+
+    def test_nvidia_cache_refreshes_after_device_change_or_explicit_request(self):
+        device = self.dev_root / "nvidia0"
+        device.touch()
+        calls = self.workspace / "nvidia-smi-calls"
+        self.add_command(
+            "nvidia-smi",
+            f"printf '%s\\n' called >> '{calls}'\n"
+            "printf '%s\\n' 'NVIDIA GeForce RTX 4090, 24564'",
+        )
+        self.add_command("nvidia-settings", "exit 1")
+
+        self.run_context("--json")
+        self.run_context("--json")
+        self.assertEqual(calls.read_text().splitlines(), ["called"])
+
+        device_stat = device.stat()
+        os.utime(
+            device,
+            ns=(device_stat.st_atime_ns, device_stat.st_mtime_ns + 1_000_000_000),
+        )
+        self.run_context("--json")
+        self.assertEqual(calls.read_text().splitlines(), ["called", "called"])
+
+        self.run_context("--json", "--refresh")
+        self.assertEqual(
+            calls.read_text().splitlines(),
+            ["called", "called", "called"],
+        )
+
+    def test_nvidia_runtime_query_failure_keeps_device_fallback(self):
+        (self.dev_root / "nvidia0").touch()
+        self.add_command("nvidia-smi", "exit 1")
+
+        payload = json.loads(self.run_context("--json").stdout)
+
+        self.assertEqual(
+            payload["compute_accelerator"],
+            "nvidia-device (runtime unverified)",
+        )
 
 
 class HookMergeTests(unittest.TestCase):

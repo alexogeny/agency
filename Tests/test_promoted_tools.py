@@ -1470,19 +1470,18 @@ class PromotedToolTests(unittest.TestCase):
         self.assertEqual(report["failed"], 0)
         self.assertEqual(record["outcome"], "partial")
         self.assertEqual(record["constraint"], "hard-login")
+        evidence = record["evidence"][0]
+        self.assertEqual(evidence["source"], "search-result")
+        self.assertEqual(evidence["query"], "public organization evidence")
+        self.assertEqual(evidence["engine"], "bing")
+        self.assertEqual(evidence["title"], "Public organization")
+        self.assertEqual(evidence["url"], "https://gate.example/public")
         self.assertEqual(
-            record["evidence"],
-            [
-                {
-                    "source": "search-result",
-                    "query": "public organization evidence",
-                    "engine": "bing",
-                    "title": "Public organization",
-                    "url": "https://gate.example/public",
-                    "snippet": "Public evidence discovered before source extraction.",
-                }
-            ],
+            evidence["snippet"],
+            "Public evidence discovered before source extraction.",
         )
+        self.assertEqual(evidence["provenance"]["snippet"][0]["source"], "search-result")
+        self.assertEqual(evidence["quality"][0]["code"], "search-snippet-only")
         self.assertNotIn("secret", output.read_text())
 
         resumed = self.run_tool(
@@ -1952,23 +1951,21 @@ class PromotedToolTests(unittest.TestCase):
         )
 
         page = json.loads(result.stdout)
+        extracted, skipped = page["frames"]
+        self.assertEqual(extracted["status"], "extracted")
+        self.assertEqual(extracted["origin"], "https://93.184.216.34")
+        self.assertEqual(extracted["path"], "/frame")
+        self.assertEqual(extracted["title"], "Frame")
+        self.assertEqual(extracted["text"], "frame evidence")
+        self.assertEqual(extracted["provenance"]["text"][0]["source"], "frame")
         self.assertEqual(
-            page["frames"],
-            [
-                {
-                    "status": "extracted",
-                    "origin": "https://93.184.216.34",
-                    "path": "/frame",
-                    "title": "Frame",
-                    "text": "frame evidence",
-                },
-                {
-                    "status": "skipped",
-                    "reason": "cross-origin",
-                    "origin": "https://readings.example",
-                    "path": "/item",
-                },
-            ],
+            skipped,
+            {
+                "status": "skipped",
+                "reason": "cross-origin",
+                "origin": "https://readings.example",
+                "path": "/item",
+            },
         )
         self.assertNotIn("secret", result.stdout)
 

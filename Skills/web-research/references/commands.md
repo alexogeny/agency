@@ -8,11 +8,14 @@ search, extraction, proxy, or model APIs.
 
 ```console
 web-research search "QUERY" --engine auto --limit 10 --json --profile TASK
+web-research search "QUERY" --domain example.org --json
+web-research search "QUERY" --json -- --literal-query-term
 web-research search "QUERY" --engine duckduckgo --limit 10 --json --profile TASK
 web-research search "QUERY" --engine brave --limit 10 --json --profile TASK
 web-research search "QUERY" --engine bing --limit 10 --json --profile TASK
 web-research search-batch queries.txt --output search.ndjson --resume --profile TASK
 web-research scrape-batch search.ndjson --output pages.ndjson --resume --index --profile TASK
+web-research scrape-batch urls.txt --output pages.ndjson --resume --append-input --profile TASK
 web-research retrieve URL... --json
 web-research download URL \
   --output "$HOME/Scratch/TASK/file.pdf" \
@@ -22,6 +25,9 @@ web-research scrape URL --format markdown --profile TASK
 web-research scrape URL --format json --include-frames --profile TASK
 web-research scrape URL --format json --interaction-steps 2 \
   --scroll-steps 2 --capture-network-json --profile TASK
+web-research scrape URL --format json --capture --profile TASK
+web-research replay CAPTURE_ID --json
+web-research capture-gc --max-manifests 100 --json
 web-research search "QUERY" --json --profile TASK --profile-template current
 web-research scrape URL --format json --index --profile TASK --ephemeral-profile --profile-template current
 web-research scrape URL --format json --index --profile TASK
@@ -33,9 +39,16 @@ web-research snapshot URL --format pdf --output "$HOME/Scratch/TASK/page.pdf" --
 `scrape` and its `fetch` alias support `markdown`, `text`, `html`, and `json`.
 JSON includes title, resolved and canonical URLs, publication and byline hints,
 main text, Markdown, main HTML, discovered links, access state, capture count,
-and evidence sources. A bounded allowlist of description, Open Graph, and
-Twitter metadata plus sanitized `application/ld+json` is returned under
-`structured`. It never includes cookies or browser storage.
+evidence sources, field-level provenance, and named quality observations. A
+bounded allowlist of description, Open Graph, and Twitter metadata plus
+sanitized `application/ld+json` is returned under `structured`. It never
+includes cookies or browser storage.
+
+Search rejects unknown options rather than treating them as query text. Put
+literal query terms beginning with a hyphen after `--`. A `site:` expression is
+only a provider hint; use repeatable `--domain HOSTNAME` for a strict
+post-filter against each cleaned destination host and its subdomains. JSON
+labels textual `site:` scope as `best-effort`.
 
 Before output or indexing, the tool removes URL user information, fragments,
 and query parameters shaped like tokens, credentials, signatures, sessions,
@@ -57,7 +70,11 @@ milliseconds. `--settle-ms N` is the additional adaptive stability budget and
 defaults to 1.2 seconds. Stability includes the URL, title, text size, document
 height, link count, and open shadow roots. `--navigation-timeout-ms` defaults to
 45 seconds and navigation stops at interactive readiness rather than waiting
-for every subresource. Automated commands remain headless by default.
+for every subresource. `--navigation-retries` permits zero to two timeout
+retries and defaults to zero. If the final navigation attempt times out but a
+usable DOM or bounded network response exists, JSON retains it as a partial
+result with the failed stage and attempt count. Partial pages are not indexed.
+Automated commands remain headless by default.
 
 `--scroll-steps N` performs at most N document-height scrolls, settling,
 rechecking access, and capturing evidence after each. It defaults to zero.
@@ -132,6 +149,9 @@ process and profile claim; challenged providers are not retried. Select one
 engine explicitly when exact search-engine reproducibility matters. Stable
 profiles and ordinary browser signals reduce needless challenge triggers, but
 no browser can guarantee that a source will not require a human challenge.
+One-shot search uses a randomly suffixed disposable profile when `--profile`
+is omitted. Explicit named profiles remain persistent. Batch search continues
+to use its named profile for stable health and resume identity.
 
 ## Resumable batch research
 
@@ -142,23 +162,31 @@ launch Firefox when nothing remains. `--retry-failures` retries failed records.
 The run cap defaults to 1,000 pending queries and can be changed with
 `--max-queries` up to 100,000.
 
+`--domain HOSTNAME` is repeatable and filters every query. `--append-input`
+requires `--resume` and accepts added lines only when the prior input remains an
+unchanged byte prefix. The health ledger records each accepted input identity.
+Without append mode, a fingerprint mismatch directs the caller to restore the
+original input or create a new output.
+
 All queries share one browser. A successful provider becomes preferred for the
-next query. Ordinary failures receive an exponential query-count cooldown; a
-challenge opens that provider's circuit for the rest of the run. Inter-query
-pacing defaults to 1.5 seconds plus up to 500 milliseconds of deterministic
-jitter. Every successful record includes the provider attempts and completion
-time.
+next query. Ordinary failures receive a bounded exponential cooldown;
+challenges, login walls, rate limits, and bounded `Retry-After` values produce
+longer cooldowns. An adjacent `.health.ndjson` sidecar binds health to the
+command, input digest, profile, and profile mode, then restores it across
+resume. Inter-query pacing defaults to 1.5 seconds plus up to 500 milliseconds
+of deterministic jitter. Every successful record includes the provider
+attempts and completion time.
 
 `scrape-batch` accepts newline URLs or successful `search-batch` NDJSON and
 appends `agency/web-page-result/1` records. `--resume`, `--retry-failures`, and
 `--max-pages` mirror discovery. Successful pages may be added to the local index
-with `--index`. An origin that presents a challenge or login wall is circuit
-broken for the run; later URLs from that origin remain pending while unrelated
-origins continue. Inputs are round-robined by origin. Default pacing is 750
-milliseconds plus up to 250 milliseconds of deterministic jitter globally and
-at least 2 seconds between requests to the same origin; change the latter with
-`--origin-delay-ms`. Soft gates do not open the origin circuit; hard gates and
-rate-limit pages do.
+with `--index` or retained with `--capture`. An origin that presents a challenge,
+login wall, or rate limit receives a persistent cooldown in the adjacent health
+sidecar; later URLs from that origin remain pending while unrelated origins
+continue. Inputs are round-robined by origin. Default pacing is 750 milliseconds
+plus up to 250 milliseconds of deterministic jitter globally and at least 2
+seconds between requests to the same origin; change the latter with
+`--origin-delay-ms`. Soft gates do not cool the origin.
 
 If the input is search-result NDJSON and the source then presents a hard gate,
 the page record has `outcome: "partial"`, a `hard-login`, `hard-challenge`, or
@@ -168,6 +196,29 @@ record retains its query, engine, title, sanitized URL, and snippet and remains
 explicitly distinct from rendered source evidence. Plain URL inputs have no
 discovery evidence to retain. `--retry-failures` retries both failed and partial
 records; otherwise either kind counts as checkpointed.
+
+Navigation-timeout evidence is also written as a partial page record with
+`failed_stage: "navigation"`. Its health event preserves that stage and it is
+eligible for `--retry-failures`.
+
+## Sanitized capture and replay
+
+`scrape --format json --capture` and `scrape-batch --capture` write immutable
+`agency/web-capture-input/1` objects and separate
+`agency/web-capture-manifest/1` manifests beneath the research data root.
+Objects are addressed by SHA-256, so identical bounded extraction inputs share
+one object while each capture keeps its own manifest. Manifests record the
+sanitized URL, capture time, Firefox version, extraction options, evidence
+sources, truncation state, and object digest.
+
+`replay CAPTURE_ID --json` reads only the manifest and object, validates both
+schemas and the digest, and reruns extraction fusion without Firefox or network
+access. Missing objects, future schemas, and digest mismatches are errors.
+
+`capture-gc --max-manifests N --json` previews which old manifests and
+unreferenced objects exceed the retention count. Add `--apply` only after
+reviewing that list. Captures never retain headers, cookies, browser storage,
+request bodies, or secret-shaped URL parameters.
 
 ## Direct HTTP evidence
 

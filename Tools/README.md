@@ -130,10 +130,11 @@ separate prose craft from source assembly and final inspection.
 
 Prints a compact, read-only summary of the local device class, AC or battery
 state, battery percentage, CPU and memory capacity, and visible NVIDIA or AMD
-KFD device nodes. Codex and Claude Code consume its plain-text output through
-session-start hooks so laptop sessions prefer bounded validation and ask before
-sustained high-load work. Use `system-context --json` for diagnostics or other
-tooling.
+accelerators. NVIDIA model, VRAM, and CUDA-core details are cached until the
+device or query tools change. Codex and Claude Code consume the plain-text output
+through session-start hooks so laptop sessions prefer bounded validation and ask
+before sustained high-load work. Use `system-context --json` for diagnostics or
+other tooling, and `system-context --refresh` to bypass the accelerator cache.
 
 ## `sudo-gui`
 
@@ -151,8 +152,8 @@ mapping, scoped crawling, and SQLite full-text indexing through the installed
 Firefox and Bun. Persistent named profiles support user-completed login and
 challenge flows without exporting cookies. Crawls are same-origin,
 single-worker, robots-aware, and skip common state-changing links. The global
-`web-research` skill defines source handling, concurrency, and interactive-page
-boundaries.
+`web-research` skill defines source handling, single-worker pacing, and
+interactive-page boundaries.
 
 `web-research retrieve URL... --json` provides a cheaper direct-HTTP evidence
 path before browser rendering is needed. It returns one typed result per URL,
@@ -174,9 +175,17 @@ walls and challenge controls from incidental prose, so ordinary content titled
 substantial public content are labeled as soft gates and extracted; actual
 authentication redirects and dominant challenges remain hard stops.
 
+One-shot searches without `--profile` use disposable profiles, avoiding
+contention with unrelated named research sessions. Unknown search options fail
+before Firefox starts. Textual `site:` terms remain provider hints;
+`--domain HOSTNAME` strictly filters cleaned destination hosts and subdomains.
+
 An entirely empty document gets one bounded 500-millisecond recovery sample.
 If it remains empty, extraction returns a clear incomplete-content error rather
 than a DOM exception or a successful blank record.
+Navigation timeouts retain usable DOM and bounded network evidence as an
+explicit partial result, including the failed stage and attempt count. Bounded
+retries are opt-in, and partial pages never enter the index.
 
 Dynamic pages settle against observable URL, title, text, height, link, and
 open-shadow-root state after interactive readiness. Navigation, settling,
@@ -214,14 +223,29 @@ code nodes are also omitted from Markdown instead of producing delimiter noise.
 `search-batch` and `scrape-batch` provide append-only NDJSON checkpoints for
 large research. They validate resume state, avoid launching Firefox for fully
 completed inputs, reuse a single browser, apply deterministic pacing, and open
-provider or origin circuits after real challenges. Search checkpoints feed
-directly into page extraction, and successful pages can be indexed in the same
-run. Page batches round-robin origins and apply a separate per-origin delay so
-one difficult site does not monopolize the request sequence. When a search
-checkpoint already contains evidence for a URL that later hard-gates, the page
-checkpoint retains it as a labeled partial result rather than losing it or
-claiming it was extracted from the source.
-Rate-limit pages also open the origin circuit instead of entering the index.
+provider or origin circuits after real challenges. A strict health sidecar
+persists outcomes, failure counts, latency, cooldowns, and bounded
+`Retry-After` values across resume. Search checkpoints feed directly into page
+extraction, and successful pages can be indexed in the same run. Page batches
+round-robin origins and apply a separate per-origin delay so one difficult site
+does not monopolize the request sequence. When a search checkpoint already
+contains evidence for a URL that later hard-gates, the page checkpoint retains
+it as a labeled partial result rather than losing it or claiming it was
+extracted from the source. Rate-limit pages also open the origin circuit
+instead of entering the index.
+
+`--append-input` supports incremental query and URL lists only when the
+previously accepted file remains an unchanged byte prefix. Ordinary resume
+still requires an exact fingerprint and reports concrete recovery choices when
+the input or profile identity changes.
+
+JSON extraction reports field-level provenance and named quality observations
+for rendered DOM, metadata, JSON-LD, frames, same-origin network JSON, and
+partial search snippets. `--capture` opt-in stores only the sanitized bounded
+extraction input as a SHA-256-addressed object plus a capture manifest.
+`web-research replay CAPTURE_ID --json` verifies and re-fuses it without
+Firefox or network access. `capture-gc --max-manifests N` previews retention;
+add `--apply` to delete old manifests and objects no live manifest references.
 
 Crawls use a bounded, tracking-normalized frontier with constant-time dequeue,
 per-page admission limits, query-complexity limits, one prepared SQLite writer,
