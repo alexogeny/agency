@@ -86,7 +86,7 @@ workload or profiler for allocation, copying, I/O, transfers, latency, or
 throughput. It verifies stable output evidence and retains raw samples, units,
 methods, dispersion, absolute and relative deltas, and reproducibility metadata.
 Use `resource-bench --help`; `instruction-bench` remains a compatibility entry
-point that defaults to retired instructions.
+point that preserves its instruction-only result schema.
 
 ## `document-inspect`
 

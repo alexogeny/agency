@@ -349,9 +349,12 @@ def parse_perf(path, metrics):
         if value.startswith("<"):
             continue
         try:
-            parsed = float(value)
+            parsed = int(value)
         except ValueError:
-            fail(f"could not parse perf count: {line}")
+            try:
+                parsed = float(value)
+            except ValueError:
+                fail(f"could not parse perf count: {line}")
         values[events[fields[2].strip()]] = parsed
     missing = [
         metric["event"] for metric in metrics if metric["name"] not in values
@@ -582,6 +585,58 @@ def display_value(value, unit):
     return f"{rendered} {unit}"
 
 
+def is_legacy_instruction_spec(spec):
+    return spec["metrics"] == [DEFAULT_METRIC]
+
+
+def legacy_instruction_result(result):
+    comparison = result["metrics"]["instructions"]
+    baseline = result["baseline"].copy()
+    candidate = result["candidate"].copy()
+    baseline.pop("metrics_file", None)
+    candidate.pop("metrics_file", None)
+    raw_order = []
+    for observation in result["raw_order"]:
+        retained = {
+            key: value for key, value in observation.items() if key != "metrics"
+        }
+        retained["instructions"] = observation["metrics"]["instructions"]
+        raw_order.append(retained)
+    return {
+        "schema": 1,
+        "name": result["name"],
+        "metric": "retired userspace instructions",
+        "event": "instructions:u",
+        "runs": result["runs"],
+        "warmups": result["warmups"],
+        "output_equivalence": result["output_equivalence"],
+        "machine": result["machine"],
+        "baseline": {**baseline, **comparison["baseline"]},
+        "candidate": {**candidate, **comparison["candidate"]},
+        "instruction_reduction_percent": comparison["improvement_percent"],
+        "raw_order": raw_order,
+    }
+
+
+def print_instruction_summary(result):
+    baseline = result["baseline"]
+    candidate = result["candidate"]
+    print(f"\033[1;35m◇ {result['name']}\033[0m")
+    print(
+        f"  baseline   {baseline['median']:,.0f} instructions  "
+        f"MAD {baseline['median_absolute_deviation']:,.0f}"
+    )
+    print(
+        f"  candidate  {candidate['median']:,.0f} instructions  "
+        f"MAD {candidate['median_absolute_deviation']:,.0f}"
+    )
+    print(f"  reduction  {result['instruction_reduction_percent']:.2f}%")
+    print(
+        f"  evidence   {result['runs']} interleaved runs · "
+        f"output {result['output_equivalence']}"
+    )
+
+
 def print_summary(result):
     name = result["primary_metric"]
     primary = result["metrics"][name]
@@ -625,31 +680,47 @@ def main():
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--instruction-compat", action="store_true", help=argparse.SUPPRESS
+    )
     arguments = parser.parse_args()
     spec_path = arguments.spec.resolve()
     spec = read_spec(spec_path)
+    instruction_compat = arguments.instruction_compat and is_legacy_instruction_spec(
+        spec
+    )
     if arguments.dry_run:
         plan = {
             "name": spec["name"],
             "cpu": spec["cpu"],
             "runs": spec["runs"],
             "warmups": spec["warmups"],
-            "primary_metric": spec["primary_metric"],
-            "metrics": spec["metrics"],
             "baseline": arm_metadata(spec["baseline"], spec_path.parent),
             "candidate": arm_metadata(spec["candidate"], spec_path.parent),
         }
+        if instruction_compat:
+            plan["baseline"].pop("metrics_file", None)
+            plan["candidate"].pop("metrics_file", None)
+        else:
+            plan["primary_metric"] = spec["primary_metric"]
+            plan["metrics"] = spec["metrics"]
         print(json.dumps(plan, indent=2, sort_keys=True))
         return
     if arguments.output and arguments.output.exists() and not arguments.force:
         fail(f"output exists: {arguments.output}; pass --force to replace it", 2)
     result = benchmark(spec, spec_path)
+    if instruction_compat:
+        result = legacy_instruction_result(result)
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if arguments.output:
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
         arguments.output.write_text(encoded)
     if arguments.json:
         print(encoded, end="")
+    elif instruction_compat:
+        print_instruction_summary(result)
+        if arguments.output:
+            print(f"  raw        {arguments.output.resolve()}")
     else:
         print_summary(result)
         if arguments.output:

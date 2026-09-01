@@ -1,2 +1,2 @@
 #!/bin/sh
-exec "$(dirname "$(readlink -f "$0")")/resource-bench" "$@"
+exec "$(dirname "$(readlink -f "$0")")/resource-bench" --instruction-compat "$@"

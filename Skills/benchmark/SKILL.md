@@ -99,7 +99,8 @@ resource-bench SPEC --output RESULTS.json
 order, and records every sample with commands, environment names, Git state,
 machine facts, output equivalence, units, collection methods, absolute deltas,
 and relative deltas. The legacy `instruction-bench` name remains a compatibility
-entry point and defaults to retired instructions when no metrics are declared.
+entry point and preserves its instruction-only result schema when no metrics
+are declared.
 
 ## Make only supported claims
 

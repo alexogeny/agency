@@ -659,6 +659,66 @@ class PromotedToolTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("claim-matched resource metrics", result.stdout)
 
+    def test_instruction_bench_preserves_its_instruction_only_json_schema(self):
+        self.executable(
+            "perf",
+            """
+            #!/usr/bin/env python3
+            import pathlib
+            import subprocess
+            import sys
+
+            if sys.argv[1:] == ["--version"]:
+                print("perf version fixture")
+                raise SystemExit
+            destination = pathlib.Path(sys.argv[sys.argv.index("-o") + 1])
+            destination.write_text("100000\\t\\tinstructions:u\\n")
+            command = sys.argv[sys.argv.index("--") + 1 :]
+            raise SystemExit(subprocess.run(command, check=False).returncode)
+            """,
+        )
+        spec = self.workspace / "legacy-instruction-bench.toml"
+        spec.write_text(
+            textwrap.dedent(
+                f"""
+                name = "legacy instruction comparison"
+                cpu = {min(os.sched_getaffinity(0))}
+                runs = 3
+                warmups = 1
+
+                [baseline]
+                command = ["python", "-c", "print('equivalent output')"]
+
+                [candidate]
+                command = ["python", "-c", "print('equivalent output')"]
+                """
+            ).lstrip()
+        )
+        installed = self.workspace / "installed" / "instruction-bench"
+        installed.parent.mkdir()
+        installed.symlink_to(TOOLS / "instruction-bench")
+        environment = {
+            **os.environ,
+            "PATH": f"{self.workspace / 'bin'}:{os.environ['PATH']}",
+        }
+
+        result = subprocess.run(
+            [installed, spec, "--json"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["schema"], 1)
+        self.assertEqual(report["metric"], "retired userspace instructions")
+        self.assertEqual(report["baseline"]["samples"], [100000] * 3)
+        self.assertIsInstance(report["baseline"]["samples"][0], int)
+        self.assertEqual(report["raw_order"][0]["instructions"], 100000)
+        self.assertNotIn("metrics", report)
+
     def test_comment_audit_classifies_python_comments_and_docstrings(self):
         source = self.workspace / "sample.py"
         source.write_text(
