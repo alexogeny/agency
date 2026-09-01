@@ -22,6 +22,17 @@ web-research search "QUERY" --json --profile TASK_NAME
 web-research scrape URL --format markdown --profile TASK_NAME
 ```
 
+One-shot `search` uses a disposable profile when `--profile` is omitted, so an
+unrelated persistent browser session cannot block it. Supply a named profile
+when coherent retained first-party state matters. Search options are strict:
+unknown flags fail, and literal query text beginning with a hyphen must follow
+`--`.
+
+A textual `site:` qualifier is provider best-effort. When source scope is a
+requirement, add one or more `--domain HOSTNAME` options. The tool then retains
+only results whose cleaned destination hostname is the named host or one of its
+subdomains.
+
 When the task needs transport evidence rather than rendered content, retrieve
 the URLs directly first:
 
@@ -114,6 +125,10 @@ without exposing redirect or token parameters.
 If navigation briefly exposes no usable document, extraction takes one bounded
 recovery sample after 500 milliseconds. A still-empty document returns a clear
 incomplete-content error; it is never indexed as a successful blank page.
+If navigation exceeds `--navigation-timeout-ms` but Firefox exposes usable
+evidence, JSON returns it as `outcome: partial` with `failed_stage: navigation`.
+Partial pages are not indexed. Use `--navigation-retries 1` for one bounded
+retry; the maximum is two.
 
 Navigation stops at interactive readiness, then samples URL, title, text size,
 document height, links, and open shadow roots until the page is stable or the
@@ -124,8 +139,13 @@ Extraction captures evidence before and after each requested scroll, then
 deduplicates blocks and links so virtualized feeds cannot discard earlier
 viewports. It also fuses a bounded allowlist of page metadata and bounded,
 sanitized JSON-LD with weak rendered content. JSON identifies the evidence
-sources, access state, capture count, and truncated fields. Per-field ceilings
-keep one pathological page from exhausting the browser-to-tool boundary.
+sources, field-level provenance, named quality observations, access state,
+capture count, and truncated fields. Quality observations explain their
+evidence; do not replace them with an aggregate score. Per-field ceilings keep
+one pathological page from exhausting the browser-to-tool boundary.
+Thin rendered text and low title/body topic overlap are explicit quality
+observations with recovery guidance for bounded interaction, network JSON, or
+linked content pages.
 
 For pages that hide public evidence behind ordinary disclosure controls, use a
 small `--interaction-steps` budget. The planner only considers visible,
@@ -169,14 +189,20 @@ Put one query per line and checkpoint discovery as NDJSON:
 ```console
 web-research search-batch queries.txt \
   --output search-results.ndjson --resume \
-  --profile RESEARCH --profile-template current
+  --domain example.org --profile RESEARCH --profile-template current
 ```
 
 The batch keeps one Firefox session, prefers the last healthy provider, applies
-provider cooldowns, opens the circuit for a challenged provider for that run,
-and adds deterministic pacing jitter. Each completed query is one append-only
-record. `--resume` validates the file before skipping completed queries, and an
-entirely completed input does not launch Firefox.
+provider cooldowns, and adds deterministic pacing jitter. A strict
+`<output>.health.ndjson` sidecar persists bounded health and `Retry-After` state
+across resume. Each completed query is one append-only record. `--resume`
+validates both files before skipping completed queries, and an entirely
+completed or cooling input does not launch Firefox.
+
+`--domain` is repeatable and applies the same strict destination-host filter to
+every query. If new query lines are discovered later, append them without
+altering existing bytes and resume with `--append-input`. The tool verifies the
+previous input as an exact byte prefix before accepting the new fingerprint.
 
 Feed that checkpoint directly into bounded page extraction:
 
@@ -188,18 +214,46 @@ web-research scrape-batch search-results.ndjson \
 
 This also accepts a newline URL file. It checkpoints every page, reuses one
 browser and one optional index writer, round-robins origins, and enforces both
-global and per-origin pacing. It defers later URLs from an origin only after a
-hard login wall or challenge; soft-gated public evidence remains usable. Other
-origins continue. When the input is search-result NDJSON, a hard-gated page
-retains its bounded discovery record as explicitly partial search evidence
-instead of discarding it or presenting it as rendered content. Use
-`--max-queries` and `--max-pages` to divide very large work into supervised
-runs; `--retry-failures` also retries partial records after the underlying
-condition has changed.
+global and per-origin pacing. Its adjacent health sidecar persists origin
+cooldowns. It defers later URLs from a cooling origin; soft-gated public
+evidence remains usable and other origins continue. When the input is
+search-result NDJSON, a hard-gated page retains its bounded discovery record as
+explicitly partial search evidence instead of discarding it or presenting it
+as rendered content. Use `--max-queries` and `--max-pages` to divide very large
+work into supervised runs; `--retry-failures` also retries partial records
+after the underlying condition has changed.
+
+For an appended URL list, use `--resume --append-input`. Without that explicit
+mode, a changed input fingerprint reports whether the input or profile changed
+and directs the caller to restore the input or create a new output. Navigation
+timeouts with usable evidence become partial records whose health event retains
+the failed stage.
 
 Rate-limit pages are not indexed as content. A batch records the rate-limited
-constraint, opens that origin's circuit for the run, and continues unrelated
-origins.
+constraint, records a bounded `Retry-After` value when available, cools that
+origin across restarts, and continues unrelated origins.
+
+## Retain and replay sanitized extraction evidence
+
+Capture is explicit because retained evidence has privacy and storage costs:
+
+```console
+web-research scrape URL --format json --capture --profile TASK_NAME
+web-research replay CAPTURE_ID --json
+web-research capture-gc --max-manifests 100 --json
+```
+
+`--capture` stores the bounded extraction input as a content-addressed object
+and writes a separate manifest under the research data root. It re-sanitizes
+URL-shaped and structured values and excludes headers, cookies, browser
+storage, request bodies, signed query values, and challenge material. Replay
+verifies the manifest schema, object schema, and SHA-256 digest, then performs
+fusion without starting Firefox or contacting the source.
+
+`capture-gc` is a dry run unless `--apply` is supplied. Review its manifest and
+object list before applying retention. A replay proves what the retained input
+produces under the current fusion logic; it does not prove that the live page
+is unchanged or complete.
 
 For a login or other user-controlled setup, open the persistent profile:
 
