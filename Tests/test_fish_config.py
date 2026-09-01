@@ -116,6 +116,125 @@ class GitPullFunctionTests(unittest.TestCase):
             0,
         )
 
+    def test_deleted_upstream_updates_stale_default_before_preserving_dirty_changes(self):
+        tracked = self.seed / "tracked.txt"
+        tracked.write_text("upstream\n")
+        self.git("-C", str(self.seed), "add", tracked.name)
+        self.git("-C", str(self.seed), "commit", "-m", "branch version")
+        self.git("-C", str(self.seed), "push", "origin", "test/pruned-upstream")
+
+        self.git("-C", str(self.seed), "switch", "main")
+        tracked.write_text("upstream\n")
+        self.git("-C", str(self.seed), "add", tracked.name)
+        self.git("-C", str(self.seed), "commit", "-m", "main version")
+        self.git("-C", str(self.seed), "push", "origin", "main")
+
+        self.git("-C", str(self.checkout), "fetch", "origin")
+        self.git(
+            "-C",
+            str(self.checkout),
+            "merge",
+            "--ff-only",
+            "origin/test/pruned-upstream",
+        )
+        dirty_contents = "upstream\nlocal change\n"
+        checkout_tracked = self.checkout / tracked.name
+        checkout_tracked.write_text(dirty_contents)
+        dirty_status = self.git(
+            "-C", str(self.checkout), "status", "--short"
+        ).stdout
+        stale_main = self.git(
+            "-C", str(self.checkout), "rev-parse", "main"
+        ).stdout.strip()
+        self.git(
+            "-C",
+            str(self.remote),
+            "update-ref",
+            "-d",
+            "refs/heads/test/pruned-upstream",
+        )
+
+        result = self.gpl()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current_branch(), "main")
+        self.assertIn("was deleted; switching to 'main'", result.stdout)
+        self.assertNotEqual(
+            self.git("-C", str(self.checkout), "rev-parse", "main").stdout.strip(),
+            stale_main,
+        )
+        self.assertEqual(
+            self.git("-C", str(self.checkout), "rev-parse", "main").stdout.strip(),
+            self.git(
+                "-C", str(self.checkout), "rev-parse", "origin/main"
+            ).stdout.strip(),
+        )
+        self.assertEqual(checkout_tracked.read_text(), dirty_contents)
+        self.assertEqual(
+            self.git("-C", str(self.checkout), "status", "--short").stdout,
+            dirty_status,
+        )
+
+    def test_deleted_upstream_refuses_diverged_local_default(self):
+        self.git("-C", str(self.checkout), "switch", "main")
+        self.git(
+            "-C",
+            str(self.checkout),
+            "config",
+            "user.name",
+            "Test Fixture",
+        )
+        self.git(
+            "-C",
+            str(self.checkout),
+            "config",
+            "user.email",
+            "fixture@example.invalid",
+        )
+        self.git(
+            "-C",
+            str(self.checkout),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "local main",
+        )
+        local_main = self.git(
+            "-C", str(self.checkout), "rev-parse", "main"
+        ).stdout.strip()
+        self.git("-C", str(self.checkout), "switch", "test/pruned-upstream")
+
+        self.git("-C", str(self.seed), "switch", "main")
+        self.git(
+            "-C",
+            str(self.seed),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "remote main",
+        )
+        self.git("-C", str(self.seed), "push", "origin", "main")
+        self.git(
+            "-C",
+            str(self.remote),
+            "update-ref",
+            "-d",
+            "refs/heads/test/pruned-upstream",
+        )
+
+        result = self.gpl()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.current_branch(), "test/pruned-upstream")
+        self.assertIn(
+            "Local branch 'main' has diverged from 'origin/main'; refusing to switch.",
+            result.stderr,
+        )
+        self.assertEqual(
+            self.git("-C", str(self.checkout), "rev-parse", "main").stdout.strip(),
+            local_main,
+        )
+
     def test_pruned_branch_without_tracking_switches_to_remote_default(self):
         self.git(
             "-C",
