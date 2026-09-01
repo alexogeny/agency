@@ -35,6 +35,13 @@ class GlobalAgentGuidanceTests(unittest.TestCase):
         )
         self.assertIn("For every executable-code change", skill)
 
+    def test_performance_claims_match_the_resource_measured(self):
+        guidance = (ROOT / "Agents/AGENTS.md").read_text()
+        skill = (ROOT / "Skills/benchmark/SKILL.md").read_text()
+
+        self.assertRegex(guidance, r"not an instruction-count\s+contest")
+        self.assertRegex(skill, r"not a universal\s+optimisation score or veto")
+
 
 class WorkstationManifestTests(unittest.TestCase):
     def test_shellcheck_and_firefox_are_native_packages(self):
@@ -453,6 +460,7 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("docs-exec", result.stdout)
         self.assertIn("evidence-review", result.stdout)
         self.assertIn("perf-diagnose", result.stdout)
+        self.assertIn("resource-bench", result.stdout)
         self.assertIn("performance-design", result.stdout)
         self.assertIn("comment-audit", result.stdout)
         self.assertIn("No changes were made", result.stdout)

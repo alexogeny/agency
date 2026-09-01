@@ -118,6 +118,7 @@ agency_plan_user_links() {
     document-inspect
     evidence-review
     instruction-bench
+    resource-bench
     perf-diagnose
     repo-map
     repository-setup

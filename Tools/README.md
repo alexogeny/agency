@@ -77,13 +77,16 @@ are always blocked. The tool can restrict output to selected components and
 never mutates GitHub settings; the `setup-repository` skill owns the live
 audit, human-facing preview, authorisation, ordering, and read-back workflow.
 
-## `instruction-bench`
+## `resource-bench`
 
-Runs declarative, CPU-pinned, interleaved baseline/candidate comparisons with
-`perf stat`, measuring retired userspace instructions only. It verifies stable
-output evidence and retains raw counts plus reproducibility metadata in JSON.
-Use `instruction-bench --help`; the global `benchmark` skill contains the TOML
-format and evidence rules.
+Runs declarative, CPU-pinned, interleaved baseline/candidate comparisons with a
+claim-matched primary metric and optional context metrics. It collects `perf`
+events, sampled process-tree RSS/PSS, and structured JSON metrics emitted by a
+workload or profiler for allocation, copying, I/O, transfers, latency, or
+throughput. It verifies stable output evidence and retains raw samples, units,
+methods, dispersion, absolute and relative deltas, and reproducibility metadata.
+Use `resource-bench --help`; `instruction-bench` remains a compatibility entry
+point that defaults to retired instructions.
 
 ## `document-inspect`
 
@@ -109,8 +112,9 @@ judgements.
 ## `perf-diagnose`
 
 Captures `perf stat` counters or `perf record` profiles with machine metadata
-and a machine-readable manifest. Its results are explicitly diagnostic; use
-`instruction-bench` for evidence supporting optimisation claims.
+and a machine-readable manifest. A single diagnostic run locates work; use
+`resource-bench` for repeated equivalent comparisons supporting optimisation
+claims.
 
 ## `comment-audit`
 

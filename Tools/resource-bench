@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import platform
+import statistics
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import tomllib
+
+
+DEFAULT_METRIC = {
+    "name": "instructions",
+    "source": "perf",
+    "event": "instructions:u",
+    "unit": "instructions",
+    "direction": "lower",
+}
+
+
+def fail(message, code=1):
+    print(f"\033[1;31merror:\033[0m {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def command_output(command):
+    result = subprocess.run(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def read_spec(path):
+    try:
+        with path.open("rb") as source:
+            spec = tomllib.load(source)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        fail(f"cannot read benchmark spec {path}: {error}", 2)
+    required = {"name", "cpu", "baseline", "candidate"}
+    missing = required - spec.keys()
+    if missing:
+        fail(f"benchmark spec is missing: {', '.join(sorted(missing))}", 2)
+    if not isinstance(spec["cpu"], int) or spec["cpu"] < 0:
+        fail("cpu must be a non-negative integer", 2)
+    spec["runs"] = spec.get("runs", 7)
+    spec["warmups"] = spec.get("warmups", 2)
+    if not isinstance(spec["runs"], int) or spec["runs"] < 3:
+        fail("runs must be an integer of at least 3", 2)
+    if not isinstance(spec["warmups"], int) or spec["warmups"] < 1:
+        fail("warmups must be an integer of at least 1", 2)
+    spec["output_equivalence"] = spec.get("output_equivalence", "exact")
+    if spec["output_equivalence"] not in {"exact", "per-arm"}:
+        fail("output_equivalence must be 'exact' or 'per-arm'", 2)
+    spec["sample_interval_ms"] = spec.get("sample_interval_ms", 5)
+    if (
+        not isinstance(spec["sample_interval_ms"], int)
+        or spec["sample_interval_ms"] < 1
+    ):
+        fail("sample_interval_ms must be a positive integer", 2)
+    metrics = spec.get("metrics", [DEFAULT_METRIC.copy()])
+    if not isinstance(metrics, list) or not metrics:
+        fail("metrics must be a non-empty array of tables", 2)
+    spec["metrics"] = [validate_metric(metric) for metric in metrics]
+    names = [metric["name"] for metric in spec["metrics"]]
+    if len(names) != len(set(names)):
+        fail("metric names must be unique", 2)
+    spec["primary_metric"] = spec.get("primary_metric", names[0])
+    if spec["primary_metric"] not in names:
+        fail("primary_metric must name a configured metric", 2)
+    for name in ("baseline", "candidate"):
+        validate_arm(name, spec[name], path.parent)
+        if any(metric["source"] == "json" for metric in spec["metrics"]):
+            if "metrics_file" not in spec[name]:
+                fail(f"{name}.metrics_file is required for JSON metrics", 2)
+    return spec
+
+
+def validate_metric(metric):
+    if not isinstance(metric, dict):
+        fail("each metric must be a TOML table", 2)
+    metric = metric.copy()
+    for key in ("name", "source", "unit"):
+        if not isinstance(metric.get(key), str) or not metric[key]:
+            fail(f"metric.{key} must be a non-empty string", 2)
+    if metric["source"] not in {"perf", "procfs", "json"}:
+        fail("metric.source must be 'perf', 'procfs', or 'json'", 2)
+    metric["direction"] = metric.get("direction", "lower")
+    if metric["direction"] not in {"lower", "higher"}:
+        fail("metric.direction must be 'lower' or 'higher'", 2)
+    if metric["source"] == "perf":
+        if not isinstance(metric.get("event"), str) or not metric["event"]:
+            fail("perf metrics require a non-empty event", 2)
+    if metric["source"] == "procfs":
+        if metric.get("field") not in {"rss", "pss"}:
+            fail("procfs metrics require field = 'rss' or 'pss'", 2)
+        if metric["unit"] != "bytes":
+            fail("procfs metrics use unit = 'bytes'", 2)
+        metric["aggregation"] = "observed_peak_process_tree"
+    if metric["source"] == "json":
+        if not isinstance(metric.get("key"), str) or not metric["key"]:
+            fail("JSON metrics require a non-empty key", 2)
+        if not isinstance(metric.get("method"), str) or not metric["method"]:
+            fail("JSON metrics require a non-empty method", 2)
+    return metric
+
+
+def validate_arm(name, arm, spec_root):
+    if not isinstance(arm, dict):
+        fail(f"{name} must be a TOML table", 2)
+    command = arm.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(value, str) and value for value in command)
+    ):
+        fail(f"{name}.command must be a non-empty string array", 2)
+    cwd = resolve_path(spec_root, arm.get("cwd", "."))
+    if not cwd.is_dir():
+        fail(f"{name}.cwd is not a directory: {cwd}", 2)
+    environment = arm.get("environment", {})
+    if not isinstance(environment, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in environment.items()
+    ):
+        fail(f"{name}.environment must contain string values", 2)
+    if "result_file" in arm and not isinstance(arm["result_file"], str):
+        fail(f"{name}.result_file must be a path string", 2)
+    if "metrics_file" in arm and not isinstance(arm["metrics_file"], str):
+        fail(f"{name}.metrics_file must be a path string", 2)
+
+
+def resolve_path(root, value):
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def child_environment(arm):
+    environment = os.environ.copy()
+    environment.update(arm.get("environment", {}))
+    return environment
+
+
+def file_revision(path):
+    try:
+        details = path.stat()
+    except OSError:
+        return None
+    return (details.st_mtime_ns, details.st_ctime_ns, details.st_size)
+
+
+def temporary_path(prefix, suffix):
+    scratch = Path.home() / "Scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=prefix, suffix=suffix, dir=scratch, delete=False
+    )
+    handle.close()
+    return Path(handle.name)
+
+
+def process_tree(root_pid):
+    pending = [root_pid]
+    found = []
+    while pending:
+        pid = pending.pop()
+        if pid in found:
+            continue
+        found.append(pid)
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+        except OSError:
+            continue
+        pending.extend(int(child) for child in children)
+    return found
+
+
+def process_tree_memory(root_pid):
+    totals = {"rss": 0, "pss": 0}
+    observed = False
+    pids = process_tree(root_pid)
+    for pid in pids:
+        try:
+            lines = Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines()
+        except OSError:
+            continue
+        values = {}
+        for line in lines:
+            key, separator, rest = line.partition(":")
+            if separator and key in {"Rss", "Pss"}:
+                values[key.lower()] = int(rest.split()[0]) * 1024
+        if values:
+            observed = True
+            for name in totals:
+                totals[name] += values.get(name, 0)
+    totals["processes"] = len(pids)
+    return totals if observed else None
+
+
+def launch_and_observe(launch, cwd, environment, cpu, sample_memory, interval_ms):
+    process = subprocess.Popen(
+        launch,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=lambda: os.sched_setaffinity(0, {cpu}),
+    )
+    if not sample_memory:
+        stdout, stderr = process.communicate()
+        return process.returncode, stdout, stderr, []
+    memory_samples = []
+    if sample_memory:
+        sample = process_tree_memory(process.pid)
+        if sample:
+            memory_samples.append(sample)
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=interval_ms / 1000)
+            break
+        except subprocess.TimeoutExpired:
+            if sample_memory:
+                sample = process_tree_memory(process.pid)
+                if sample:
+                    memory_samples.append(sample)
+    if sample_memory:
+        sample = process_tree_memory(process.pid)
+        if sample:
+            memory_samples.append(sample)
+    return process.returncode, stdout, stderr, memory_samples
+
+
+def run_command(arm, spec_root, cpu, metrics, measured, sample_interval_ms):
+    cwd = resolve_path(spec_root, arm.get("cwd", "."))
+    command = arm["command"]
+    environment = child_environment(arm)
+    perf_path = None
+    perf_metrics = [metric for metric in metrics if metric["source"] == "perf"]
+    procfs_metrics = [metric for metric in metrics if metric["source"] == "procfs"]
+    json_metrics = [metric for metric in metrics if metric["source"] == "json"]
+    metrics_path = (
+        resolve_path(cwd, arm["metrics_file"])
+        if measured and json_metrics
+        else None
+    )
+    metrics_revision = file_revision(metrics_path) if metrics_path else None
+    result_path = (
+        resolve_path(cwd, arm["result_file"]) if "result_file" in arm else None
+    )
+    result_revision = file_revision(result_path) if result_path else None
+    if measured and perf_metrics:
+        perf_path = temporary_path("resource-bench-", ".perf")
+        launch = [
+            "perf",
+            "stat",
+            "--no-big-num",
+            "-x",
+            "\t",
+            "-o",
+            str(perf_path),
+        ]
+        for metric in perf_metrics:
+            launch.extend(["-e", metric["event"]])
+        launch.extend(["--", *command])
+    else:
+        launch = command
+    try:
+        returncode, stdout, stderr, memory_samples = launch_and_observe(
+            launch,
+            cwd,
+            environment,
+            cpu,
+            measured and bool(procfs_metrics),
+            sample_interval_ms,
+        )
+        if returncode != 0:
+            message = stderr.decode(errors="replace").strip()
+            fail(f"command failed ({returncode}): {' '.join(command)}\n{message}")
+        evidence = stdout
+        evidence_source = "stdout"
+        if result_path:
+            if file_revision(result_path) == result_revision:
+                fail(f"result_file {result_path} did not change during the run")
+            try:
+                evidence = result_path.read_bytes()
+            except OSError as error:
+                fail(f"cannot read result_file {result_path}: {error}")
+            evidence_source = str(result_path)
+        if not evidence and not arm.get("allow_empty_output", False):
+            fail(
+                f"{' '.join(command)} produced empty equivalence evidence; "
+                "set result_file or explicitly allow_empty_output"
+            )
+        values = {}
+        if measured and perf_metrics:
+            values.update(parse_perf(perf_path, perf_metrics))
+        if measured and procfs_metrics:
+            if not memory_samples:
+                fail(
+                    "procfs recorded no memory sample; increase the workload "
+                    "duration or use a workload-produced metric"
+                )
+            if perf_metrics and not any(
+                sample["processes"] > 1 for sample in memory_samples
+            ):
+                fail("procfs never observed the measured child process")
+            for metric in procfs_metrics:
+                values[metric["name"]] = max(
+                    sample[metric["field"]] for sample in memory_samples
+                )
+        if measured:
+            if metrics_path and file_revision(metrics_path) == metrics_revision:
+                fail(
+                    f"metrics_file {metrics_path} did not change during the "
+                    "measured run"
+                )
+            values.update(read_json_metrics(arm, cwd, metrics))
+        observation = {
+            "metrics": values,
+            "output_sha256": hashlib.sha256(evidence).hexdigest(),
+            "output_bytes": len(evidence),
+            "output_source": evidence_source,
+        }
+        if memory_samples:
+            observation["procfs_samples"] = len(memory_samples)
+        return observation
+    finally:
+        if perf_path and perf_path.exists():
+            perf_path.unlink()
+
+
+def parse_perf(path, metrics):
+    events = {metric["event"]: metric["name"] for metric in metrics}
+    values = {}
+    for line in path.read_text().splitlines():
+        fields = line.split("\t")
+        if len(fields) < 3 or fields[2].strip() not in events:
+            continue
+        value = fields[0].strip()
+        if value.startswith("<"):
+            continue
+        try:
+            parsed = float(value)
+        except ValueError:
+            fail(f"could not parse perf count: {line}")
+        values[events[fields[2].strip()]] = parsed
+    missing = [
+        metric["event"] for metric in metrics if metric["name"] not in values
+    ]
+    if missing:
+        fail(f"perf returned no supported count for: {', '.join(missing)}")
+    return values
+
+
+def read_json_metrics(arm, cwd, metrics):
+    selected = [metric for metric in metrics if metric["source"] == "json"]
+    if not selected:
+        return {}
+    path = resolve_path(cwd, arm["metrics_file"])
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"cannot read metrics_file {path}: {error}")
+    values = {}
+    for metric in selected:
+        value = payload
+        try:
+            for component in metric["key"].split("."):
+                value = value[component]
+        except (KeyError, TypeError):
+            fail(f"metrics_file {path} has no numeric key {metric['key']}")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            fail(f"metrics_file key {metric['key']} is not numeric")
+        if not math.isfinite(value):
+            fail(f"metrics_file key {metric['key']} is not finite")
+        values[metric["name"]] = value
+    return values
+
+
+def git_state(cwd):
+    head = command_output(["git", "-C", str(cwd), "rev-parse", "HEAD"])
+    if not head:
+        return None
+    status = subprocess.run(
+        ["git", "-C", str(cwd), "status", "--porcelain=v1"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).stdout
+    return {
+        "head": head,
+        "dirty": bool(status.strip()),
+        "status_sha256": hashlib.sha256(status.encode()).hexdigest(),
+    }
+
+
+def arm_metadata(arm, spec_root):
+    cwd = resolve_path(spec_root, arm.get("cwd", "."))
+    return {
+        "label": arm.get("label"),
+        "command": arm["command"],
+        "cwd": str(cwd),
+        "environment_names": sorted(arm.get("environment", {})),
+        "result_file": arm.get("result_file"),
+        "metrics_file": arm.get("metrics_file"),
+        "allow_empty_output": bool(arm.get("allow_empty_output", False)),
+        "git": git_state(cwd),
+    }
+
+
+def summary(values):
+    median = statistics.median(values)
+    deviations = [abs(value - median) for value in values]
+    return {
+        "samples": values,
+        "median": median,
+        "minimum": min(values),
+        "maximum": max(values),
+        "median_absolute_deviation": statistics.median(deviations),
+    }
+
+
+def machine_metadata(cpu):
+    model = None
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    return {
+        "architecture": platform.machine(),
+        "kernel": platform.release(),
+        "cpu": cpu,
+        "cpu_model": model,
+        "python": platform.python_version(),
+        "perf": command_output(["perf", "--version"]),
+    }
+
+
+def metric_metadata(metric, sample_interval_ms):
+    retained = {
+        key: value
+        for key, value in metric.items()
+        if key
+        in {
+            "source",
+            "unit",
+            "direction",
+            "event",
+            "field",
+            "key",
+            "method",
+            "aggregation",
+        }
+    }
+    if metric["source"] == "procfs":
+        retained["sample_interval_ms"] = sample_interval_ms
+        retained["scope"] = "benchmark process tree"
+    return retained
+
+
+def compare_metric(metric, baseline, candidate, sample_interval_ms):
+    baseline_summary = summary(baseline)
+    candidate_summary = summary(candidate)
+    absolute_change = candidate_summary["median"] - baseline_summary["median"]
+    if baseline_summary["median"] == 0:
+        relative_change = None
+        improvement = None
+    else:
+        relative_change = absolute_change / abs(baseline_summary["median"]) * 100
+        improvement = (
+            -relative_change if metric["direction"] == "lower" else relative_change
+        )
+    return {
+        **metric_metadata(metric, sample_interval_ms),
+        "baseline": baseline_summary,
+        "candidate": candidate_summary,
+        "absolute_change": absolute_change,
+        "relative_change_percent": relative_change,
+        "improvement_percent": improvement,
+    }
+
+
+def benchmark(spec, spec_path):
+    spec_root = spec_path.parent
+    cpu = spec["cpu"]
+    available = os.sched_getaffinity(0)
+    if cpu not in available:
+        fail(
+            f"cpu {cpu} is not in this process's affinity set: "
+            f"{sorted(available)}",
+            2,
+        )
+    observed_hashes = {"baseline": set(), "candidate": set()}
+    for _ in range(spec["warmups"]):
+        for name in ("baseline", "candidate"):
+            observation = run_command(
+                spec[name],
+                spec_root,
+                cpu,
+                spec["metrics"],
+                False,
+                spec["sample_interval_ms"],
+            )
+            observed_hashes[name].add(observation["output_sha256"])
+    samples = {
+        name: {metric["name"]: [] for metric in spec["metrics"]}
+        for name in ("baseline", "candidate")
+    }
+    raw = []
+    for index in range(spec["runs"]):
+        order = (
+            ("baseline", "candidate") if index % 2 == 0 else ("candidate", "baseline")
+        )
+        for name in order:
+            observation = run_command(
+                spec[name],
+                spec_root,
+                cpu,
+                spec["metrics"],
+                True,
+                spec["sample_interval_ms"],
+            )
+            observed_hashes[name].add(observation["output_sha256"])
+            for metric_name, value in observation["metrics"].items():
+                samples[name][metric_name].append(value)
+            raw.append({"round": index + 1, "arm": name, **observation})
+    for name, hashes in observed_hashes.items():
+        if len(hashes) != 1:
+            fail(f"{name} output evidence changed across runs: {sorted(hashes)}")
+    if (
+        spec["output_equivalence"] == "exact"
+        and observed_hashes["baseline"] != observed_hashes["candidate"]
+    ):
+        fail("baseline and candidate output evidence differs")
+    comparisons = {
+        metric["name"]: compare_metric(
+            metric,
+            samples["baseline"][metric["name"]],
+            samples["candidate"][metric["name"]],
+            spec["sample_interval_ms"],
+        )
+        for metric in spec["metrics"]
+    }
+    result = {
+        "schema": "agency/resource-bench/1",
+        "name": spec["name"],
+        "primary_metric": spec["primary_metric"],
+        "runs": spec["runs"],
+        "warmups": spec["warmups"],
+        "output_equivalence": spec["output_equivalence"],
+        "machine": machine_metadata(cpu),
+        "baseline": arm_metadata(spec["baseline"], spec_root),
+        "candidate": arm_metadata(spec["candidate"], spec_root),
+        "metrics": comparisons,
+        "raw_order": raw,
+    }
+    if "instructions" in comparisons:
+        result["instruction_reduction_percent"] = comparisons["instructions"][
+            "improvement_percent"
+        ]
+    return result
+
+
+def display_value(value, unit):
+    if isinstance(value, float) and not value.is_integer():
+        rendered = f"{value:,.3f}"
+    else:
+        rendered = f"{value:,.0f}"
+    return f"{rendered} {unit}"
+
+
+def print_summary(result):
+    name = result["primary_metric"]
+    primary = result["metrics"][name]
+    print(f"\033[1;35m◇ {result['name']}\033[0m")
+    print(f"  primary    {name}")
+    print(
+        f"  baseline   "
+        f"{display_value(primary['baseline']['median'], primary['unit'])}"
+    )
+    print(
+        f"  candidate  "
+        f"{display_value(primary['candidate']['median'], primary['unit'])}"
+    )
+    change = display_value(primary["absolute_change"], primary["unit"])
+    relative = primary["relative_change_percent"]
+    relative_text = "undefined" if relative is None else f"{relative:+.2f}%"
+    print(f"  change     {change} ({relative_text})")
+    for metric_name, comparison in result["metrics"].items():
+        if metric_name == name:
+            continue
+        improvement = comparison["improvement_percent"]
+        improvement_text = (
+            "undefined" if improvement is None else f"{improvement:+.2f}%"
+        )
+        print(f"  context    {metric_name} {improvement_text} improvement")
+    print(
+        f"  evidence   {result['runs']} interleaved runs · "
+        f"output {result['output_equivalence']}"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare claim-matched resource metrics with an interleaved, "
+            "output-checked workload."
+        )
+    )
+    parser.add_argument("spec", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    arguments = parser.parse_args()
+    spec_path = arguments.spec.resolve()
+    spec = read_spec(spec_path)
+    if arguments.dry_run:
+        plan = {
+            "name": spec["name"],
+            "cpu": spec["cpu"],
+            "runs": spec["runs"],
+            "warmups": spec["warmups"],
+            "primary_metric": spec["primary_metric"],
+            "metrics": spec["metrics"],
+            "baseline": arm_metadata(spec["baseline"], spec_path.parent),
+            "candidate": arm_metadata(spec["candidate"], spec_path.parent),
+        }
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return
+    if arguments.output and arguments.output.exists() and not arguments.force:
+        fail(f"output exists: {arguments.output}; pass --force to replace it", 2)
+    result = benchmark(spec, spec_path)
+    encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if arguments.output:
+        arguments.output.parent.mkdir(parents=True, exist_ok=True)
+        arguments.output.write_text(encoded)
+    if arguments.json:
+        print(encoded, end="")
+    else:
+        print_summary(result)
+        if arguments.output:
+            print(f"  raw        {arguments.output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()

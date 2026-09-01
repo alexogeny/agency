@@ -179,19 +179,22 @@ perf-diagnose record --event cycles:u --output profile.data \
 ```
 
 Profiles suggest causes; they do not prove an improvement. The
-[`benchmark`](Skills/benchmark/SKILL.md) skill and `instruction-bench` compare
+[`benchmark`](Skills/benchmark/SKILL.md) skill and `resource-bench` compare
 equivalent baseline and candidate workloads with repeated, CPU-pinned,
-interleaved retired userspace instruction samples:
+interleaved measurements of the resource named by the claim:
 
 ```console
-instruction-bench SPEC.toml --dry-run
-instruction-bench SPEC.toml --output results.json
+resource-bench SPEC.toml --dry-run
+resource-bench SPEC.toml --output results.json
 ```
 
 The retained JSON includes every sample, dispersion, commands, environment,
-Git state, and output-equivalence evidence. A lower instruction count supports
-a claim about less executed work—not automatically lower latency, energy, or
-cost.
+Git state, output-equivalence evidence, collection methods, units, and absolute
+and relative deltas. Retired instructions measure executed CPU work; direct
+allocation, copied-byte, RSS/PSS, I/O, latency, or throughput metrics support
+claims about those resources. A material resource reduction remains a real win
+when instructions are flat, but it does not establish an unmeasured downstream
+benefit.
 
 ### Stamp out repository plumbing
 
