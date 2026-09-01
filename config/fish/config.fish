@@ -98,13 +98,28 @@ if status is-interactive
                 end
 
                 set --local default_branch (string replace -- "refs/remotes/$remote/" '' "$default_ref")
+                set --local local_default_ref "refs/heads/$default_branch"
+                if git show-ref --verify --quiet "$local_default_ref"
+                    if not git merge-base --is-ancestor "$local_default_ref" "$default_ref"
+                        printf "Local branch '%s' has diverged from '%s/%s'; refusing to switch.\n" "$default_branch" "$remote" "$default_branch" >&2
+                        return 1
+                    end
+
+                    set --local local_default_oid (git rev-parse "$local_default_ref")
+                    or return
+                    set --local remote_default_oid (git rev-parse "$default_ref")
+                    or return
+                    git update-ref -m "gpl: fast-forward to $remote/$default_branch" "$local_default_ref" "$remote_default_oid" "$local_default_oid"
+                    or return
+                end
+
                 if test "$tracking_missing" = true
                     printf "Remote branch '%s/%s' does not exist; switching to '%s'.\n" "$remote" "$upstream_branch" "$default_branch"
                 else
                     printf "Upstream '%s/%s' was deleted; switching to '%s'.\n" "$remote" "$upstream_branch" "$default_branch"
                 end
 
-                if git show-ref --verify --quiet "refs/heads/$default_branch"
+                if git show-ref --verify --quiet "$local_default_ref"
                     git switch "$default_branch"
                 else
                     git switch --track "$remote/$default_branch"
