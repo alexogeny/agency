@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+RESET = "\033[0m"
+DIM = "\033[2m"
+RED = "\033[1;31m"
+YELLOW = "\033[1;33m"
+PURPLE = "\033[1;35m"
+PINK = "\033[38;5;183m"
+LAVENDER = "\033[38;5;141m"
+SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+PULSE = ("·  ", "·· ", "···", " ··", "  ·", "   ")
+KINDS = {
+    "phase": ("◇", PURPLE),
+    "success": ("✓", PINK),
+    "warning": ("!", YELLOW),
+    "error": ("✕", RED),
+    "note": ("↳", LAVENDER),
+}
+
+
+def preferences():
+    mode = os.environ.get("AGENCY_UI", "auto").lower()
+    terminal = sys.stderr.isatty() and os.environ.get("TERM") != "dumb"
+    colour = terminal and mode != "plain" and "NO_COLOR" not in os.environ
+    motion = (
+        terminal
+        and mode == "auto"
+        and os.environ.get("AGENCY_MOTION") != "reduce"
+        and "CI" not in os.environ
+    )
+    return mode != "quiet", colour, motion
+
+
+def styled(value, colour, enabled):
+    return f"{colour}{value}{RESET}" if enabled else value
+
+
+def elapsed_text(seconds):
+    if seconds < 1:
+        return f"{round(seconds * 1000):d}ms"
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    return f"{round(seconds):d}s"
+
+
+def emit(kind, message, indent=0, duration=None):
+    visible, colour, _ = preferences()
+    if not visible and kind != "error":
+        return
+    icon, accent = KINDS[kind]
+    suffix = ""
+    if duration is not None:
+        timing = f"· {elapsed_text(duration)}"
+        suffix = f" {styled(timing, DIM, colour)}"
+    prefix = " " * indent
+    print(
+        f"{prefix}{styled(icon, accent, colour)} {message}{suffix}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def animation_line(label, indent, frame, started, colour):
+    try:
+        columns = os.get_terminal_size(sys.stderr.fileno()).columns or 80
+    except OSError:
+        columns = 80
+    elapsed = elapsed_text(time.monotonic() - started)
+    pulse = PULSE[frame % len(PULSE)]
+    available = max(12, columns - indent - len(elapsed) - len(pulse) - 7)
+    shortened = label if len(label) <= available else f"{label[: available - 1]}…"
+    icon = styled(SPINNER[frame % len(SPINNER)], LAVENDER, colour)
+    detail = styled(f"{pulse} {elapsed}", DIM, colour)
+    return f"{' ' * indent}{icon} {shortened} {detail}"
+
+
+def clear_animation():
+    sys.stderr.write("\r\033[2K")
+    sys.stderr.flush()
+
+
+def replay(handle, destination):
+    handle.seek(0)
+    shutil.copyfileobj(handle, destination)
+    destination.flush()
+
+
+def exit_status(returncode):
+    return returncode if returncode >= 0 else 128 + abs(returncode)
+
+
+def run_command(arguments):
+    command = arguments.command
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        emit("error", "A command is required")
+        return 2
+
+    visible, colour, motion = preferences()
+    started = time.monotonic()
+    if not arguments.capture:
+        emit("phase", arguments.label, arguments.indent)
+        try:
+            result = subprocess.run(command, check=False)
+        except KeyboardInterrupt:
+            emit("warning", f"Cancelled {arguments.label}", arguments.indent)
+            return 130
+        elapsed = time.monotonic() - started
+        if result.returncode == 0:
+            emit("success", arguments.success or arguments.label, arguments.indent, elapsed)
+        else:
+            emit("error", arguments.failure, arguments.indent, elapsed)
+        return exit_status(result.returncode)
+
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        try:
+            process = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+        except OSError as error:
+            emit("error", f"{arguments.failure}: {error}", arguments.indent)
+            return 127
+
+        try:
+            if not motion:
+                emit("phase", arguments.label, arguments.indent)
+                process.wait()
+            else:
+                frame = 0
+                while process.poll() is None:
+                    line = animation_line(arguments.label, arguments.indent, frame, started, colour)
+                    sys.stderr.write(f"\r\033[2K{line}")
+                    sys.stderr.flush()
+                    frame += 1
+                    try:
+                        process.wait(timeout=0.08)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except KeyboardInterrupt:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if motion and visible:
+                clear_animation()
+            emit("warning", f"Cancelled {arguments.label}", arguments.indent)
+            return 130
+
+        elapsed = time.monotonic() - started
+        if motion and visible:
+            clear_animation()
+        if process.returncode == 0:
+            if arguments.show_output:
+                replay(stdout, sys.stdout.buffer)
+                replay(stderr, sys.stderr.buffer)
+            emit("success", arguments.success or arguments.label, arguments.indent, elapsed)
+        else:
+            emit("error", arguments.failure, arguments.indent, elapsed)
+            replay(stdout, sys.stdout.buffer)
+            replay(stderr, sys.stderr.buffer)
+        return exit_status(process.returncode)
+
+
+def parser():
+    root = argparse.ArgumentParser(
+        prog="agency-ui",
+        description="Render calm, phased terminal progress without polluting command output.",
+    )
+    commands = root.add_subparsers(dest="subcommand", required=True)
+
+    status = commands.add_parser("status", help="print one styled status line")
+    status.add_argument("kind", choices=KINDS)
+    status.add_argument("message")
+    status.add_argument("--indent", type=int, default=0)
+
+    run = commands.add_parser("run", help="present one command as a bounded phase")
+    run.add_argument("--label", required=True)
+    run.add_argument("--success")
+    run.add_argument("--failure", default="Command failed")
+    run.add_argument("--indent", type=int, default=0)
+    run.add_argument("--capture", action="store_true")
+    run.add_argument("--show-output", action="store_true")
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    return root
+
+
+def main():
+    arguments = parser().parse_args()
+    if arguments.subcommand == "status":
+        emit(arguments.kind, arguments.message, arguments.indent)
+        return 0
+    return run_command(arguments)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

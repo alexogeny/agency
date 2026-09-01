@@ -60,10 +60,13 @@ class GitPullFunctionTests(unittest.TestCase):
             capture_output=True,
         )
 
-    def gpl(self):
+    def gpl(self, directory=None):
         environment = os.environ.copy()
         environment["HOME"] = str(self.home)
-        command = f"source {FISH_CONFIG}; cd {self.checkout}; gpl"
+        environment["AGENCY_UI"] = "plain"
+        environment["GIT_CEILING_DIRECTORIES"] = str(self.workspace.parent)
+        environment["PATH"] = f"{ROOT / 'Tools'}:{environment['PATH']}"
+        command = f"source {FISH_CONFIG}; cd {directory or self.checkout}; gpl"
         return subprocess.run(
             ["fish", "--no-config", "--interactive", "--command", command],
             text=True,
@@ -81,6 +84,40 @@ class GitPullFunctionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.current_branch(), "test/pruned-upstream")
+        self.assertIn("◇ Updating checkout", result.stderr)
+        self.assertIn("✓ test/pruned-upstream is already current", result.stderr)
+        self.assertNotIn("Already up to date", result.stderr)
+
+    def test_url_valued_tracking_remote_resolves_to_configured_remote(self):
+        ssh_url = "git@github.example:team/repository.git"
+        https_url = "https://github.example/team/repository.git"
+        rewrite_key = f"url.file://{self.remote}.insteadOf"
+        self.git("-C", str(self.checkout), "remote", "set-url", "origin", ssh_url)
+        self.git("-C", str(self.checkout), "config", "--add", rewrite_key, ssh_url)
+        self.git("-C", str(self.checkout), "config", "--add", rewrite_key, https_url)
+        self.git(
+            "-C",
+            str(self.checkout),
+            "config",
+            "branch.test/pruned-upstream.remote",
+            https_url,
+        )
+
+        result = self.gpl()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current_branch(), "test/pruned-upstream")
+        self.assertIn("✓ test/pruned-upstream is already current", result.stderr)
+        self.assertNotIn("No such remote", result.stderr)
+        self.assertNotIn("No such ref", result.stderr)
+
+    def test_outside_repository_fails_with_one_clear_message(self):
+        result = self.gpl(self.workspace)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("✕ This directory is not a Git repository", result.stderr)
+        self.assertNotIn("fatal:", result.stderr)
 
     def test_deleted_upstream_switches_to_remote_default_and_keeps_local_branch(self):
         self.git(
@@ -96,7 +133,10 @@ class GitPullFunctionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.current_branch(), "main")
-        self.assertIn("was deleted; switching to 'main'", result.stdout)
+        self.assertIn(
+            "Recovered deleted upstream origin/test/pruned-upstream through main",
+            result.stderr,
+        )
         self.assertEqual(
             self.git(
                 "-C", str(self.checkout), "rev-parse", "--abbrev-ref", "@{upstream}"
@@ -158,7 +198,10 @@ class GitPullFunctionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.current_branch(), "main")
-        self.assertIn("was deleted; switching to 'main'", result.stdout)
+        self.assertIn(
+            "Recovered deleted upstream origin/test/pruned-upstream through main",
+            result.stderr,
+        )
         self.assertNotEqual(
             self.git("-C", str(self.checkout), "rev-parse", "main").stdout.strip(),
             stale_main,
@@ -227,7 +270,7 @@ class GitPullFunctionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.current_branch(), "test/pruned-upstream")
         self.assertIn(
-            "Local branch 'main' has diverged from 'origin/main'; refusing to switch.",
+            "Local main diverged from origin/main; refusing to switch",
             result.stderr,
         )
         self.assertEqual(
@@ -256,8 +299,8 @@ class GitPullFunctionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.current_branch(), "main")
         self.assertIn(
-            "does not exist; switching to 'main'",
-            result.stdout,
+            "Recovered missing remote branch origin/test/pruned-upstream through main",
+            result.stderr,
         )
 
 

@@ -26,6 +26,28 @@ safe path from request to checked result.
 
 ## Hero stories
 
+### Keep terminal work calm and legible
+
+`agency-ui` gives interactive tools one shared visual language: soft
+pink-and-purple phases, smoothly animated work, compact success summaries, and
+full diagnostic output only when something fails. `gpl` and `git-get` use it to
+turn noisy Git transport into a short account of what changed.
+
+```text
+◇ Updating agency
+  ⠸ Fetching origin ·· 1.2s
+  ✓ origin is refreshed · 1.3s
+  ↳ Recovered deleted upstream through main
+  ✓ main is already current · 12ms
+```
+
+Presentation stays on stderr so stdout remains usable as data. Pipes, CI, and
+`TERM=dumb` receive stable plain output. Set `AGENCY_UI=plain` for an unstyled
+static view, `AGENCY_UI=quiet` to retain errors only, `AGENCY_MOTION=reduce` to
+disable animation, or `NO_COLOR` to remove colour without removing progress.
+SSH authentication remains interactive, so presentation never competes with a
+key passphrase prompt.
+
 ### Scale out without worktree choreography
 
 Parallel agents need ownership, not automatic isolation. Agency keeps an atomic
@@ -360,6 +382,9 @@ runtime for vendor launchers.
 
 ## What the workstation receives
 
+- **Terminal experience:** animated phased progress, compact results, quiet Git
+  transport, failure detail on demand, and accessible plain or reduced-motion
+  modes through `agency-ui`.
 - **Agents:** Codex CLI, Claude Code, and Pi with one portable global policy,
   shared skills, coordinated-worker profiles, and merged session hooks.
 - **Development:** uv, Bun, GitHub CLI, GitLab CLI, stable Rust, yay, h2load,

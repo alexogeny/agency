@@ -448,6 +448,7 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("1Password desktop", result.stdout)
         self.assertIn("1Password CLI", result.stdout)
         self.assertIn("1Password Firefox extension", result.stdout)
+        self.assertIn("agency-ui", result.stdout)
         self.assertIn("document-inspect", result.stdout)
         self.assertIn("docs-exec", result.stdout)
         self.assertIn("evidence-review", result.stdout)
