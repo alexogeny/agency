@@ -68,7 +68,7 @@ agency_prepare_scratch
 mkdir -p \
   "$HOME/.codex/agents" \
   "$HOME/.claude/agents" \
-  "$HOME/.pi/agent"
+  "$HOME/.pi/agent/extensions"
 mkdir -p "$HOME/.local/bin"
 agency_link "$AGENCY_DIR/Tools/agency-ui" "$HOME/.local/bin/agency-ui"
 agency_link "$AGENCY_DIR/Tools/git-get" "$HOME/.local/bin/git-get"
@@ -88,9 +88,11 @@ agency_link "$AGENCY_DIR/Tools/report-build" "$HOME/.local/bin/report-build"
 agency_link "$AGENCY_DIR/Tools/system-context" "$HOME/.local/bin/system-context"
 agency_link "$AGENCY_DIR/Tools/sudo-gui" "$HOME/.local/bin/sudo-gui"
 agency_link "$AGENCY_DIR/Tools/web-research" "$HOME/.local/bin/web-research"
+agency_link "$AGENCY_DIR/Tools/web-research-mcp" "$HOME/.local/bin/web-research-mcp"
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.claude/CLAUDE.md"
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.pi/agent/AGENTS.md"
+agency_link "$AGENCY_DIR/Agents/pi/agency-web.ts" "$HOME/.pi/agent/extensions/agency-web.ts"
 agency_link \
   "$AGENCY_DIR/Agents/codex/coordinated-worker.toml" \
   "$HOME/.codex/agents/coordinated-worker.toml"
@@ -137,6 +139,7 @@ agency_link "$AGENCY_DIR/config/git/hooks" "$HOME/.config/git/hooks"
 
 "$AGENCY_DIR/scripts/install-rust.sh" "${update_arguments[@]}"
 "$AGENCY_DIR/scripts/install-agent-clis.sh" "${update_arguments[@]}"
+"$AGENCY_DIR/scripts/configure-agent-tools.sh"
 "$AGENCY_DIR/scripts/install-python-tools.sh" "${update_arguments[@]}"
 
 mkdir -p "$HOME/.config/containers"

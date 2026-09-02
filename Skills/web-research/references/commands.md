@@ -8,7 +8,9 @@ search, extraction, proxy, or model APIs.
 
 ```console
 web-research search "QUERY" --engine auto --limit 10 --json --profile TASK
+web-research search "QUERY" --strategy federated --limit 10 --json --profile TASK
 web-research search "QUERY" --domain example.org --json
+web-research search "QUERY" --domain example.org --exclude-domain noise.example.org --json
 web-research search "QUERY" --json -- --literal-query-term
 web-research search "QUERY" --engine duckduckgo --limit 10 --json --profile TASK
 web-research search "QUERY" --engine brave --limit 10 --json --profile TASK
@@ -21,7 +23,7 @@ web-research download URL \
   --output "$HOME/Scratch/TASK/file.pdf" \
   --output-root "$HOME/Scratch/TASK" \
   --profile TASK --expected-type pdf --json
-web-research scrape URL --format markdown --profile TASK
+web-research scrape URL --format markdown --preflight --profile TASK
 web-research scrape URL --format json --include-frames --profile TASK
 web-research scrape URL --format json --interaction-steps 2 \
   --scroll-steps 2 --capture-network-json --profile TASK
@@ -30,7 +32,7 @@ web-research replay CAPTURE_ID --json
 web-research capture-gc --max-manifests 100 --json
 web-research search "QUERY" --json --profile TASK --profile-template current
 web-research scrape URL --format json --index --profile TASK --ephemeral-profile --profile-template current
-web-research scrape URL --format json --index --profile TASK
+web-research scrape URL --format json --preflight --profile TASK
 web-research scrape URL --output "$HOME/Scratch/TASK/page.md" --profile TASK
 web-research snapshot URL --format png --output "$HOME/Scratch/TASK/page.png" --profile TASK
 web-research snapshot URL --format pdf --output "$HOME/Scratch/TASK/page.pdf" --profile TASK
@@ -277,8 +279,10 @@ web-research stats
 `map` returns unique same-origin links found on the page. `crawl` performs a
 single-worker breadth-first crawl, follows only same-origin HTTP(S) links,
 obeys `robots.txt`, and writes extracted pages to the local SQLite FTS index.
-`scrape --index` adds one selected page. `local` queries only that retained
-index and does not contact the network.
+`scrape --index` adds one selected page. `scrape --preflight` first resolves the
+requested or canonical URL in that index, serves fresh or immutable extracted
+text locally, and renders then re-indexes a miss or stale entry. `local` queries
+only retained text and does not contact the network.
 
 The crawler normalizes common tracking parameters before deduplication, bounds
 the total queue with `--max-queue`, bounds unique additions from each page with

@@ -44,7 +44,18 @@ const webProtocols = new Set(["http:", "https:"]);
 const redirectStatuses = new Set([301, 302, 303, 307, 308]);
 
 type JsonObject = Record<string, unknown>;
-type SearchResult = { title: string; url: string; snippet: string };
+type SearchResult = {
+  title: string;
+  url: string;
+  snippet: string;
+  score?: number;
+  sources?: Array<{
+    engine: string;
+    rank: number;
+    title: string;
+    snippet: string;
+  }>;
+};
 type DiscoveryEvidence = SearchResult & {
   source: "search-result";
   query: string;
@@ -59,6 +70,18 @@ type RetrievalOptions = {
 type StructuredEvidence = {
   metadata: Record<string, string>;
   jsonLd: unknown[];
+};
+type ChangeLikelihood = "immutable" | "low" | "medium" | "high";
+type PageFreshness = {
+  retrieval: "live" | "local-index" | "offline-capture";
+  cache: "bypass" | "miss" | "stale" | "fresh" | "immutable";
+  change_likelihood: ChangeLikelihood;
+  basis: string[];
+  retrieved_at: string;
+  indexed_at: string | null;
+  refresh_after: string | null;
+  content_sha256: string;
+  changed?: boolean;
 };
 type PageAccessState = "public" | "soft-login" | "soft-challenge";
 type PageAction = {
@@ -110,6 +133,7 @@ type Page = {
   frames?: JsonObject[];
   provenance?: Record<string, EvidenceReference[]>;
   quality?: QualityObservation[];
+  freshness?: PageFreshness;
   capture_id?: string;
   outcome?: "partial";
   constraint?: "navigation-timeout";
@@ -1925,6 +1949,8 @@ function extractionExpression(options: BrowserOptions) {
     ['og:description', 'meta[property="og:description"]'],
     ['og:type', 'meta[property="og:type"]'],
     ['og:url', 'meta[property="og:url"]'],
+    ['article:modified_time', 'meta[property="article:modified_time"]'],
+    ['last-modified', 'meta[name="last-modified"], meta[name="modified"]'],
     ['twitter:title', 'meta[name="twitter:title"]'],
     ['twitter:description', 'meta[name="twitter:description"]'],
   ]) {
@@ -3093,21 +3119,33 @@ function checkedDomain(value: string) {
   return hostname;
 }
 
-function resultMatchesDomains(result: SearchResult, domains: string[]) {
-  if (!domains.length) return true;
+function resultMatchesDomains(
+  result: SearchResult,
+  domains: string[],
+  excludedDomains: string[],
+) {
   try {
     const hostname = new URL(result.url).hostname.toLowerCase().replace(/\.$/, "");
-    return domains.some(
+    const allowed = !domains.length || domains.some(
       (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
     );
+    const excluded = excludedDomains.some(
+      (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+    );
+    return allowed && !excluded;
   } catch {
     return false;
   }
 }
 
-function searchScope(query: string, domains: string[]) {
+function searchScope(
+  query: string,
+  domains: string[],
+  excludedDomains: string[],
+) {
   return {
     domains,
+    excluded_domains: excludedDomains,
     site_qualifier: /(?:^|\s)site:\S+/i.test(query)
       ? "best-effort"
       : "not-present",
@@ -3273,6 +3311,7 @@ async function searchOne(
   requestedEngine: string,
   limit: number,
   domains: string[],
+  excludedDomains: string[],
   state: SearchRunState,
   recordAttempt?: (attempt: SearchAttempt) => void,
 ) {
@@ -3301,12 +3340,17 @@ async function searchOne(
         String(
           await browser.bidi.evaluate(
             browser.context,
-            searchExpression(candidate, domains.length ? 50 : limit),
+            searchExpression(
+              candidate,
+              domains.length || excludedDomains.length ? 50 : limit,
+            ),
           ),
         ),
       ) as SearchResult[];
       const results = discoveredResults
-        .filter((result) => resultMatchesDomains(result, domains))
+        .filter((result) =>
+          resultMatchesDomains(result, domains, excludedDomains),
+        )
         .slice(0, limit);
       if (!results.length) {
         const attempt = {
@@ -3386,6 +3430,82 @@ async function searchOne(
   throw new Error("no healthy search provider returned a result");
 }
 
+async function searchFederated(
+  browser: Awaited<ReturnType<typeof startBrowser>>,
+  options: BrowserOptions,
+  query: string,
+  limit: number,
+  domains: string[],
+  excludedDomains: string[],
+  state: SearchRunState,
+  recordAttempt?: (attempt: SearchAttempt) => void,
+) {
+  const attempts: SearchAttempt[] = [];
+  const ranked = new Map<string, SearchResult>();
+  const errors: string[] = [];
+  for (const engine of ["duckduckgo", "brave", "bing"]) {
+    try {
+      const outcome = await searchOne(
+        browser,
+        options,
+        query,
+        engine,
+        limit,
+        domains,
+        excludedDomains,
+        state,
+        (attempt) => {
+          attempts.push(attempt);
+          recordAttempt?.(attempt);
+        },
+      );
+      for (const [index, result] of outcome.results.entries()) {
+        const rank = index + 1;
+        const source = {
+          engine,
+          rank,
+          title: result.title,
+          snippet: result.snippet,
+        };
+        const existing = ranked.get(result.url);
+        if (existing) {
+          existing.score = (existing.score || 0) + 1 / (60 + rank);
+          existing.sources?.push(source);
+        } else {
+          ranked.set(result.url, {
+            ...result,
+            score: 1 / (60 + rank),
+            sources: [source],
+          });
+        }
+      }
+    } catch (error) {
+      errors.push(
+        `${engine}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  const results = [...ranked.values()]
+    .sort(
+      (left, right) =>
+        (right.score || 0) - (left.score || 0) ||
+        left.url.localeCompare(right.url),
+    )
+    .slice(0, limit)
+    .map((result) => ({
+      ...result,
+      score: Math.round((result.score || 0) * 1_000_000) / 1_000_000,
+    }));
+  if (!results.length) {
+    throw new Error(
+      errors.length
+        ? `all search engines failed (${errors.join("; ")})`
+        : "no search provider returned a result",
+    );
+  }
+  return { engine: "federated", results, attempts };
+}
+
 function database() {
   mkdirSync(dataRoot, { recursive: true });
   const db = new Database(join(dataRoot, "index.sqlite"), { create: true });
@@ -3394,49 +3514,279 @@ function database() {
   db.run(
     "CREATE TABLE IF NOT EXISTS pages (url TEXT PRIMARY KEY, title TEXT NOT NULL, text TEXT NOT NULL, markdown TEXT NOT NULL, fetched_at TEXT NOT NULL)",
   );
+  const columns = new Set(
+    (db.query("PRAGMA table_info(pages)").all() as any[]).map(
+      (column) => String(column.name),
+    ),
+  );
+  const migrations = [
+    ["published", "TEXT NOT NULL DEFAULT ''"],
+    ["byline", "TEXT NOT NULL DEFAULT ''"],
+    ["links_json", "TEXT NOT NULL DEFAULT '[]'"],
+    ["sources_json", "TEXT NOT NULL DEFAULT '[]'"],
+    ["change_likelihood", "TEXT NOT NULL DEFAULT 'medium'"],
+    ["freshness_basis", "TEXT NOT NULL DEFAULT '[\"legacy-index-entry\"]'"],
+    ["refresh_after", "TEXT"],
+    ["content_sha256", "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [name, definition] of migrations) {
+    if (!columns.has(name)) {
+      db.run(`ALTER TABLE pages ADD COLUMN ${name} ${definition}`);
+    }
+  }
+  db.run(
+    "CREATE TABLE IF NOT EXISTS page_aliases (request_url TEXT PRIMARY KEY, page_url TEXT NOT NULL)",
+  );
   db.run(
     "CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, text, tokenize='unicode61')",
   );
   return db;
 }
 
+function normalizedPageUrl(value: string) {
+  try {
+    const url = new URL(redactedOutputUrl(value) || value);
+    url.hash = "";
+    return url.href;
+  } catch {
+    return value;
+  }
+}
+
 function pageIndexUrl(page: Page) {
-  return /^https?:\/\//.test(page.canonicalUrl)
-    ? page.canonicalUrl
-    : page.url;
+  return normalizedPageUrl(
+    /^https?:\/\//.test(page.canonicalUrl) ? page.canonicalUrl : page.url,
+  );
+}
+
+function structuredSignals(page: Page) {
+  const types = new Set<string>();
+  const modified: number[] = [];
+  let visited = 0;
+  const walk = (value: unknown, depth = 0) => {
+    if (visited >= 2_000 || depth > 8 || value === null) return;
+    visited += 1;
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, depth + 1);
+      return;
+    }
+    if (typeof value !== "object") return;
+    for (const [key, item] of Object.entries(value as JsonObject)) {
+      if (key === "@type") {
+        const values = Array.isArray(item) ? item : [item];
+        for (const type of values) types.add(String(type).toLocaleLowerCase());
+      } else if (key.toLocaleLowerCase() === "datemodified") {
+        const timestamp = Date.parse(String(item));
+        if (Number.isFinite(timestamp)) modified.push(timestamp);
+      }
+      walk(item, depth + 1);
+    }
+  };
+  walk(page.structured?.jsonLd || []);
+  const metadata = page.structured?.metadata || {};
+  for (const key of ["article:modified_time", "last-modified"]) {
+    const timestamp = Date.parse(metadata[key] || "");
+    if (Number.isFinite(timestamp)) modified.push(timestamp);
+  }
+  return { types, modified };
+}
+
+function freshnessPolicy(page: Page, retrievedAt: string) {
+  const published = Date.parse(page.published);
+  const now = Date.parse(retrievedAt);
+  const signals = structuredSignals(page);
+  const newestDocumentDate = Math.max(
+    Number.isFinite(published) ? published : 0,
+    ...signals.modified,
+  );
+  const identity =
+    `${page.title} ${page.canonicalUrl} ${page.url}`.toLocaleLowerCase();
+  const article =
+    /\b(article|paper|post|news|story|research)\b/.test(identity) ||
+    page.structured?.metadata?.["og:type"]?.toLocaleLowerCase() === "article" ||
+    [...signals.types].some((type) => /article|posting|report/.test(type));
+  const historical =
+    article &&
+    newestDocumentDate > 0 &&
+    newestDocumentDate <= now - 10 * 365.2425 * 24 * 60 * 60 * 1_000;
+  let changeLikelihood: ChangeLikelihood;
+  let basis: string[];
+  let ttl: number | null;
+  if (historical) {
+    changeLikelihood = "immutable";
+    basis = ["historical-published-article"];
+    ttl = null;
+  } else if (
+    /\b(status|incident|availability|outage|pricing|prices|schedule|scores?|weather|markets?|stocks?|live|latest)\b/.test(
+      identity,
+    )
+  ) {
+    changeLikelihood = "high";
+    basis = ["frequently-changing-subject"];
+    ttl = 24 * 60 * 60 * 1_000;
+  } else if (
+    /\b(terms|conditions|privacy|policy|policies|legal|security|documentation|docs|reference|changelog|releases?)\b/.test(
+      identity,
+    )
+  ) {
+    changeLikelihood = "medium";
+    basis = ["maintained-document"];
+    ttl = 14 * 24 * 60 * 60 * 1_000;
+  } else if (
+    newestDocumentDate > 0 &&
+    newestDocumentDate <= now - 2 * 365.2425 * 24 * 60 * 60 * 1_000
+  ) {
+    changeLikelihood = "low";
+    basis = ["older-published-document"];
+    ttl = 180 * 24 * 60 * 60 * 1_000;
+  } else {
+    changeLikelihood = "medium";
+    basis = [
+      Number.isFinite(published)
+        ? "recent-published-document"
+        : "undated-document",
+    ];
+    ttl = 14 * 24 * 60 * 60 * 1_000;
+  }
+  return {
+    changeLikelihood,
+    basis,
+    refreshAfter: ttl === null ? null : new Date(now + ttl).toISOString(),
+  };
+}
+
+function contentHash(page: Pick<Page, "markdown" | "text">) {
+  return createHash("sha256")
+    .update(page.markdown || page.text)
+    .digest("hex");
+}
+
+function parsedArray(value: unknown) {
+  try {
+    const parsed = JSON.parse(String(value || "[]"));
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+function cachedPage(url: string) {
+  const db = database();
+  try {
+    const normalized = normalizedPageUrl(url);
+    const row = db
+      .query(
+        "SELECT pages.* FROM pages WHERE pages.url = COALESCE((SELECT page_url FROM page_aliases WHERE request_url = ?), ?) LIMIT 1",
+      )
+      .get(normalized, normalized) as any;
+    if (!row) return { cache: "miss" as const };
+    const likelihood = new Set(["immutable", "low", "medium", "high"]).has(
+      row.change_likelihood,
+    )
+      ? (row.change_likelihood as ChangeLikelihood)
+      : "medium";
+    const immutable = likelihood === "immutable";
+    const fresh =
+      immutable ||
+      (typeof row.refresh_after === "string" &&
+        Date.parse(row.refresh_after) > Date.now());
+    if (!fresh) return { cache: "stale" as const };
+    const page: Page = {
+      title: String(row.title),
+      url: String(row.url),
+      canonicalUrl: String(row.url),
+      published: String(row.published || ""),
+      byline: String(row.byline || ""),
+      text: String(row.text),
+      markdown: String(row.markdown),
+      html: "",
+      links: parsedArray(row.links_json),
+      sources: [...new Set([...parsedArray(row.sources_json), "local-index"])],
+      freshness: {
+        retrieval: "local-index",
+        cache: immutable ? "immutable" : "fresh",
+        change_likelihood: likelihood,
+        basis: parsedArray(row.freshness_basis),
+        retrieved_at: String(row.fetched_at),
+        indexed_at: String(row.fetched_at),
+        refresh_after:
+          row.refresh_after === null ? null : String(row.refresh_after),
+        content_sha256: String(row.content_sha256 || contentHash(row)),
+      },
+    };
+    return { cache: page.freshness!.cache, page };
+  } finally {
+    db.close();
+  }
 }
 
 function pageIndexer() {
   const db = database();
   const upsert = db.query(
-    "INSERT INTO pages (url, title, text, markdown, fetched_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at",
+    "INSERT INTO pages (url, title, text, markdown, fetched_at, published, byline, links_json, sources_json, change_likelihood, freshness_basis, refresh_after, content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at, published=excluded.published, byline=excluded.byline, links_json=excluded.links_json, sources_json=excluded.sources_json, change_likelihood=excluded.change_likelihood, freshness_basis=excluded.freshness_basis, refresh_after=excluded.refresh_after, content_sha256=excluded.content_sha256",
+  );
+  const prior = db.query("SELECT content_sha256 FROM pages WHERE url = ?");
+  const addAlias = db.query(
+    "INSERT INTO page_aliases (request_url, page_url) VALUES (?, ?) ON CONFLICT(request_url) DO UPDATE SET page_url=excluded.page_url",
   );
   const removeSearch = db.query("DELETE FROM pages_fts WHERE url = ?");
   const addSearch = db.query(
     "INSERT INTO pages_fts (url, title, text) VALUES (?, ?, ?)",
   );
-  const write = db.transaction((page: Page) => {
-    const url = pageIndexUrl(page);
-    upsert.run(
-      url,
-      page.title,
-      page.text,
-      page.markdown,
-      new Date().toISOString(),
-    );
-    removeSearch.run(url);
-    addSearch.run(url, page.title, page.text);
-  });
+  const write = db.transaction(
+    (page: Page, requestedUrl = "", cache = "bypass") => {
+      const url = pageIndexUrl(page);
+      const indexedAt = new Date().toISOString();
+      const policy = freshnessPolicy(page, indexedAt);
+      const hash = contentHash(page);
+      const previous = prior.get(url) as any;
+      upsert.run(
+        url,
+        page.title,
+        page.text,
+        page.markdown,
+        indexedAt,
+        page.published,
+        page.byline,
+        JSON.stringify(page.links),
+        JSON.stringify(page.sources || []),
+        policy.changeLikelihood,
+        JSON.stringify(policy.basis),
+        policy.refreshAfter,
+        hash,
+      );
+      for (const alias of new Set(
+        [url, page.url, page.canonicalUrl, requestedUrl]
+          .filter(Boolean)
+          .map(normalizedPageUrl),
+      )) addAlias.run(alias, url);
+      removeSearch.run(url);
+      addSearch.run(url, page.title, page.text);
+      return {
+        retrieval: "live",
+        cache,
+        change_likelihood: policy.changeLikelihood,
+        basis: policy.basis,
+        retrieved_at: indexedAt,
+        indexed_at: indexedAt,
+        refresh_after: policy.refreshAfter,
+        content_sha256: hash,
+        ...(previous?.content_sha256
+          ? { changed: previous.content_sha256 !== hash }
+          : {}),
+      } as PageFreshness;
+    },
+  );
   return {
     write,
     close: () => db.close(),
   };
 }
 
-function indexPage(page: Page) {
+function indexPage(page: Page, requestedUrl = "", cache = "bypass") {
   const indexer = pageIndexer();
   try {
-    indexer.write(page);
+    return indexer.write(page, requestedUrl, cache);
   } finally {
     indexer.close();
   }
@@ -3543,9 +3893,13 @@ async function commandSearch(args: string[]) {
   const explicitProfile = args.includes("--profile") || args.includes("--ephemeral-profile");
   const options = browserOptions(args);
   const requestedEngine = takeOption(args, "--engine", "auto");
+  const strategy = takeOption(args, "--strategy", "first");
   const limit = takeNumber(args, "--limit", 10, 1, 50);
   const json = takeFlag(args, "--json");
   const domains = takeOptions(args, "--domain").map(checkedDomain);
+  const excludedDomains = takeOptions(args, "--exclude-domain").map(
+    checkedDomain,
+  );
   rejectUnknownOptions(args, "search");
   const query = [...args, ...literalQuery].join(" ").trim();
   if (!query) fail("search requires a query");
@@ -3553,25 +3907,49 @@ async function commandSearch(args: string[]) {
   if (!new Set(["auto", "duckduckgo", "brave", "bing"]).has(requestedEngine)) {
     fail("--engine must be auto, duckduckgo, brave, or bing");
   }
+  if (!new Set(["first", "federated"]).has(strategy)) {
+    fail("--strategy must be first or federated");
+  }
+  if (strategy === "federated" && requestedEngine !== "auto") {
+    fail("--strategy federated cannot be combined with an explicit --engine");
+  }
   if (!explicitProfile) {
     options.profile = "search";
     options.ephemeral = true;
   }
   const outcome = await withBrowser(options, async (browser) => {
-    return searchOne(
-      browser,
-      options,
-      query,
-      requestedEngine,
-      limit,
-      domains,
-      newSearchRunState(),
-    );
+    const state = newSearchRunState();
+    return strategy === "federated"
+      ? searchFederated(
+          browser,
+          options,
+          query,
+          limit,
+          domains,
+          excludedDomains,
+          state,
+        )
+      : searchOne(
+          browser,
+          options,
+          query,
+          requestedEngine,
+          limit,
+          domains,
+          excludedDomains,
+          state,
+        );
   });
-  const { engine, results } = outcome;
-  const scope = searchScope(query, domains);
+  const { engine, results, attempts } = outcome;
+  const scope = searchScope(query, domains, excludedDomains);
   if (json) {
-    console.log(JSON.stringify({ query, engine, scope, results }, null, 2));
+    console.log(
+      JSON.stringify(
+        { query, engine, strategy, scope, results, attempts },
+        null,
+        2,
+      ),
+    );
     return;
   }
   if (scope.site_qualifier === "best-effort" && !domains.length) {
@@ -3929,6 +4307,7 @@ async function commandSearchBatch(args: string[]) {
   const options = browserOptions(args);
   const outputValue = takeOption(args, "--output");
   const requestedEngine = takeOption(args, "--engine", "auto");
+  const strategy = takeOption(args, "--strategy", "first");
   const limit = takeNumber(args, "--limit", 10, 1, 50);
   const delayMs = takeNumber(args, "--delay-ms", 1_500, 0, 60_000);
   const jitterMs = takeNumber(args, "--jitter-ms", 500, 0, 60_000);
@@ -3937,11 +4316,20 @@ async function commandSearchBatch(args: string[]) {
   const retryFailures = takeFlag(args, "--retry-failures");
   const appendInput = takeFlag(args, "--append-input");
   const domains = takeOptions(args, "--domain").map(checkedDomain);
+  const excludedDomains = takeOptions(args, "--exclude-domain").map(
+    checkedDomain,
+  );
   if (appendInput && !resume) fail("--append-input requires --resume");
   if (!outputValue) fail("search-batch requires --output PATH");
   if (args.length !== 1) fail("search-batch requires one query file");
   if (!new Set(["auto", "duckduckgo", "brave", "bing"]).has(requestedEngine)) {
     fail("--engine must be auto, duckduckgo, brave, or bing");
+  }
+  if (!new Set(["first", "federated"]).has(strategy)) {
+    fail("--strategy must be first or federated");
+  }
+  if (strategy === "federated" && requestedEngine !== "auto") {
+    fail("--strategy federated cannot be combined with an explicit --engine");
   }
   const { input, queries } = batchQueries(args[0]);
   const output = checkedBatchOutput(outputValue, resume, "search-batch");
@@ -3989,28 +4377,41 @@ async function commandSearchBatch(args: string[]) {
     for (const [index, query] of pending.entries()) {
       summary.attempted += 1;
       try {
-        const result = await searchOne(
-          browser,
-          options,
-          query,
-          requestedEngine,
-          limit,
-          domains,
-          state,
-          (attempt) => {
-            health.record(
-              "provider",
-              attempt.engine,
-              attempt.outcome === "searched"
-                ? "success"
-                : attempt.outcome === "challenged"
-                  ? "challenged"
-                  : attempt.outcome,
-              attempt.duration_ms,
-              attempt.retry_after_seconds ?? null,
+        const recordAttempt = (attempt: SearchAttempt) => {
+          health.record(
+            "provider",
+            attempt.engine,
+            attempt.outcome === "searched"
+              ? "success"
+              : attempt.outcome === "challenged"
+                ? "challenged"
+                : attempt.outcome,
+            attempt.duration_ms,
+            attempt.retry_after_seconds ?? null,
+          );
+        };
+        const result = strategy === "federated"
+          ? await searchFederated(
+              browser,
+              options,
+              query,
+              limit,
+              domains,
+              excludedDomains,
+              state,
+              recordAttempt,
+            )
+          : await searchOne(
+              browser,
+              options,
+              query,
+              requestedEngine,
+              limit,
+              domains,
+              excludedDomains,
+              state,
+              recordAttempt,
             );
-          },
-        );
         writeFileSync(
           output,
           `${JSON.stringify({
@@ -4018,7 +4419,8 @@ async function commandSearchBatch(args: string[]) {
             query,
             outcome: "searched",
             engine: result.engine,
-            scope: searchScope(query, domains),
+            strategy,
+            scope: searchScope(query, domains, excludedDomains),
             results: result.results,
             attempts: result.attempts,
             completed_at: new Date().toISOString(),
@@ -4699,6 +5101,7 @@ async function commandScrape(args: string[]) {
   const format = takeOption(args, "--format", "markdown");
   const output = takeOption(args, "--output");
   const shouldIndex = takeFlag(args, "--index");
+  const shouldPreflight = takeFlag(args, "--preflight");
   const includeFrames = takeFlag(args, "--include-frames");
   const frameOrigins = takeOptions(args, "--frame-origin").map(
     (value) => checkedUrl(value).origin,
@@ -4716,31 +5119,60 @@ async function commandScrape(args: string[]) {
   }
   if (args.length !== 1) fail("scrape requires one URL");
   const url = checkedUrl(args[0]);
-  const page = await withBrowser(options, async (browser) => {
-    let extracted = await navigateAndExtract(
-      browser,
-      url.href,
-      options,
-    );
-    let frames: JsonObject[] = [];
-    if (includeFrames) {
-      let topOrigin = url.origin;
-      try {
-        topOrigin = new URL(extracted.url).origin;
-      } catch {}
-      frames = await extractFrames(browser, topOrigin, frameOrigins);
+  const cacheEligible =
+    shouldPreflight &&
+    format !== "html" &&
+    !includeFrames &&
+    !options.capture &&
+    !options.captureNetworkJson &&
+    options.scrollSteps === 0 &&
+    options.interactionSteps === 0;
+  const preflight = cacheEligible
+    ? cachedPage(url.href)
+    : { cache: "bypass" as const };
+  let page = preflight.page;
+  if (!page) {
+    page = await withBrowser(options, async (browser) => {
+      let extracted = await navigateAndExtract(
+        browser,
+        url.href,
+        options,
+      );
+      let frames: JsonObject[] = [];
+      if (includeFrames) {
+        let topOrigin = url.origin;
+        try {
+          topOrigin = new URL(extracted.url).origin;
+        } catch {}
+        frames = await extractFrames(browser, topOrigin, frameOrigins);
+      }
+      const input = pageCaptures.get(extracted);
+      if (!input) throw new Error("page capture state is unavailable");
+      input.frames = frames;
+      extracted = fusePageCapture(input);
+      pageCaptures.set(extracted, input);
+      if (options.capture) {
+        extracted = storedCapture(extracted, browser, frames);
+      }
+      return extracted;
+    });
+    if ((shouldIndex || shouldPreflight) && page.outcome !== "partial") {
+      page.freshness = indexPage(page, url.href, preflight.cache);
+    } else {
+      const retrievedAt = new Date().toISOString();
+      const policy = freshnessPolicy(page, retrievedAt);
+      page.freshness = {
+        retrieval: "live",
+        cache: preflight.cache,
+        change_likelihood: policy.changeLikelihood,
+        basis: policy.basis,
+        retrieved_at: retrievedAt,
+        indexed_at: null,
+        refresh_after: policy.refreshAfter,
+        content_sha256: contentHash(page),
+      };
     }
-    const input = pageCaptures.get(extracted);
-    if (!input) throw new Error("page capture state is unavailable");
-    input.frames = frames;
-    extracted = fusePageCapture(input);
-    pageCaptures.set(extracted, input);
-    if (options.capture) {
-      extracted = storedCapture(extracted, browser, frames);
-    }
-    return extracted;
-  });
-  if (shouldIndex && page.outcome !== "partial") indexPage(page);
+  }
   const content =
     format === "json"
       ? JSON.stringify(page, null, 2)
@@ -4761,7 +5193,18 @@ async function commandScrape(args: string[]) {
 function commandReplay(args: string[]) {
   const json = takeFlag(args, "--json");
   if (args.length !== 1) fail("replay requires one capture ID");
-  const { page } = loadedCapture(args[0]);
+  const { manifest, page } = loadedCapture(args[0]);
+  const policy = freshnessPolicy(page, manifest.captured_at);
+  page.freshness = {
+    retrieval: "offline-capture",
+    cache: "bypass",
+    change_likelihood: policy.changeLikelihood,
+    basis: policy.basis,
+    retrieved_at: manifest.captured_at,
+    indexed_at: null,
+    refresh_after: policy.refreshAfter,
+    content_sha256: contentHash(page),
+  };
   console.log(json ? JSON.stringify(page, null, 2) : terminalText(page.markdown));
 }
 
@@ -5069,7 +5512,7 @@ function commandLocal(args: string[]) {
   const db = database();
   const results = db
     .query(
-      "SELECT url, title, snippet(pages_fts, 2, '', '', ' … ', 18) AS snippet, bm25(pages_fts) AS score FROM pages_fts WHERE pages_fts MATCH ? ORDER BY score LIMIT ?",
+      "SELECT pages_fts.url AS url, pages_fts.title AS title, snippet(pages_fts, 2, '', '', ' … ', 18) AS snippet, bm25(pages_fts) AS score, pages.fetched_at AS retrieved_at, pages.change_likelihood, pages.refresh_after, pages.content_sha256 FROM pages_fts JOIN pages ON pages.url = pages_fts.url WHERE pages_fts MATCH ? ORDER BY score LIMIT ?",
     )
     .all(match, limit);
   db.close();
@@ -5090,9 +5533,25 @@ function commandStats(args: string[]) {
   const row = db
     .query("SELECT COUNT(*) AS pages, MAX(fetched_at) AS newest FROM pages")
     .get() as any;
+  const byChangeLikelihood = Object.fromEntries(
+    (db
+      .query(
+        "SELECT change_likelihood, COUNT(*) AS pages FROM pages GROUP BY change_likelihood ORDER BY change_likelihood",
+      )
+      .all() as any[]).map((item) => [item.change_likelihood, item.pages]),
+  );
   db.close();
   console.log(
-    JSON.stringify({ pages: row.pages, newest: row.newest, dataRoot }, null, 2),
+    JSON.stringify(
+      {
+        pages: row.pages,
+        newest: row.newest,
+        by_change_likelihood: byChangeLikelihood,
+        dataRoot,
+      },
+      null,
+      2,
+    ),
   );
 }
 
@@ -5129,12 +5588,12 @@ function help() {
   console.log(`web-research — bounded HTTP retrieval and local Firefox research
 
 Usage:
-  web-research search QUERY [--domain HOSTNAME] [--profile NAME] [--json] [-- QUERY_TEXT]
-  web-research search-batch QUERIES --output RESULTS.ndjson [--domain HOSTNAME] [--resume]
+  web-research search QUERY [--strategy first|federated] [--domain HOSTNAME] [--exclude-domain HOSTNAME] [--json]
+  web-research search-batch QUERIES --output RESULTS.ndjson [--strategy first|federated] [--resume]
   web-research scrape-batch URLS_OR_SEARCH_RESULTS --output PAGES.ndjson [--resume] [--append-input]
   web-research retrieve URL... [--json] [--max-bytes N] [--timeout-ms N]
   web-research download URL --output PATH --output-root PATH [--expected-type TYPE]
-  web-research scrape URL [--format markdown|text|html|json] [--include-frames]
+  web-research scrape URL [--format markdown|text|html|json] [--preflight] [--include-frames]
   web-research replay CAPTURE_ID [--json]
   web-research capture-gc --max-manifests N [--apply] [--json]
   web-research map URL [--limit N] [--json]
@@ -5160,6 +5619,7 @@ Browser options:
   --interaction-steps N   Bounded safe expand/load/dismiss actions (default: 0)
   --capture-network-json  Retain bounded same-origin JSON response evidence
   --capture               Retain sanitized extraction inputs for offline replay
+  --preflight             Reuse fresh indexed text; refresh and re-index stale pages
 
 Batch search options:
   --output PATH           Append-only NDJSON checkpoint (required)
@@ -5167,6 +5627,8 @@ Batch search options:
   --append-input          Accept new lines after an unchanged resumed input
   --retry-failures        Retry prior failed records when resuming
   --domain HOSTNAME       Strictly retain this host and its subdomains; repeatable
+  --exclude-domain HOSTNAME  Strictly exclude this host and subdomains; repeatable
+  --strategy MODE         first tries providers in order; federated fuses all providers
   --max-queries N         Maximum pending queries this run (default: 1000)
   --delay-ms N            Base inter-query delay (default: 1500)
   --jitter-ms N           Deterministic delay jitter (default: 500)

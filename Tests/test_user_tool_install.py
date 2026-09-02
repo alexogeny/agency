@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENT_INSTALLER = ROOT / "scripts/install-agent-clis.sh"
+AGENT_TOOL_CONFIGURATOR = ROOT / "scripts/configure-agent-tools.sh"
 PYTHON_INSTALLER = ROOT / "scripts/install-python-tools.sh"
 RUST_INSTALLER = ROOT / "scripts/install-rust.sh"
 SCRATCH = Path(os.environ.get("AGENCY_TEST_SCRATCH", ROOT / ".cache/tests"))
@@ -36,6 +37,7 @@ class UserToolInstallTests(unittest.TestCase):
         return {
             **os.environ,
             "PATH": str(self.bin),
+            "HOME": str(self.workspace / "home"),
             "AGENCY_TEST_LOG": str(self.log),
             "AGENCY_UV_TOOL_PYTHON": "/usr/bin/python3",
         }
@@ -173,6 +175,49 @@ class UserToolInstallTests(unittest.TestCase):
             self.log.read_text().splitlines(),
             ["rustup toolchain list", "rustup default stable"],
         )
+
+    def test_agent_web_tool_is_registered_when_missing(self):
+        for name in ("codex", "claude"):
+            self.executable(
+                name,
+                """
+                #!/usr/bin/env bash
+                if [[ $2 == get ]]; then
+                  exit 1
+                fi
+                printf '%s %s\n' "${0##*/}" "$*" >> "$AGENCY_TEST_LOG"
+                """,
+            )
+
+        result = self.run_installer(AGENT_TOOL_CONFIGURATOR)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.log.read_text().splitlines(),
+            [
+                f"codex mcp add agency-web -- {self.workspace}/home/.local/bin/web-research-mcp",
+                f"claude mcp add --scope user agency-web -- {self.workspace}/home/.local/bin/web-research-mcp",
+            ],
+        )
+
+    def test_existing_agent_web_registration_is_preserved(self):
+        for name in ("codex", "claude"):
+            self.executable(
+                name,
+                """
+                #!/usr/bin/env bash
+                if [[ $2 == get ]]; then
+                  exit 0
+                fi
+                printf '%s %s\n' "${0##*/}" "$*" >> "$AGENCY_TEST_LOG"
+                """,
+            )
+
+        result = self.run_installer(AGENT_TOOL_CONFIGURATOR)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.log.exists())
+        self.assertIn("existing agency-web", result.stdout)
 
 
 if __name__ == "__main__":

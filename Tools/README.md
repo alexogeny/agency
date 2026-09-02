@@ -186,17 +186,32 @@ focus. The explicit `browser` command remains attached for user-completed login
 and releases its profile lock when the window closes.
 
 Automatic search reuses one Firefox process while falling back through
-DuckDuckGo, Brave, and Bing. A challenged provider is skipped without blind
-retries or another browser launch. Page access checks distinguish visible login
-walls and challenge controls from incidental prose, so ordinary content titled
-“Just a Moment” is not treated as a CAPTCHA. Login prompts layered over
-substantial public content are labeled as soft gates and extracted; actual
-authentication redirects and dominant challenges remain hard stops.
+DuckDuckGo, Brave, and Bing. Federated mode queries all three in that process,
+deduplicates destination URLs, and fuses their rankings. A challenged provider
+is skipped without blind retries or another browser launch. Page access checks
+distinguish visible login walls and challenge controls from incidental prose,
+so ordinary content titled “Just a Moment” is not treated as a CAPTCHA. Login
+prompts layered over substantial public content are labeled as soft gates and
+extracted; actual authentication redirects and dominant challenges remain hard
+stops.
 
 One-shot searches without `--profile` use disposable profiles, avoiding
 contention with unrelated named research sessions. Unknown search options fail
 before Firefox starts. Textual `site:` terms remain provider hints;
 `--domain HOSTNAME` strictly filters cleaned destination hosts and subdomains.
+`--exclude-domain HOSTNAME` removes a host and its subdomains after inclusion
+filtering.
+
+`web-research-mcp` exposes the same stack to Codex and Claude Code through one
+bounded `run` tool with `search_query`, `open`, `find`, `click`, `local_query`,
+and `replay` operations. URL opens preflight the extracted-text index, follow
+requested and canonical aliases, reuse fresh or immutable entries, and render
+then re-index stale pages. Stable in-session references keep page bodies out of
+search results, and `response_length` bounds model-facing text. Open and find
+records include citation-ready URLs, freshness metadata, content hashes, and
+exact evidence lines in a deduplicated source ledger. Pi's installed
+`agency_web` extension speaks to the same server and retains those references
+for the life of its session.
 
 An entirely empty document gets one bounded 500-millisecond recovery sample.
 If it remains empty, extraction returns a clear incomplete-content error rather

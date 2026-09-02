@@ -64,8 +64,12 @@ Claude Code, and Pi.
   repository work. Claim the narrowest write scope; reads never need a claim.
   Heartbeat long work and close with changed paths and concrete checks.
 - Use `repo-map` before broad exploration of an unfamiliar repository.
-- Use `web-research` for JavaScript-heavy or authenticated browsing. Never
-  automate CAPTCHA solving or expose browser secrets.
+- Use Agency's web tool by default for substantive, source-sensitive,
+  JavaScript-heavy, authenticated, or audit-sensitive web research. Use native
+  search for quick lookups or when Agency's tool is unavailable. Never automate
+  CAPTCHA solving or expose browser secrets. Treat search snippets as discovery,
+  open supporting pages before making claims, and cite the direct URLs from the
+  returned source ledger against its displayed or matching evidence lines.
 - Whenever writing or modifying executable code, use `performance-design` as a
   lightweight preflight. Escalate to `perf-diagnosis` when the cost location is
   uncertain and `benchmark` before making performance claims.
