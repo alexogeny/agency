@@ -247,8 +247,10 @@ focused query → direct retrieval → rendered Firefox → bounded human handof
 
 ```console
 web-research search "QUERY" --json --profile TASK
+web-research search "QUERY" --strategy federated --json
 web-research search "QUERY" --domain example.org --json
 web-research retrieve URL... --json
+web-research scrape URL --format json --preflight --profile TASK
 web-research scrape URL --format json --capture --index --profile TASK
 web-research replay CAPTURE_ID --json
 web-research local "SEARCH TERMS" --json
@@ -276,6 +278,21 @@ truncated evidence without hiding it behind a scalar score.
 
 Strict search options prevent misspelled flags from becoming query text, and
 explicit domain filters keep scoped corpora on the intended destination hosts.
+Federated discovery fuses DuckDuckGo, Brave, and Bing rankings while reusing a
+single Firefox process. The installed `agency-web` MCP tool gives Codex and
+Claude Code compact `search_query`, `open`, `find`, and `click` operations with
+stable in-session references, bounded responses, domain exclusions, automatic
+freshness-aware index preflight, and opt-in capture evidence. Opened-page and
+find results carry a citation source ledger, content identity, retrieval and
+refresh dates, and exact displayed or matching evidence lines. Pi receives the
+same contract through its installed `agency_web` extension tool.
+
+Preflight avoids a Firefox launch when the canonical URL or one of its aliases
+has fresh extracted text. Entries store a change-likelihood marker: frequently
+changing subjects refresh daily, maintained and undated documents after 14
+days, older published documents after 180 days, and clearly historical
+published articles remain immutable. Expired pages are rendered and safely
+re-indexed before their new evidence is returned.
 
 Persistent named profiles retain ordinary first-party state for a research
 task without exporting cookies or credentials. Automated work stays headless.

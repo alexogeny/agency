@@ -42,6 +42,11 @@ class GlobalAgentGuidanceTests(unittest.TestCase):
         self.assertRegex(guidance, r"not an instruction-count\s+contest")
         self.assertRegex(skill, r"not a universal\s+optimisation score or veto")
 
+    def test_agents_prefer_agency_for_substantive_web_research(self):
+        guidance = (ROOT / "Agents/AGENTS.md").read_text()
+
+        self.assertIn("Use Agency's web tool by default for substantive", guidance)
+
 
 class WorkstationManifestTests(unittest.TestCase):
     def test_shellcheck_and_firefox_are_native_packages(self):
@@ -456,6 +461,9 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("1Password CLI", result.stdout)
         self.assertIn("1Password Firefox extension", result.stdout)
         self.assertIn("agency-ui", result.stdout)
+        self.assertIn("web-research-mcp", result.stdout)
+        self.assertIn("agency-web MCP", result.stdout)
+        self.assertIn("extensions/agency-web.ts", result.stdout)
         self.assertIn("document-inspect", result.stdout)
         self.assertIn("docs-exec", result.stdout)
         self.assertIn("evidence-review", result.stdout)

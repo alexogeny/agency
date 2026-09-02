@@ -126,6 +126,7 @@ agency_plan_user_links() {
     system-context
     sudo-gui
     web-research
+    web-research-mcp
   )
 
   for tool in "${tools[@]}"; do
@@ -134,6 +135,8 @@ agency_plan_user_links() {
   agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
   agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.claude/CLAUDE.md"
   agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.pi/agent/AGENTS.md"
+  agency_plan_link "$AGENCY_DIR/Agents/pi/agency-web.ts" \
+    "$HOME/.pi/agent/extensions/agency-web.ts"
   agency_plan_link "$AGENCY_DIR/Agents/codex/coordinated-worker.toml" \
     "$HOME/.codex/agents/coordinated-worker.toml"
   agency_plan_link "$AGENCY_DIR/Agents/claude/coordinated-worker.md" \
@@ -149,6 +152,7 @@ agency_plan_user_links() {
 
   agency_plan_hook_merge "$AGENCY_DIR/config/codex/hooks.json" "$HOME/.codex/hooks.json"
   agency_plan_hook_merge "$AGENCY_DIR/config/claude/hooks.json" "$HOME/.claude/settings.json"
+  printf '  [%-16s] agency-web MCP for Codex and Claude Code\n' "register tool"
 }
 
 agency_plan_power() {
