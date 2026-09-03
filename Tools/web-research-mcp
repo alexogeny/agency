@@ -19,8 +19,15 @@ type PageReference = {
   page: JsonObject;
   evidence: Set<string>;
 };
+type PageLoadError = {
+  kind: "error";
+  url: string;
+  error: JsonObject;
+};
+type PageLoadResult = PageReference | PageLoadError;
 type Reference = SearchReference | PageReference;
 
+const pageBatchSize = 4;
 const backend = process.env.WEB_RESEARCH_COMMAND || join(import.meta.dir, "web-research");
 const references = new Map<string, Reference>();
 const pageReferences = new Map<string, PageReference>();
@@ -366,31 +373,52 @@ async function loadPages(values: string[], evidence: string, profile: string) {
   const missing = [...new Set(
     resolved.filter((item) => !item.reference).map((item) => item.url),
   )];
+  const failures = new Map<string, PageLoadError>();
   if (missing.length === 1) {
     const reference = await loadPage(missing[0], evidence, profile);
     pageReferences.set(missing[0], reference);
   } else if (missing.length > 1) {
-    const arguments_ = ["scrape-many"];
-    if (evidence === "index") arguments_.push("--index");
-    if (evidence === "capture") arguments_.push("--capture");
-    if (profile) arguments_.push("--profile", profile);
-    const outcome = await invoke(
-      arguments_,
-      JSON.stringify({ urls: missing }),
-    );
-    if (!Array.isArray(outcome.pages) || outcome.pages.length !== missing.length) {
-      throw new Error("web-research returned an invalid scrape batch");
-    }
-    for (const [index, page] of outcome.pages.entries()) {
-      const reference = addPageReference(page as JsonObject, evidence);
-      pageReferences.set(missing[index], reference);
+    for (let offset = 0; offset < missing.length; offset += pageBatchSize) {
+      const batch = missing.slice(offset, offset + pageBatchSize);
+      const arguments_ = ["scrape-many"];
+      if (evidence === "index") arguments_.push("--index");
+      if (evidence === "capture") arguments_.push("--capture");
+      if (profile) arguments_.push("--profile", profile);
+      const outcome = await invoke(
+        arguments_,
+        JSON.stringify({ urls: batch }),
+      );
+      if (!Array.isArray(outcome.pages) || outcome.pages.length !== batch.length) {
+        throw new Error("web-research returned an invalid scrape batch");
+      }
+      for (const [index, page] of outcome.pages.entries()) {
+        if (!isObject(page)) {
+          throw new Error("web-research returned an invalid page result");
+        }
+        const url = batch[index];
+        if (isObject(page.error)) {
+          failures.set(url, { kind: "error", url, error: page.error });
+          continue;
+        }
+        const reference = addPageReference(page, evidence);
+        pageReferences.set(url, reference);
+      }
     }
   }
   return resolved.map((item) => {
     const reference = item.reference || pageReferences.get(item.url);
-    if (!reference) throw new Error(`page was not loaded: ${item.url}`);
+    if (!reference) {
+      const failure = failures.get(item.url);
+      if (failure) return failure;
+      throw new Error(`page was not loaded: ${item.url}`);
+    }
     return reference;
-  });
+  }) as PageLoadResult[];
+}
+
+function requirePage(result: PageLoadResult) {
+  if (result.kind === "page") return result;
+  throw new Error(String(result.error.message || `page was not loaded: ${result.url}`));
 }
 
 function pageLines(reference: PageReference) {
@@ -400,6 +428,7 @@ function pageLines(reference: PageReference) {
 
 function pageRecord(reference: PageReference) {
   const links = Array.isArray(reference.page.links) ? reference.page.links : [];
+  const jobs = Array.isArray(reference.page.jobs) ? reference.page.jobs : [];
   return {
     type: "page",
     ref_id: reference.ref_id,
@@ -408,6 +437,7 @@ function pageRecord(reference: PageReference) {
     published: String(reference.page.published || ""),
     byline: String(reference.page.byline || ""),
     links: links.length,
+    ...(jobs.length ? { jobs } : {}),
     sources: Array.isArray(reference.page.sources) ? reference.page.sources : [],
     ...(reference.page.capture_id ? { capture_id: reference.page.capture_id } : {}),
   };
@@ -464,6 +494,18 @@ function renderPage(reference: PageReference, lineno: number, budget: number) {
         append("[more links omitted]\n");
         break;
       }
+      if (!append(value)) break;
+    }
+  }
+  const jobs = Array.isArray(reference.page.jobs) ? reference.page.jobs : [];
+  if (!truncated && jobs.length) {
+    append("\nJobs\n");
+    for (const [index, job] of jobs.slice(0, 50).entries()) {
+      const details = [job.company, job.location, job.published || job.posting_age]
+        .map(String)
+        .filter(Boolean)
+        .join(" · ");
+      const value = `${index + 1}. ${String(job.title || "Untitled role")}\n   ${String(job.url || "")}${details ? `\n   ${details}` : ""}\n`;
       if (!append(value)) break;
     }
   }
@@ -625,6 +667,17 @@ async function performOpen(
   const rendered: string[] = [];
   for (const [index, page] of pages.entries()) {
     const { lineno } = requests[index];
+    if (page.kind === "error") {
+      records.push({
+        type: "page_error",
+        url: page.url,
+        error: page.error,
+      });
+      rendered.push(
+        `[page error] ${page.url}\n${String(page.error.message || "page could not be loaded")}`,
+      );
+      continue;
+    }
     const view = renderPage(page, lineno, budget);
     records.push({
       ...pageRecord(page),
@@ -651,7 +704,8 @@ async function performFind(
   const pages = await loadPages(requests.map((item) => item.refId), evidence, profile);
   const records: JsonObject[] = [];
   const rendered: string[] = [];
-  for (const [index, page] of pages.entries()) {
+  for (const [index, result] of pages.entries()) {
+    const page = requirePage(result);
     const { pattern } = requests[index];
     const needle = pattern.toLocaleLowerCase();
     const matches = pageLines(page)
@@ -690,13 +744,14 @@ async function performClick(
     return { refId, id };
   });
   const sources = await loadPages(requests.map((item) => item.refId), evidence, profile);
-  const targets = sources.map((source, index) => {
+  const targets = sources.map((result, index) => {
+    const source = requirePage(result);
     const { id } = requests[index];
     const links = Array.isArray(source.page.links) ? source.page.links : [];
     if (id > links.length) throw new Error(`[${source.ref_id}] has no link ${id}`);
     return checkedString(links[id - 1], "link URL", 8192);
   });
-  const pages = await loadPages(targets, evidence, profile);
+  const pages = (await loadPages(targets, evidence, profile)).map(requirePage);
   const records: JsonObject[] = [];
   const rendered: string[] = [];
   for (const page of pages) {

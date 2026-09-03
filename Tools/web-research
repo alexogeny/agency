@@ -73,6 +73,15 @@ type StructuredEvidence = {
   metadata: Record<string, string>;
   jsonLd: unknown[];
 };
+type JobCard = {
+  title: string;
+  url: string;
+  company: string;
+  location: string;
+  posting_age: string;
+  published: string;
+  summary: string;
+};
 type ChangeLikelihood = "immutable" | "low" | "medium" | "high";
 type PageFreshness = {
   retrieval: "live" | "local-index" | "offline-capture";
@@ -124,6 +133,7 @@ type Page = {
   markdown: string;
   html: string;
   links: string[];
+  jobs?: JobCard[];
   structured?: StructuredEvidence;
   sources?: string[];
   access?: { state: PageAccessState };
@@ -146,6 +156,15 @@ type Page = {
     markdown: boolean;
     html: boolean;
     links: boolean;
+  };
+};
+type PageBatchFailure = {
+  url: string;
+  error: {
+    kind: string;
+    code: string;
+    message: string;
+    retriable: boolean;
   };
 };
 
@@ -2225,6 +2244,44 @@ function extractionExpression(options: BrowserOptions) {
   const markdown = clean(walk(root))
   const html = root.innerHTML
   const uniqueLinks = [...new Set(links)]
+  const jobCards = []
+  const seenJobs = new Set()
+  const jobContainers = queryAll([
+    '[data-job-id]',
+    '[data-testid*="job" i]',
+    '[class*="job-card" i]',
+    '[class*="job_card" i]',
+    '[class*="job-result" i]',
+    '[class*="job_result" i]',
+    '[itemtype$="/JobPosting" i]',
+  ].join(','))
+  for (const container of jobContainers.slice(0, 500)) {
+    const titleNode = container.querySelector('h1, h2, h3, [itemprop="title"], [class*="title" i]') || container.querySelector('a[href]')
+    const link = titleNode?.closest?.('a[href]') || titleNode?.querySelector?.('a[href]') || container.querySelector('a[href]')
+    const title = clean(titleNode?.textContent || link?.textContent || '').slice(0, 500)
+    const url = absolute(link?.getAttribute('href') || '')
+    if (!title || !url) continue
+    const key = url + '\n' + title.toLocaleLowerCase()
+    if (seenJobs.has(key)) continue
+    seenJobs.add(key)
+    const company = clean(container.querySelector('[itemprop="hiringOrganization"], [class*="company" i], [class*="employer" i]')?.textContent || '').slice(0, 500)
+    const location = clean(container.querySelector('[itemprop="jobLocation"], [class*="location" i], [class*="locality" i]')?.textContent || '').slice(0, 500)
+    const time = container.querySelector('time, [itemprop="datePosted"], [class*="posted" i], [class*="listed" i]')
+    const containerText = clean(container.textContent || '')
+    const ageMatch = (clean(time?.textContent || '') + '\n' + containerText).match(/\b(?:posted|listed|published)?\s*(today|yesterday|\d+\s*(?:minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|mos?)\s+ago)\b/i)
+    const postingAge = clean(ageMatch?.[0] || '').slice(0, 100)
+    const published = clean(time?.getAttribute?.('datetime') || time?.getAttribute?.('content') || '').slice(0, 100)
+    jobCards.push({
+      title,
+      url,
+      company,
+      location,
+      posting_age: postingAge,
+      published,
+      summary: containerText.slice(0, 1200),
+    })
+    if (jobCards.length >= 100) break
+  }
   const sources = []
   if (text || markdown) sources.push('rendered-dom')
   if (Object.keys(metadata).length) sources.push('page-metadata')
@@ -2239,6 +2296,7 @@ function extractionExpression(options: BrowserOptions) {
     markdown: markdown.slice(0, maxContentChars),
     html: html.slice(0, maxContentChars),
     links: uniqueLinks.slice(0, maxLinks),
+    jobs: jobCards,
     structured: Object.keys(metadata).length || jsonLd.length ? { metadata, jsonLd } : undefined,
     sources,
     truncated: {
@@ -2430,6 +2488,8 @@ function fusePageCapture(input: PageCaptureInput, identity = "live") {
   const metadata: Record<string, string> = {};
   const jsonLd: unknown[] = [];
   const seenJsonLd = new Set<string>();
+  const jobs: JobCard[] = [];
+  const seenJobs = new Set<string>();
   const sources = new Set<string>();
   const provenance: Record<string, EvidenceReference[]> = {};
   for (const [index, capture] of input.captures.entries()) {
@@ -2466,6 +2526,14 @@ function fusePageCapture(input: PageCaptureInput, identity = "live") {
         source: "json-ld",
         capture: `${identity}:page:${index}`,
       });
+    }
+    for (const job of capture.jobs || []) {
+      const key = `${job.url}\n${job.title.toLocaleLowerCase()}`;
+      if (seenJobs.has(key)) continue;
+      seenJobs.add(key);
+      const retainedIndex = jobs.length;
+      jobs.push(job);
+      addEvidenceReference(provenance, `jobs.${retainedIndex}`, renderedReference);
     }
   }
   const structured =
@@ -2567,6 +2635,7 @@ function fusePageCapture(input: PageCaptureInput, identity = "live") {
     markdown,
     html,
     links,
+    ...(jobs.length ? { jobs } : {}),
     ...(structured ? { structured } : {}),
     sources: [...sources],
     access: { state: accessState },
@@ -3704,6 +3773,7 @@ function database() {
     ["published", "TEXT NOT NULL DEFAULT ''"],
     ["byline", "TEXT NOT NULL DEFAULT ''"],
     ["links_json", "TEXT NOT NULL DEFAULT '[]'"],
+    ["jobs_json", "TEXT NOT NULL DEFAULT '[]'"],
     ["sources_json", "TEXT NOT NULL DEFAULT '[]'"],
     ["change_likelihood", "TEXT NOT NULL DEFAULT 'medium'"],
     ["freshness_basis", "TEXT NOT NULL DEFAULT '[\"legacy-index-entry\"]'"],
@@ -3743,7 +3813,31 @@ function pageIndexUrl(page: Page) {
 function structuredSignals(page: Page) {
   const types = new Set<string>();
   const modified: number[] = [];
+  const jobs: JobCard[] = [];
   let visited = 0;
+  const text = (value: unknown) =>
+    typeof value === "string"
+      ? terminalText(value).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim()
+      : "";
+  const named = (value: unknown) => {
+    if (typeof value === "string") return text(value);
+    if (!value || typeof value !== "object") return "";
+    return text((value as JsonObject).name);
+  };
+  const jobLocation = (value: unknown): string => {
+    if (Array.isArray(value)) {
+      return value.map(jobLocation).filter(Boolean).join("; ");
+    }
+    if (!value || typeof value !== "object") return text(value);
+    const record = value as JsonObject;
+    const address = record.address;
+    if (typeof address === "string") return text(address);
+    if (!address || typeof address !== "object") return named(record);
+    const fields = ["addressLocality", "addressRegion", "addressCountry"]
+      .map((key) => text((address as JsonObject)[key]))
+      .filter(Boolean);
+    return [...new Set(fields)].join(", ");
+  };
   const walk = (value: unknown, depth = 0) => {
     if (visited >= 2_000 || depth > 8 || value === null) return;
     visited += 1;
@@ -3752,7 +3846,23 @@ function structuredSignals(page: Page) {
       return;
     }
     if (typeof value !== "object") return;
-    for (const [key, item] of Object.entries(value as JsonObject)) {
+    const record = value as JsonObject;
+    const recordTypes = (Array.isArray(record["@type"])
+      ? record["@type"]
+      : [record["@type"]]
+    ).map((item) => String(item || "").toLocaleLowerCase());
+    if (recordTypes.includes("jobposting")) {
+      jobs.push({
+        title: text(record.title || record.name).slice(0, 500),
+        url: redactedOutputUrl(text(record.url || record["@id"])),
+        company: named(record.hiringOrganization).slice(0, 500),
+        location: jobLocation(record.jobLocation).slice(0, 500),
+        posting_age: "",
+        published: text(record.datePosted).slice(0, 100),
+        summary: text(record.description).slice(0, 1_200),
+      });
+    }
+    for (const [key, item] of Object.entries(record)) {
       if (key === "@type") {
         const values = Array.isArray(item) ? item : [item];
         for (const type of values) types.add(String(type).toLocaleLowerCase());
@@ -3769,13 +3879,91 @@ function structuredSignals(page: Page) {
     const timestamp = Date.parse(metadata[key] || "");
     if (Number.isFinite(timestamp)) modified.push(timestamp);
   }
-  return { types, modified };
+  return { types, modified, jobs };
+}
+
+function relativePublicationDate(value: string, retrievedAt: string) {
+  const match = value.match(
+    /\b(today|yesterday|\d+\s*(?:minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|mos?)\s+ago)\b/i,
+  );
+  if (!match) return "";
+  const retrieved = Date.parse(retrievedAt);
+  if (!Number.isFinite(retrieved)) return "";
+  const normalized = match[1].toLocaleLowerCase();
+  let elapsed = 0;
+  if (normalized === "yesterday") elapsed = 24 * 60 * 60 * 1_000;
+  else if (normalized !== "today") {
+    const parts = normalized.match(
+      /^(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|weeks?|months?|mos?|[mhdw])\s+ago$/,
+    );
+    if (!parts) return "";
+    const quantity = Number(parts[1]);
+    const unit = parts[2];
+    const unitMilliseconds = /^(?:minutes?|mins?|m)$/.test(unit)
+      ? 60 * 1_000
+      : /^(?:hours?|hrs?|h)$/.test(unit)
+        ? 60 * 60 * 1_000
+        : /^(?:days?|d)$/.test(unit)
+          ? 24 * 60 * 60 * 1_000
+          : /^(?:weeks?|w)$/.test(unit)
+            ? 7 * 24 * 60 * 60 * 1_000
+            : 30 * 24 * 60 * 60 * 1_000;
+    elapsed = quantity * unitMilliseconds;
+  }
+  return new Date(retrieved - elapsed).toISOString().slice(0, 10);
+}
+
+function enrichJobEvidence(
+  page: Page,
+  retrievedAt: string,
+  signals: ReturnType<typeof structuredSignals>,
+) {
+  const candidates = [...(page.jobs || []), ...signals.jobs];
+  const jobs: JobCard[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const title = terminalText(String(candidate.title || "")).trim().slice(0, 500);
+    const url = redactedOutputUrl(String(candidate.url || ""));
+    if (!title || !url) continue;
+    const key = `${url}\n${title.toLocaleLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const explicit = Date.parse(candidate.published);
+    const published = Number.isFinite(explicit)
+      ? new Date(explicit).toISOString().slice(0, 10)
+      : relativePublicationDate(candidate.posting_age, retrievedAt);
+    jobs.push({
+      title,
+      url,
+      company: terminalText(String(candidate.company || "")).trim().slice(0, 500),
+      location: terminalText(String(candidate.location || "")).trim().slice(0, 500),
+      posting_age: terminalText(String(candidate.posting_age || "")).trim().slice(0, 100),
+      published,
+      summary: terminalText(String(candidate.summary || "")).trim().slice(0, 1_200),
+    });
+    if (jobs.length >= 100) break;
+  }
+  if (jobs.length) page.jobs = jobs;
+  const identity = `${page.title} ${page.canonicalUrl} ${page.url}`.toLocaleLowerCase();
+  const jobPage =
+    jobs.length > 0 ||
+    signals.types.has("jobposting") ||
+    /(?:^|[\s/_-])(jobs?|careers?|vacanc(?:y|ies)|open[\s_-]?roles?|positions?)(?:$|[\s/?#_-])/.test(
+      identity,
+    );
+  if (!page.published && jobs.length === 1 && jobs[0].published) {
+    page.published = jobs[0].published;
+  } else if (!page.published && jobPage && signals.types.has("jobposting")) {
+    page.published = relativePublicationDate(page.text, retrievedAt);
+  }
+  return jobPage;
 }
 
 function freshnessPolicy(page: Page, retrievedAt: string) {
+  const signals = structuredSignals(page);
+  const jobPage = enrichJobEvidence(page, retrievedAt, signals);
   const published = Date.parse(page.published);
   const now = Date.parse(retrievedAt);
-  const signals = structuredSignals(page);
   const newestDocumentDate = Math.max(
     Number.isFinite(published) ? published : 0,
     ...signals.modified,
@@ -3793,7 +3981,11 @@ function freshnessPolicy(page: Page, retrievedAt: string) {
   let changeLikelihood: ChangeLikelihood;
   let basis: string[];
   let ttl: number | null;
-  if (historical) {
+  if (jobPage) {
+    changeLikelihood = "high";
+    basis = ["job-listing-or-board"];
+    ttl = 24 * 60 * 60 * 1_000;
+  } else if (historical) {
     changeLikelihood = "immutable";
     basis = ["historical-published-article"];
     ttl = null;
@@ -3851,6 +4043,17 @@ function parsedArray(value: unknown) {
   }
 }
 
+function parsedJobCards(value: unknown) {
+  try {
+    const parsed = JSON.parse(String(value || "[]"));
+    return Array.isArray(parsed)
+      ? parsed.filter((item) => item && typeof item === "object") as JobCard[]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function cachedPage(url: string) {
   const db = database();
   try {
@@ -3882,6 +4085,7 @@ function cachedPage(url: string) {
       markdown: String(row.markdown),
       html: "",
       links: parsedArray(row.links_json),
+      jobs: parsedJobCards(row.jobs_json),
       sources: [...new Set([...parsedArray(row.sources_json), "local-index"])],
       freshness: {
         retrieval: "local-index",
@@ -3904,7 +4108,7 @@ function cachedPage(url: string) {
 function pageIndexer() {
   const db = database();
   const upsert = db.query(
-    "INSERT INTO pages (url, title, text, markdown, fetched_at, published, byline, links_json, sources_json, change_likelihood, freshness_basis, refresh_after, content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at, published=excluded.published, byline=excluded.byline, links_json=excluded.links_json, sources_json=excluded.sources_json, change_likelihood=excluded.change_likelihood, freshness_basis=excluded.freshness_basis, refresh_after=excluded.refresh_after, content_sha256=excluded.content_sha256",
+    "INSERT INTO pages (url, title, text, markdown, fetched_at, published, byline, links_json, jobs_json, sources_json, change_likelihood, freshness_basis, refresh_after, content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at, published=excluded.published, byline=excluded.byline, links_json=excluded.links_json, jobs_json=excluded.jobs_json, sources_json=excluded.sources_json, change_likelihood=excluded.change_likelihood, freshness_basis=excluded.freshness_basis, refresh_after=excluded.refresh_after, content_sha256=excluded.content_sha256",
   );
   const prior = db.query("SELECT content_sha256 FROM pages WHERE url = ?");
   const addAlias = db.query(
@@ -3930,6 +4134,7 @@ function pageIndexer() {
         page.published,
         page.byline,
         JSON.stringify(page.links),
+        JSON.stringify(page.jobs || []),
         JSON.stringify(page.sources || []),
         policy.changeLikelihood,
         JSON.stringify(policy.basis),
@@ -5476,7 +5681,7 @@ async function commandScrapeMany(args: string[]) {
   }
   const urls = values.map((value) => checkedUrl(String(value)));
   for (const url of urls) explicitNetworkTarget(url, options.allowPrivate);
-  const pages = new Array<Page>(urls.length);
+  const pages = new Array<Page | PageBatchFailure>(urls.length);
   const pending: Array<{ index: number; url: URL; cache: "miss" | "stale" }> = [];
   for (const [index, url] of urls.entries()) {
     const preflight = options.capture ? { cache: "bypass" as const } : cachedPage(url.href);
@@ -5492,27 +5697,56 @@ async function commandScrapeMany(args: string[]) {
     if (pending.length) {
       await withBrowser(options, async (browser) => {
         for (const item of pending) {
-          let page = await navigateAndExtract(browser, item.url.href, options);
-          if (options.capture) page = storedCapture(page, browser);
-          if (page.outcome !== "partial") {
-            if (indexer) {
-              page.freshness = indexer.write(page, item.url.href, item.cache);
-            } else {
-              const retrievedAt = new Date().toISOString();
-              const policy = freshnessPolicy(page, retrievedAt);
-              page.freshness = {
-                retrieval: "live",
-                cache: item.cache,
-                change_likelihood: policy.changeLikelihood,
-                basis: policy.basis,
-                retrieved_at: retrievedAt,
-                indexed_at: null,
-                refresh_after: policy.refreshAfter,
-                content_sha256: contentHash(page),
-              };
+          try {
+            let page = await navigateAndExtract(browser, item.url.href, options);
+            if (options.capture) page = storedCapture(page, browser);
+            if (page.outcome !== "partial") {
+              if (indexer) {
+                page.freshness = indexer.write(page, item.url.href, item.cache);
+              } else {
+                const retrievedAt = new Date().toISOString();
+                const policy = freshnessPolicy(page, retrievedAt);
+                page.freshness = {
+                  retrieval: "live",
+                  cache: item.cache,
+                  change_likelihood: policy.changeLikelihood,
+                  basis: policy.basis,
+                  retrieved_at: retrievedAt,
+                  indexed_at: null,
+                  refresh_after: policy.refreshAfter,
+                  content_sha256: contentHash(page),
+                };
+              }
             }
+            pages[item.index] = page;
+          } catch (error) {
+            const message = terminalText(
+              error instanceof Error ? error.message : String(error),
+            );
+            let kind = "retrieval";
+            let code = "page-load-failed";
+            let retriable = true;
+            if (error instanceof RetrievalFailure) {
+              kind = error.kind;
+              code = error.code;
+              retriable = error.retriable;
+            } else if (/interactive login required/i.test(message)) {
+              kind = "access";
+              code = "interactive-login-required";
+              retriable = false;
+            } else if (/interactive challenge required/i.test(message)) {
+              kind = "access";
+              code = "interactive-challenge-required";
+              retriable = false;
+            } else if (/rate limit/i.test(message)) {
+              kind = "network";
+              code = "rate-limited";
+            }
+            pages[item.index] = {
+              url: redactedOutputUrl(item.url.href),
+              error: { kind, code, message, retriable },
+            };
           }
-          pages[item.index] = page;
         }
       });
     }

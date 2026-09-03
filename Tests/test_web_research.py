@@ -8,6 +8,7 @@ import textwrap
 import threading
 import unittest
 from contextlib import contextmanager
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -19,7 +20,32 @@ SCRATCH = Path(os.environ.get("AGENCY_TEST_SCRATCH", ROOT / ".cache/tests"))
 
 class RenderedFixtureHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"""<!doctype html>
+        if self.path == "/jobs":
+            body = b"""<!doctype html>
+<html>
+  <head><title>Engineering opportunities</title></head>
+  <body>
+    <main class="job-results">
+      <article class="job-card" data-job-id="role-1">
+        <h2><a href="/roles/platform-engineer">Platform Engineer</a></h2>
+        <p class="company">Example Company</p>
+        <p class="location">Remote</p>
+        <time>Posted 3d ago</time>
+        <p>Build reliable systems for customers.</p>
+      </article>
+      <article class="job-card" data-job-id="role-2">
+        <h2><a href="/roles/data-engineer">Data Engineer</a></h2>
+        <p class="company">Example Company</p>
+        <p class="location">Brisbane</p>
+        <time>Posted today</time>
+        <p>Develop dependable data products.</p>
+      </article>
+    </main>
+  </body>
+</html>
+"""
+        else:
+            body = b"""<!doctype html>
 <html>
   <head><title>Rendered fixture</title></head>
   <body>
@@ -82,13 +108,14 @@ class WebResearchTests(unittest.TestCase):
             environment["PATH"] = f"{self.workspace / 'bin'}:{environment['PATH']}"
         return environment
 
-    def run_tool(self, *arguments, check=True, environment=None):
+    def run_tool(self, *arguments, check=True, environment=None, input=None):
         return subprocess.run(
             [str(TOOL), *map(str, arguments)],
             check=check,
             text=True,
             capture_output=True,
             env=environment or self.environment(),
+            input=input,
         )
 
     def fake_firefox(self):
@@ -130,6 +157,7 @@ class WebResearchTests(unittest.TestCase):
               markdown: process.env.FAKE_PAGE_TEXT || "Repeated evidence block\n\nRepeated evidence block",
               html: `<main><p>${process.env.FAKE_PAGE_TEXT || "Repeated evidence block"}</p></main>`,
               links: [],
+              jobs: JSON.parse(process.env.FAKE_PAGE_JOBS || "[]"),
               structured: {
                 metadata: { "og:title": "Different structured title" },
                 jsonLd: [],
@@ -223,20 +251,23 @@ class WebResearchTests(unittest.TestCase):
                       const cooling = currentUrl.includes("cool.example") ||
                         (process.env.FAKE_ALL_SEARCH_RATE_LIMIT === "1" &&
                           ["html.duckduckgo.com", "search.brave.com", "www.bing.com"].includes(new URL(currentUrl).hostname));
+                      const gated = currentUrl.includes("account-required.example");
                       value = JSON.stringify({
-                        title: cooling ? "Too Many Requests" : "Rendered title",
+                        title: cooling ? "Too Many Requests" : gated ? "Sign in" : "Rendered title",
                         url: currentUrl,
                         text: cooling
                           ? "Rate limit exceeded. Please try again later."
+                          : gated
+                            ? "Sign in to continue"
                           : process.env.FAKE_EMPTY_PAGE === "1"
                             ? ""
                             : "Repeated evidence block",
                         challengeControl: false,
-                        loginControl: false,
-                        mainTextLength: cooling ? 0 : 48,
-                        articleCount: cooling ? 0 : 1,
+                        loginControl: gated,
+                        mainTextLength: cooling || gated ? 0 : 48,
+                        articleCount: cooling || gated ? 0 : 1,
                         contentLinks: 0,
-                        structuredDataChars: cooling ? 0 : 32,
+                        structuredDataChars: cooling || gated ? 0 : 32,
                       });
                     } else if (expression.includes("const engine =") && process.env.FAKE_SEARCH_RESULTS_BY_ENGINE) {
                       const engine = expression.match(/const engine = "([^"]+)"/)?.[1] || "";
@@ -1070,6 +1101,80 @@ class WebResearchTests(unittest.TestCase):
         self.assertEqual(second["freshness"]["cache"], "immutable")
         self.assertEqual(launches.read_text().splitlines(), ["launch"])
 
+    def test_job_page_uses_daily_freshness_and_relative_posting_date(self):
+        self.fake_firefox()
+        environment = self.environment()
+        environment["FAKE_PAGE_TITLE"] = "Platform engineering jobs"
+        environment["FAKE_PAGE_TEXT"] = "Platform Engineer\nPosted 2d ago\nRemote"
+        environment["FAKE_PAGE_JOBS"] = json.dumps(
+            [
+                {
+                    "title": "Platform Engineer",
+                    "url": "https://example.test/roles/platform-engineer",
+                    "company": "Example Company",
+                    "location": "Remote",
+                    "posting_age": "2d ago",
+                    "published": "",
+                    "summary": "Build reliable systems.",
+                }
+            ]
+        )
+
+        arguments = (
+            "scrape",
+            "https://example.test/jobs/platform-engineer",
+            "--format",
+            "json",
+            "--preflight",
+            "--wait-ms",
+            "0",
+            "--settle-ms",
+            "0",
+            "--profile",
+            "job-freshness",
+        )
+        page = json.loads(self.run_tool(*arguments, environment=environment).stdout)
+        cached = json.loads(self.run_tool(*arguments, environment=environment).stdout)
+
+        self.assertEqual(page["freshness"]["change_likelihood"], "high")
+        self.assertIn("job-listing-or-board", page["freshness"]["basis"])
+        retrieved = datetime.fromisoformat(page["freshness"]["retrieved_at"])
+        refresh = datetime.fromisoformat(page["freshness"]["refresh_after"])
+        self.assertEqual((refresh - retrieved).total_seconds(), 24 * 60 * 60)
+        self.assertRegex(page["jobs"][0]["published"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertEqual(page["published"], page["jobs"][0]["published"])
+        self.assertEqual(cached["freshness"]["retrieval"], "local-index")
+        self.assertEqual(cached["jobs"], page["jobs"])
+
+    def test_scrape_many_isolates_a_gated_page(self):
+        self.fake_firefox()
+        environment = self.environment()
+        result = self.run_tool(
+            "scrape-many",
+            "--wait-ms",
+            "0",
+            "--settle-ms",
+            "0",
+            "--profile",
+            "isolated-page-errors",
+            environment=environment,
+            input=json.dumps(
+                {
+                    "urls": [
+                        "https://example.test/page-one",
+                        "https://account-required.example/page",
+                        "https://example.test/page-two",
+                    ]
+                }
+            ),
+        )
+
+        pages = json.loads(result.stdout)["pages"]
+        self.assertEqual(len(pages), 3)
+        self.assertNotIn("error", pages[0])
+        self.assertEqual(pages[1]["error"]["code"], "interactive-login-required")
+        self.assertNotIn("error", pages[2])
+
     def test_preflight_resolves_requested_url_through_canonical_alias(self):
         self.fake_firefox()
         launches = self.workspace / "launches"
@@ -1156,6 +1261,7 @@ class WebResearchTests(unittest.TestCase):
         self.assertIn("change_likelihood", columns)
         self.assertIn("refresh_after", columns)
         self.assertIn("content_sha256", columns)
+        self.assertIn("jobs_json", columns)
 
     def test_real_firefox_extracts_hydrated_open_shadow_root(self):
         environment = self.environment(fake_firefox=False)
@@ -1178,6 +1284,33 @@ class WebResearchTests(unittest.TestCase):
         page = json.loads(result.stdout)
         self.assertIn("Hydrated evidence", page["text"])
         self.assertIn("Open shadow-root evidence", page["text"])
+
+    def test_real_firefox_extracts_generic_job_cards(self):
+        environment = self.environment(fake_firefox=False)
+        with rendered_fixture_server() as url:
+            result = self.run_tool(
+                "scrape",
+                f"{url}jobs",
+                "--format",
+                "json",
+                "--wait-ms",
+                "0",
+                "--settle-ms",
+                "200",
+                "--profile",
+                "job-card-regression-fixture",
+                "--allow-private",
+                environment=environment,
+            )
+
+        page = json.loads(result.stdout)
+        self.assertEqual(
+            [job["title"] for job in page["jobs"]],
+            ["Platform Engineer", "Data Engineer"],
+        )
+        self.assertTrue(page["jobs"][0]["url"].endswith("/roles/platform-engineer"))
+        self.assertEqual(page["jobs"][1]["location"], "Brisbane")
+        self.assertRegex(page["jobs"][0]["published"], r"^\d{4}-\d{2}-\d{2}$")
 
     def test_browser_navigation_blocks_private_networks_without_opt_in(self):
         self.fake_firefox()

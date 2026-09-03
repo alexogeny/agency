@@ -217,6 +217,12 @@ exact evidence lines in a deduplicated source ledger. Pi's installed
 `agency_web` extension speaks to the same server and retains those references
 for the life of its session.
 
+Large MCP opens are divided into bounded four-page backend batches. A failed or
+login-gated page returns a typed per-page error while successful siblings remain
+available and citable. Extracted job cards are returned as structured records
+with title, URL, company, location, summary, visible posting age, and a normalized
+publication date when the page supplies enough evidence.
+
 Automated browser and direct-HTTP traffic pass through a per-run validating
 proxy that resolves and pins each destination address and blocks private,
 link-local, and other non-public ranges at every request. `--allow-private` is
@@ -237,7 +243,9 @@ bounded lazy-feed scrolling, content size, and link count all have explicit
 budgets, with truncation reported in JSON. Each bounded scroll is captured and
 deduplicated so virtualized feeds retain earlier evidence. Extraction also
 merges bounded page metadata and sanitized JSON-LD, recording access state,
-sources, and capture count.
+sources, and capture count. Job listings and job-board result pages use a daily
+refresh window; relative posting ages are resolved against the recorded live
+retrieval time and retained with the original visible age.
 
 Optional semantic interaction steps dismiss narrowly recognized overlays and
 activate expand, read-more, or load-more controls while recording whether each
