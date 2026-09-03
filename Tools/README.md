@@ -156,12 +156,13 @@ other tooling, and `system-context --refresh` to bypass the accelerator cache.
 
 ## `sudo-gui`
 
-Opens one KDE password dialog for an explicitly approved sudo operation, makes
-one authentication attempt, and runs the requested workflow in the same
-process context so sudo's cached authorization remains usable. It refuses to
-prompt during an active PAM lockout and never retries automatically. Passwords
-remain in process memory only and are not written to files, arguments,
-environment variables, or output.
+Gives an explicitly approved sudo operation a one-attempt KDE askpass helper.
+Direct sudo commands authenticate and execute in the same sudo invocation;
+script workflows receive a private PATH-scoped sudo proxy. Sudo reuses valid
+authorization or command-specific `NOPASSWD` rules without a dialog. The helper
+refuses to prompt during an active PAM lockout and blocks sudo password retries.
+Passwords remain in the dialog process memory only and are not written to
+files, arguments, environment variables, or captured output.
 
 ## `web-research`
 

@@ -60,16 +60,18 @@ class SudoGuiTests(unittest.TestCase):
         self.write_executable(
             "sudo",
             'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/sudo"\n'
-            'if [[ ${1:-} == -n ]]; then\n'
-            '  [[ -e "$SUDO_GUI_TEST_CALLS/authorized" ]]\n'
-            'elif [[ ${1:-} == -S ]]; then\n'
-            '  IFS= read -r password\n'
+            'if [[ ${1:-} == -A ]]; then\n'
+            '  password=$("$SUDO_ASKPASS")\n'
             '  printf "%s" "$password" > "$SUDO_GUI_TEST_CALLS/password"\n'
             '  touch "$SUDO_GUI_TEST_CALLS/authorized"\n'
-            'fi',
+            '  exit 0\n'
+            'fi\n'
+            'exit 1',
         )
         command = self.write_executable(
-            "after-auth", 'printf "ran\\n" > "$SUDO_GUI_TEST_CALLS/command"'
+            "after-auth",
+            'sudo privileged\n'
+            'printf "ran\\n" > "$SUDO_GUI_TEST_CALLS/command"',
         )
 
         result = self.run_tool("--", command)
@@ -81,18 +83,162 @@ class SudoGuiTests(unittest.TestCase):
         self.assertEqual((self.calls / "command").read_text(), "ran\n")
         self.assertNotIn("correct horse", result.stdout + result.stderr)
 
+    def test_nopasswd_true_does_not_skip_authorization_for_requested_command(self):
+        self.write_executable(
+            "kdialog",
+            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/kdialog"\n'
+            'printf "correct horse\\n"',
+        )
+        self.write_executable("faillock", "exit 0")
+        sudo = self.write_executable(
+            "sudo",
+            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/sudo"\n'
+            'if [[ ${1:-} == -n && ${2:-} == true ]]; then exit 0; fi\n'
+            'if [[ ${1:-} == -A ]]; then\n'
+            '  password=$("$SUDO_ASKPASS")\n'
+            '  printf "%s" "$password" > "$SUDO_GUI_TEST_CALLS/password"\n'
+            '  touch "$SUDO_GUI_TEST_CALLS/command"\n'
+            '  exit 0\n'
+            'fi\n'
+            'exit 77',
+        )
+
+        result = self.run_tool("--", sudo, "privileged")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.calls / "password").read_text(), "correct horse")
+        self.assertTrue((self.calls / "command").exists())
+        self.assertEqual(
+            sum(
+                "--password" in line
+                for line in (self.calls / "kdialog").read_text().splitlines()
+            ),
+            1,
+        )
+
+    def test_requested_sudo_does_not_depend_on_a_validate_timestamp(self):
+        self.write_executable(
+            "kdialog",
+            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/kdialog"\n'
+            'printf "correct horse\\n"',
+        )
+        self.write_executable("faillock", "exit 0")
+        sudo = self.write_executable(
+            "sudo",
+            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/sudo"\n'
+            'if [[ ${1:-} == -n ]]; then exit 1; fi\n'
+            'if [[ ${1:-} == -S ]]; then\n'
+            '  IFS= read -r password\n'
+            '  printf "%s" "$password" > "$SUDO_GUI_TEST_CALLS/validated"\n'
+            '  exit 0\n'
+            'fi\n'
+            'if [[ ${1:-} == -A ]]; then\n'
+            '  password=$("$SUDO_ASKPASS")\n'
+            '  printf "%s" "$password" > "$SUDO_GUI_TEST_CALLS/password"\n'
+            '  touch "$SUDO_GUI_TEST_CALLS/command"\n'
+            '  exit 0\n'
+            'fi\n'
+            'exit 89',
+        )
+
+        result = self.run_tool("--", sudo, "privileged")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.calls / "password").read_text(), "correct horse")
+        self.assertTrue((self.calls / "command").exists())
+        self.assertFalse((self.calls / "validated").exists())
+
+    def test_script_can_pass_nopasswd_probe_then_authorize_later_sudo(self):
+        self.write_executable(
+            "kdialog",
+            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/kdialog"\n'
+            'printf "correct horse\\n"',
+        )
+        self.write_executable("faillock", "exit 0")
+        self.write_executable(
+            "sudo",
+            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/sudo"\n'
+            'if [[ $* == "-A -n true" ]]; then exit 0; fi\n'
+            'if [[ $* == "-A privileged" ]]; then\n'
+            '  password=$("$SUDO_ASKPASS")\n'
+            '  printf "%s" "$password" > "$SUDO_GUI_TEST_CALLS/password"\n'
+            '  exit 0\n'
+            'fi\n'
+            'exit 1',
+        )
+        command = self.write_executable(
+            "workflow",
+            'sudo -n true\n'
+            'sudo privileged\n'
+            'touch "$SUDO_GUI_TEST_CALLS/command"',
+        )
+
+        result = self.run_tool("--", command)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.calls / "password").read_text(), "correct horse")
+        self.assertTrue((self.calls / "command").exists())
+        self.assertEqual(
+            (self.calls / "sudo").read_text().splitlines(),
+            ["-A -n true", "-A privileged"],
+        )
+
+    def test_existing_authorization_runs_without_a_dialog(self):
+        self.write_executable(
+            "kdialog", 'printf "called\\n" > "$SUDO_GUI_TEST_CALLS/kdialog"'
+        )
+        self.write_executable("faillock", "exit 0")
+        sudo = self.write_executable(
+            "sudo",
+            'printf "%s\\n" "$*" > "$SUDO_GUI_TEST_CALLS/sudo"\n'
+            'exit 0',
+        )
+
+        result = self.run_tool("--", sudo, "privileged")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.calls / "kdialog").exists())
+        self.assertEqual((self.calls / "sudo").read_text(), "-A privileged\n")
+
+    def test_sudo_retry_does_not_open_a_second_password_dialog(self):
+        self.write_executable(
+            "kdialog",
+            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/kdialog"\n'
+            'printf "wrong password\\n"',
+        )
+        self.write_executable("faillock", "exit 0")
+        sudo = self.write_executable(
+            "sudo",
+            '"$SUDO_ASKPASS" >/dev/null\n'
+            '"$SUDO_ASKPASS" >/dev/null',
+        )
+
+        result = self.run_tool("--", sudo, "privileged")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            sum(
+                "--password" in line
+                for line in (self.calls / "kdialog").read_text().splitlines()
+            ),
+            1,
+        )
+        self.assertIn("only one password attempt", result.stderr)
+
     def test_cancel_does_not_call_sudo_with_a_password(self):
         self.write_executable("kdialog", "exit 1")
         self.write_executable("faillock", "exit 0")
         self.write_executable(
             "sudo",
-            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/sudo"\nexit 1',
+            'printf "%s\\n" "$*" >> "$SUDO_GUI_TEST_CALLS/sudo"\n'
+            'if [[ ${1:-} == -A ]]; then "$SUDO_ASKPASS" >/dev/null; fi\n'
+            'exit 1',
         )
 
         result = self.run_tool()
 
         self.assertEqual(result.returncode, 130)
-        self.assertEqual((self.calls / "sudo").read_text().splitlines(), ["-n true"])
+        self.assertEqual(len((self.calls / "sudo").read_text().splitlines()), 1)
 
     def test_active_faillock_refuses_without_opening_password_dialog(self):
         now = subprocess.run(
@@ -106,7 +252,11 @@ class SudoGuiTests(unittest.TestCase):
         self.write_executable(
             "kdialog", 'printf "called\\n" > "$SUDO_GUI_TEST_CALLS/kdialog"'
         )
-        self.write_executable("sudo", "exit 1")
+        self.write_executable(
+            "sudo",
+            'if [[ ${1:-} == -A ]]; then "$SUDO_ASKPASS" >/dev/null; fi\n'
+            'exit 1',
+        )
 
         result = self.run_tool()
 
