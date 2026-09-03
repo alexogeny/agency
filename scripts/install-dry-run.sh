@@ -198,14 +198,14 @@ agency_print_install_plan() {
     "install/update" "${packages[*]}"
   printf '  [%-16s] verified Computer Modern Unicode fonts\n' "install fonts"
   if $update; then
-    printf '  [%-16s] yay and patched nghttp2/h2load AUR builds\n' "update AUR tools"
-    printf '  [%-16s] 1Password desktop AUR build\n' "update AUR tool"
-    printf '  [%-16s] 1Password CLI AUR build\n' "update AUR tool"
+    printf '  [%-16s] pinned yay and patched nghttp2/h2load AUR builds\n' "reinstall tools"
+    printf '  [%-16s] pinned 1Password desktop AUR build\n' "reinstall tool"
+    printf '  [%-16s] pinned 1Password CLI AUR build\n' "reinstall tool"
     printf '  [%-16s] stable Rust toolchain\n' "update toolchain"
     printf '  [%-16s] Codex, Claude Code, and Pi through Bun\n' \
-      "update installed CLIs"
+      "reinstall pins"
     printf '  [%-16s] Gantry, Thoreau, and podman-compose through uv\n' \
-      "update installed CLIs"
+      "reinstall pins"
   else
     printf '  [%-16s] yay and patched nghttp2/h2load; retain installed versions\n' \
       "install missing"
@@ -218,7 +218,7 @@ agency_print_install_plan() {
       "install missing"
     printf '  [%-16s] Gantry, Thoreau, and podman-compose; retain installed versions\n' \
       "install missing"
-    printf '  [%-16s] pass --update to check retained tools for newer versions\n' \
+    printf '  [%-16s] update reviewed pins, then pass --update to reinstall them\n' \
       "update warning"
   fi
 

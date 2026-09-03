@@ -229,13 +229,17 @@ function checkedProfile(value: unknown) {
   return profile;
 }
 
-async function invoke(arguments_: string[]) {
+async function invoke(arguments_: string[], input = "") {
   const process_ = Bun.spawn([backend, ...arguments_], {
-    stdin: "ignore",
+    stdin: input ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
     env: process.env,
   });
+  if (input) {
+    process_.stdin.write(input);
+    process_.stdin.end();
+  }
   const [stdout, stderr, status] = await Promise.all([
     new Response(process_.stdout).text(),
     new Response(process_.stderr).text(),
@@ -344,6 +348,51 @@ async function loadPage(value: string, evidence: string, profile: string) {
   return reference;
 }
 
+async function loadPages(values: string[], evidence: string, profile: string) {
+  const resolved = values.map((value) => {
+    const existing = references.get(value);
+    if (
+      existing?.kind === "page" &&
+      hasEvidence(existing, evidence) &&
+      isFreshReference(existing)
+    ) return { reference: existing, url: existing.url };
+    const url = resolvedUrl(value);
+    const cached = pageReferences.get(url);
+    if (cached && hasEvidence(cached, evidence) && isFreshReference(cached)) {
+      return { reference: cached, url };
+    }
+    return { url };
+  });
+  const missing = [...new Set(
+    resolved.filter((item) => !item.reference).map((item) => item.url),
+  )];
+  if (missing.length === 1) {
+    const reference = await loadPage(missing[0], evidence, profile);
+    pageReferences.set(missing[0], reference);
+  } else if (missing.length > 1) {
+    const arguments_ = ["scrape-many"];
+    if (evidence === "index") arguments_.push("--index");
+    if (evidence === "capture") arguments_.push("--capture");
+    if (profile) arguments_.push("--profile", profile);
+    const outcome = await invoke(
+      arguments_,
+      JSON.stringify({ urls: missing }),
+    );
+    if (!Array.isArray(outcome.pages) || outcome.pages.length !== missing.length) {
+      throw new Error("web-research returned an invalid scrape batch");
+    }
+    for (const [index, page] of outcome.pages.entries()) {
+      const reference = addPageReference(page as JsonObject, evidence);
+      pageReferences.set(missing[index], reference);
+    }
+  }
+  return resolved.map((item) => {
+    const reference = item.reference || pageReferences.get(item.url);
+    if (!reference) throw new Error(`page was not loaded: ${item.url}`);
+    return reference;
+  });
+}
+
 function pageLines(reference: PageReference) {
   const markdown = String(reference.page.markdown || reference.page.text || "").trim();
   return markdown.split(/\r?\n/);
@@ -445,10 +494,12 @@ function renderPage(reference: PageReference, lineno: number, budget: number) {
   };
 }
 
-async function performSearch(items: JsonObject[], responseLength: unknown) {
-  const records: JsonObject[] = [];
-  const rendered: string[] = [];
-  for (const [queryIndex, item] of items.entries()) {
+async function performSearch(
+  items: JsonObject[],
+  responseLength: unknown,
+  profile: string,
+) {
+  const searches = items.map((item, queryIndex) => {
     const query = checkedString(item.q, `search_query[${queryIndex}].q`, 1000);
     const domains = checkedStrings(item.domains, `search_query[${queryIndex}].domains`);
     const excluded = checkedStrings(
@@ -459,18 +510,24 @@ async function performSearch(items: JsonObject[], responseLength: unknown) {
     if (!new Set(["first", "federated"]).has(strategy)) {
       throw new Error(`search_query[${queryIndex}].strategy must be first or federated`);
     }
-    const arguments_ = [
-      "search",
+    return {
       query,
-      "--strategy",
       strategy,
-      "--limit",
-      String(searchLimit(responseLength)),
-      "--json",
-    ];
-    for (const domain of domains) arguments_.push("--domain", domain);
-    for (const domain of excluded) arguments_.push("--exclude-domain", domain);
-    const outcome = await invoke(arguments_);
+      domains,
+      excluded,
+      limit: searchLimit(responseLength),
+    };
+  });
+  const arguments_ = ["search-many"];
+  if (profile) arguments_.push("--profile", profile);
+  const batch = await invoke(arguments_, JSON.stringify({ searches }));
+  if (!Array.isArray(batch.results) || batch.results.length !== searches.length) {
+    throw new Error("web-research returned an invalid search batch");
+  }
+  const records: JsonObject[] = [];
+  const rendered: string[] = [];
+  for (const [queryIndex, outcome] of batch.results.entries()) {
+    const { query, strategy } = searches[queryIndex];
     const results = (Array.isArray(outcome.results) ? outcome.results : []).map(
       (result: JsonObject) => {
         const reference = addSearchReference(result);
@@ -555,15 +612,19 @@ async function performOpen(
   profile: string,
   budget: number,
 ) {
-  const records: JsonObject[] = [];
-  const rendered: string[] = [];
-  for (const [index, item] of items.entries()) {
+  const requests = items.map((item, index) => {
     const refId = checkedString(item.ref_id, `open[${index}].ref_id`, 8192);
     const lineno = item.lineno === undefined ? 1 : Number(item.lineno);
     if (!Number.isInteger(lineno) || lineno < 1) {
       throw new Error(`open[${index}].lineno must be a positive integer`);
     }
-    const page = await loadPage(refId, evidence, profile);
+    return { refId, lineno };
+  });
+  const pages = await loadPages(requests.map((item) => item.refId), evidence, profile);
+  const records: JsonObject[] = [];
+  const rendered: string[] = [];
+  for (const [index, page] of pages.entries()) {
+    const { lineno } = requests[index];
     const view = renderPage(page, lineno, budget);
     records.push({
       ...pageRecord(page),
@@ -583,12 +644,15 @@ async function performFind(
   evidence: string,
   profile: string,
 ) {
+  const requests = items.map((item, index) => ({
+    refId: checkedString(item.ref_id, `find[${index}].ref_id`, 8192),
+    pattern: checkedString(item.pattern, `find[${index}].pattern`, 500),
+  }));
+  const pages = await loadPages(requests.map((item) => item.refId), evidence, profile);
   const records: JsonObject[] = [];
   const rendered: string[] = [];
-  for (const [index, item] of items.entries()) {
-    const refId = checkedString(item.ref_id, `find[${index}].ref_id`, 8192);
-    const pattern = checkedString(item.pattern, `find[${index}].pattern`, 500);
-    const page = await loadPage(refId, evidence, profile);
+  for (const [index, page] of pages.entries()) {
+    const { pattern } = requests[index];
     const needle = pattern.toLocaleLowerCase();
     const matches = pageLines(page)
       .map((line, lineIndex) => ({ line, lineno: lineIndex + 1 }))
@@ -617,18 +681,25 @@ async function performClick(
   profile: string,
   budget: number,
 ) {
-  const records: JsonObject[] = [];
-  const rendered: string[] = [];
-  for (const [index, item] of items.entries()) {
+  const requests = items.map((item, index) => {
     const refId = checkedString(item.ref_id, `click[${index}].ref_id`, 8192);
     const id = Number(item.id);
     if (!Number.isInteger(id) || id < 1) {
       throw new Error(`click[${index}].id must be a positive integer`);
     }
-    const source = await loadPage(refId, evidence, profile);
+    return { refId, id };
+  });
+  const sources = await loadPages(requests.map((item) => item.refId), evidence, profile);
+  const targets = sources.map((source, index) => {
+    const { id } = requests[index];
     const links = Array.isArray(source.page.links) ? source.page.links : [];
     if (id > links.length) throw new Error(`[${source.ref_id}] has no link ${id}`);
-    const page = await loadPage(checkedString(links[id - 1], "link URL", 8192), evidence, profile);
+    return checkedString(links[id - 1], "link URL", 8192);
+  });
+  const pages = await loadPages(targets, evidence, profile);
+  const records: JsonObject[] = [];
+  const rendered: string[] = [];
+  for (const page of pages) {
     const view = renderPage(page, 1, budget);
     records.push({
       ...pageRecord(page),
@@ -710,6 +781,7 @@ async function callRun(arguments_: unknown) {
     const result = await performSearch(
       checkedArray(arguments_.search_query, "search_query", 4),
       responseLength,
+      profile,
     );
     records.push(...result.records);
     rendered.push(...result.rendered);

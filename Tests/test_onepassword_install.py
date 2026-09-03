@@ -83,10 +83,26 @@ class OnePasswordInstallTests(unittest.TestCase):
             "git",
             r"""
             #!/usr/bin/env bash
+            set -euo pipefail
             printf 'git %s\n' "$*" >> "$AGENCY_TEST_LOG"
-            target=${@: -1}
-            mkdir -p "$target"
-            printf 'pkgname=%s\n' "${target##*/}" > "$target/PKGBUILD"
+            if [[ ${1:-} == clone ]]; then
+              target=${@: -1}
+              mkdir -p "$target"
+              printf 'pkgname=%s\n' "${target##*/}" > "$target/PKGBUILD"
+              exit
+            fi
+            if [[ ${1:-} == -C && ${3:-} == cat-file ]]; then
+              exit
+            fi
+            if [[ ${1:-} == -C && ${3:-} == rev-parse ]]; then
+              if [[ $2 == */1password ]]; then
+                printf '%s\n' e323d0d1f8dea6b75bb651ce14acc73904cd0326
+              else
+                printf '%s\n' b0d208821677a5dbb883a8b92f06a5c92b9e861a
+              fi
+              exit
+            fi
+            exit 2
             """,
         )
         self.executable(
@@ -124,6 +140,7 @@ class OnePasswordInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         log = self.log.read_text()
         self.assertIn("aur.archlinux.org/1password-cli.git", log)
+        self.assertIn("b0d208821677a5dbb883a8b92f06a5c92b9e861a", log)
         self.assertNotIn("aur.archlinux.org/1password.git", log)
         self.assertIn("sudo pacman -U --noconfirm", log)
 
@@ -137,6 +154,7 @@ class OnePasswordInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         log = self.log.read_text()
         self.assertIn("aur.archlinux.org/1password-cli.git", log)
+        self.assertIn("b0d208821677a5dbb883a8b92f06a5c92b9e861a", log)
         self.assertNotIn("aur.archlinux.org/1password.git", log)
         self.assertNotIn("--needed", log)
 
@@ -164,6 +182,8 @@ class OnePasswordInstallTests(unittest.TestCase):
         log = self.log.read_text()
         self.assertIn("aur.archlinux.org/1password.git", log)
         self.assertIn("aur.archlinux.org/1password-cli.git", log)
+        self.assertIn("e323d0d1f8dea6b75bb651ce14acc73904cd0326", log)
+        self.assertIn("b0d208821677a5dbb883a8b92f06a5c92b9e861a", log)
         self.assertEqual(log.count("sudo pacman -U --noconfirm"), 2)
 
 

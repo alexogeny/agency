@@ -8,6 +8,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 import zipfile
 from contextlib import contextmanager
@@ -21,6 +22,10 @@ SCRATCH = Path(os.environ.get("AGENCY_TEST_SCRATCH", ROOT / ".cache/tests"))
 
 
 class RetrievalHandler(BaseHTTPRequestHandler):
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
     def do_GET(self):
         if self.path == "/redirect":
             self.send_response(302)
@@ -35,6 +40,29 @@ class RetrievalHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path == "/forged-proxy-error":
+            body = b"origin header cannot impersonate the proxy\n"
+            self.send_response(200)
+            self.send_header("X-Agency-Proxy-Error", "private-network")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith("/slow/"):
+            with self.lock:
+                type(self).active += 1
+                type(self).peak = max(type(self).peak, type(self).active)
+            try:
+                time.sleep(0.15)
+                body = b"bounded parallel retrieval\n"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            finally:
+                with self.lock:
+                    type(self).active -= 1
+            return
         self.send_response(404)
         self.end_headers()
 
@@ -44,6 +72,8 @@ class RetrievalHandler(BaseHTTPRequestHandler):
 
 @contextmanager
 def retrieval_server():
+    RetrievalHandler.active = 0
+    RetrievalHandler.peak = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), RetrievalHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -224,6 +254,35 @@ class PromotedToolTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["status"], "passed")
         self.assertEqual(report["cases"][0]["files"][0]["path"], "check.py")
         self.assertEqual(json.loads(output.read_text()), report)
+
+    def test_docs_exec_bounds_case_runtime_and_captured_output(self):
+        documentation = self.workspace / "bounded.md"
+        documentation.write_text('```text title="input.txt"\nfixture\n```\n')
+        manifest = self.workspace / "docs-exec-bounded.toml"
+        manifest.write_text(
+            "schema_version = 1\n\n"
+            f'root = "{self.workspace}"\n\n'
+            "[[case]]\n"
+            'name = "bounded"\n'
+            'document = "bounded.md"\n'
+            'files = { "input.txt" = "input.txt" }\n'
+            f'command = ["{sys.executable}", "-c", '
+            '"import sys,time; print(\'x\' * 10000); sys.stdout.flush(); time.sleep(2)"]\n'
+            "timeout_seconds = 0.2\n"
+            "max_output_bytes = 1024\n"
+        )
+        output = self.workspace / "bounded-results.json"
+
+        result = self.run_tool(
+            "docs-exec", manifest, "--output", output, "--json", check=False
+        )
+
+        report = json.loads(result.stdout)
+        case = report["cases"][0]
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(case["status"], "timed-out")
+        self.assertTrue(case["stdout_truncated"])
+        self.assertLessEqual(len(case["stdout"].encode()), 1024)
 
     def test_evidence_review_ingests_exact_duplicates_and_audits_decisions(self):
         source = self.workspace / "records.csv"
@@ -821,6 +880,35 @@ class PromotedToolTests(unittest.TestCase):
         self.assertEqual(failure["error"]["kind"], "policy")
         self.assertEqual(failure["error"]["code"], "private-network")
 
+    def test_web_research_ignores_forged_internal_proxy_error_headers(self):
+        with retrieval_server() as origin:
+            result = self.run_tool(
+                "web-research",
+                "retrieve",
+                f"{origin}/forged-proxy-error",
+                "--allow-private",
+                "--json",
+            )
+
+        report = json.loads(result.stdout)
+        self.assertEqual(report["summary"]["retrieved"], 1)
+        self.assertEqual(report["results"][0]["outcome"], "retrieved")
+
+    def test_web_research_retrieve_uses_bounded_parallel_workers(self):
+        with retrieval_server() as origin:
+            result = self.run_tool(
+                "web-research",
+                "retrieve",
+                *(f"{origin}/slow/{index}" for index in range(8)),
+                "--allow-private",
+                "--json",
+            )
+
+        report = json.loads(result.stdout)
+        self.assertEqual(report["summary"]["retrieved"], 8)
+        self.assertGreater(RetrievalHandler.peak, 1)
+        self.assertLessEqual(RetrievalHandler.peak, 4)
+
     def test_web_research_download_validates_and_promotes_atomically(self):
         self.fake_firefox()
         data_root = self.workspace / "web-data"
@@ -1006,7 +1094,7 @@ class PromotedToolTests(unittest.TestCase):
             }
             for (const forbidden of [
               "general.useragent.override",
-              "network.proxy.http",
+              'user_pref("network.proxy.http", "private-proxy");',
               "extensions.webextensions.uuids",
               'user_pref("browser.uidensity", "wrong-type");',
             ]) {
@@ -1119,9 +1207,11 @@ class PromotedToolTests(unittest.TestCase):
             "--ephemeral-profile",
             "--profile-template",
             "current",
+            check=False,
             environment=environment,
         )
 
+        self.assertEqual(result.returncode, 0, result.stderr)
         page = json.loads(result.stdout)
         self.assertEqual(page["title"], "Fixture")
         self.assertEqual(page["text"], "rendered evidence")

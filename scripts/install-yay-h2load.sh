@@ -2,6 +2,8 @@
 set -euo pipefail
 
 update=false
+yay_revision=cb43f84828ab4f9700f7c6f9c6d7a923d4cfaff0
+nghttp2_revision=2f11414698d4a0190de1681f817855d93e29fcd9
 case ${1:-} in
   --update) update=true ;;
   "") ;;
@@ -35,6 +37,21 @@ verify_command() {
   "$name" --version
 }
 
+clone_pinned_recipe() {
+  local package=$1 revision=$2 target=$3 actual
+  git clone --depth 1 "https://aur.archlinux.org/${package}.git" "$target"
+  git -C "$target" cat-file -e "${revision}^{commit}" || {
+    printf '%s AUR revision is no longer the fetched head; review and update the pin.\n' "$package" >&2
+    exit 1
+  }
+  actual=$(git -C "$target" rev-parse HEAD)
+  [[ $actual == "$revision" ]] || {
+    printf '%s AUR head %s does not match pinned revision %s.\n' \
+      "$package" "$actual" "$revision" >&2
+    exit 1
+  }
+}
+
 temporary_directories=()
 cleanup() {
   local directory
@@ -50,19 +67,17 @@ trap cleanup EXIT
 
 retained=()
 
-if ! command -v yay >/dev/null 2>&1; then
+if ! command -v yay >/dev/null 2>&1 || $update; then
   mkdir -p "$HOME/Scratch"
   yay_build_dir="$(mktemp -d -p "$HOME/Scratch" yay.XXXXXX)"
   temporary_directories+=("$yay_build_dir")
 
-  git clone --depth 1 https://aur.archlinux.org/yay.git "$yay_build_dir"
+  clone_pinned_recipe yay "$yay_revision" "$yay_build_dir"
   review_recipe "$yay_build_dir/PKGBUILD"
   (
     cd "$yay_build_dir"
     makepkg -si --needed --noconfirm
   )
-elif $update; then
-  yay -S --needed --noconfirm yay
 else
   retained+=(yay)
 fi
@@ -74,23 +89,15 @@ if command -v h2load >/dev/null 2>&1 && ! $update; then
   retained+=(h2load)
   printf '⚠ Already installed and left unchanged:\n'
   printf '  - %s\n' "${retained[@]}"
-  printf 'If any version is older than upstream, run ./install.sh --update.\n'
+  printf 'To upgrade, update the reviewed AUR revisions and run ./install.sh --update.\n'
   exit 0
 fi
 
-if $update; then
-  mkdir -p "$HOME/Scratch"
-  nghttp2_build_dir="$(mktemp -d -p "$HOME/Scratch" nghttp2.XXXXXX)"
-  temporary_directories+=("$nghttp2_build_dir")
-  nghttp2_dir="$nghttp2_build_dir/source"
-  git clone --depth 1 https://aur.archlinux.org/nghttp2.git "$nghttp2_dir"
-else
-  nghttp2_dir="${XDG_CACHE_HOME:-$HOME/.cache}/yay/nghttp2"
-fi
-if [[ ! -e $nghttp2_dir ]]; then
-  mkdir -p "$(dirname -- "$nghttp2_dir")"
-  git clone --depth 1 https://aur.archlinux.org/nghttp2.git "$nghttp2_dir"
-fi
+mkdir -p "$HOME/Scratch"
+nghttp2_build_dir="$(mktemp -d -p "$HOME/Scratch" nghttp2.XXXXXX)"
+temporary_directories+=("$nghttp2_build_dir")
+nghttp2_dir="$nghttp2_build_dir/source"
+clone_pinned_recipe nghttp2 "$nghttp2_revision" "$nghttp2_dir"
 if [[ ! -f $nghttp2_dir/PKGBUILD ]]; then
   printf 'nghttp2 PKGBUILD is unavailable in %s.\n' "$nghttp2_dir" >&2
   exit 1

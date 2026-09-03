@@ -3,6 +3,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import {
   closeSync,
   existsSync,
@@ -19,7 +20,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { BlockList, isIP } from "node:net";
+import { BlockList, connect as connectTcp, isIP } from "node:net";
 import { homedir } from "node:os";
 import {
   basename,
@@ -63,6 +64,7 @@ type DiscoveryEvidence = SearchResult & {
 };
 type RetrievalOptions = {
   allowPrivate: boolean;
+  proxyUrl: string;
   maxBytes: number;
   maxRedirects: number;
   timeoutMs: number;
@@ -438,6 +440,129 @@ async function checkRetrievalSafety(url: URL, allowPrivate: boolean) {
   };
 }
 
+function explicitNetworkTarget(url: URL, allowPrivate: boolean) {
+  if (allowPrivate) return;
+  const hostname = normalizedHostname(url.hostname).toLowerCase();
+  const family = isIP(hostname);
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    (family && isNonPublicAddress(hostname, family))
+  ) {
+    throw new RetrievalFailure(
+      "policy",
+      "private-network",
+      `private or non-public address requires --allow-private: ${url.href}`,
+      false,
+    );
+  }
+}
+
+async function safeProxy(allowPrivate: boolean) {
+  const sockets = new Set<any>();
+  const server = createHttpServer((request, response) => {
+    void (async () => {
+      const target = retrievalUrl(
+        request.url?.startsWith("http://") || request.url?.startsWith("https://")
+          ? request.url
+          : `http://${String(request.headers.host || "")}${request.url || "/"}`,
+      );
+      if (target.protocol !== "http:") {
+        throw new RetrievalFailure(
+          "policy",
+          "proxy-protocol",
+          "non-tunneled proxy requests must use HTTP",
+          false,
+        );
+      }
+      const safety = await checkRetrievalSafety(target, allowPrivate);
+      const address = String((safety.resolved_addresses as string[])[0]);
+      const headers = { ...request.headers, host: target.host };
+      delete headers["proxy-authorization"];
+      delete headers["proxy-connection"];
+      const upstream = httpRequest(
+        {
+          hostname: address,
+          family: isIP(address),
+          port: Number(target.port || 80),
+          path: `${target.pathname}${target.search}`,
+          method: request.method,
+          headers,
+        },
+        (upstreamResponse) => {
+          const responseHeaders = { ...upstreamResponse.headers };
+          delete responseHeaders["x-agency-proxy-error"];
+          response.writeHead(
+            upstreamResponse.statusCode || 502,
+            upstreamResponse.statusMessage,
+            responseHeaders,
+          );
+          upstreamResponse.pipe(response);
+        },
+      );
+      sockets.add(upstream);
+      upstream.once("close", () => sockets.delete(upstream));
+      upstream.once("error", (error) => response.destroy(error));
+      request.pipe(upstream);
+    })().catch((error) => {
+      response.writeHead(error instanceof RetrievalFailure ? 403 : 502, {
+        "content-type": "text/plain; charset=utf-8",
+        connection: "close",
+        "x-agency-proxy-error": error instanceof RetrievalFailure ? error.code : "proxy-failed",
+      });
+      response.end(error instanceof Error ? error.message : String(error));
+    });
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  server.on("connect", (request, client, head) => {
+    void (async () => {
+      const authority = new URL(`http://${request.url || ""}`);
+      const port = Number(authority.port || 443);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new RetrievalFailure("policy", "invalid-port", "invalid proxy target port", false);
+      }
+      const target = new URL(`https://${authority.hostname}:${port}/`);
+      const safety = await checkRetrievalSafety(target, allowPrivate);
+      const address = String((safety.resolved_addresses as string[])[0]);
+      const upstream = connectTcp({ host: address, port, family: isIP(address) });
+      sockets.add(upstream);
+      upstream.once("close", () => sockets.delete(upstream));
+      upstream.once("connect", () => {
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length) upstream.write(head);
+        client.pipe(upstream);
+        upstream.pipe(client);
+      });
+      upstream.once("error", (error) => client.destroy(error));
+    })().catch((error) => {
+      client.end(
+        `HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+      );
+      if (!(error instanceof RetrievalFailure)) console.error(error);
+    });
+  });
+  await new Promise<void>((resolveReady, rejectReady) => {
+    server.once("error", rejectReady);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", rejectReady);
+      resolveReady();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("safe proxy has no TCP address");
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    port: address.port,
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    },
+  };
+}
+
 async function boundedResponseDigest(response: Response, maxBytes: number) {
   const lengthHeader = response.headers.get("content-length");
   const declaredLength = lengthHeader === null ? null : Number(lengthHeader);
@@ -511,11 +636,22 @@ async function retrieveOne(requestedUrl: string, options: RetrievalOptions) {
       const response = await fetch(current, {
         redirect: "manual",
         signal: controller.signal,
+        proxy: options.proxyUrl,
         headers: {
           accept: "*/*",
           "user-agent": "agency-web-research/1 direct-http",
         },
       });
+      const proxyError = response.headers.get("x-agency-proxy-error");
+      if (proxyError) {
+        await response.body?.cancel();
+        throw new RetrievalFailure(
+          proxyError === "proxy-failed" ? "network" : "policy",
+          proxyError,
+          `safe proxy rejected ${current.href}`,
+          proxyError === "proxy-failed",
+        );
+      }
       if (redirectStatuses.has(response.status)) {
         const location = response.headers.get("location");
         if (location) {
@@ -622,6 +758,28 @@ function checkedProfile(value: string) {
 
 function sleep(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function boundedMap<T, U>(
+  values: T[],
+  concurrency: number,
+  operation: (value: T, index: number) => Promise<U>,
+) {
+  const results = new Array<U>(values.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, values.length) },
+    async () => {
+      while (true) {
+        const index = next;
+        next += 1;
+        if (index >= values.length) return;
+        results[index] = await operation(values[index], index);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
 }
 
 function choosePort() {
@@ -1050,6 +1208,7 @@ type BrowserOptions = {
   interactionSteps: number;
   captureNetworkJson: boolean;
   capture: boolean;
+  allowPrivate: boolean;
 };
 
 const ordinaryBrowserPreload = String.raw`() => {
@@ -1085,12 +1244,29 @@ async function startBrowser(
   ) {
     throw new Error("no graphical display is available; use --headless");
   }
-  const claimed = claimProfile(
-    options.profile,
-    [...options.templatePreferences, ...transientPreferences],
-    true,
-    options.ephemeral,
-  );
+  const proxy = await safeProxy(options.allowPrivate);
+  let claimed: ReturnType<typeof claimProfile>;
+  try {
+    claimed = claimProfile(
+      options.profile,
+      [
+        ...options.templatePreferences,
+        ...transientPreferences,
+        ["network.proxy.type", 1],
+        ["network.proxy.http", "127.0.0.1"],
+        ["network.proxy.http_port", proxy.port],
+        ["network.proxy.ssl", "127.0.0.1"],
+        ["network.proxy.ssl_port", proxy.port],
+        ["network.proxy.no_proxies_on", ""],
+        ["network.proxy.allow_hijacking_localhost", true],
+      ],
+      true,
+      options.ephemeral,
+    );
+  } catch (error) {
+    await proxy.close();
+    throw error;
+  }
   const port = choosePort();
   const command = [
     "firefox",
@@ -1123,6 +1299,7 @@ async function startBrowser(
   if (!ready) {
     await terminateBrowserProcess(processHandle);
     releaseProfile(claimed);
+    await proxy.close();
     throw new Error(
       processHandle.exitCode !== null
         ? "Firefox exited before its local control socket became ready"
@@ -1142,15 +1319,17 @@ async function startBrowser(
     bidi.close();
     await terminateBrowserProcess(processHandle);
     releaseProfile(claimed);
+    await proxy.close();
     throw error;
   }
-  return { bidi, context, processHandle, ...claimed };
+  return { bidi, context, processHandle, proxy, ...claimed };
 }
 
 async function stopBrowser(browser: Awaited<ReturnType<typeof startBrowser>>) {
   browser.bidi.close();
   await terminateBrowserProcess(browser.processHandle);
   releaseProfile(browser);
+  await browser.proxy.close();
 }
 
 async function withBrowser<T>(
@@ -2672,6 +2851,7 @@ async function navigateAndExtract(
   url: string,
   options: BrowserOptions,
 ) {
+  explicitNetworkTarget(retrievalUrl(url), options.allowPrivate);
   const navigationHealth = await startNavigationHealth(browser, url);
   const networkCapture = await startNetworkCapture(
     browser,
@@ -3097,6 +3277,7 @@ function browserOptions(args: string[]): BrowserOptions {
     interactionSteps: takeNumber(args, "--interaction-steps", 0, 0, 10),
     captureNetworkJson: takeFlag(args, "--capture-network-json"),
     capture: takeFlag(args, "--capture"),
+    allowPrivate: takeFlag(args, "--allow-private"),
   };
 }
 
@@ -3964,6 +4145,76 @@ async function commandSearch(args: string[]) {
   }
 }
 
+async function commandSearchMany(args: string[]) {
+  const explicitProfile = args.includes("--profile") || args.includes("--ephemeral-profile");
+  const options = browserOptions(args);
+  rejectUnknownOptions(args, "search-many");
+  if (args.length) fail("search-many accepts its request on stdin");
+  if (!explicitProfile) {
+    options.profile = "search";
+    options.ephemeral = true;
+  }
+  let payload: any;
+  try {
+    payload = JSON.parse(await Bun.stdin.text());
+  } catch {
+    fail("search-many requires a JSON request on stdin");
+  }
+  if (!Array.isArray(payload.searches) || !payload.searches.length || payload.searches.length > 4) {
+    fail("search-many searches must contain 1–4 requests");
+  }
+  const searches = payload.searches.map((item: any) => {
+    if (!item || typeof item.query !== "string" || !item.query.trim() || item.query.length > 1000) {
+      fail("search-many query must be non-empty text of at most 1000 characters");
+    }
+    const strategy = item.strategy === undefined ? "federated" : String(item.strategy);
+    if (!new Set(["first", "federated"]).has(strategy)) {
+      fail("search-many strategy must be first or federated");
+    }
+    const domains = Array.isArray(item.domains) ? item.domains.map(checkedDomain) : [];
+    const excluded = Array.isArray(item.excluded) ? item.excluded.map(checkedDomain) : [];
+    const limit = Number(item.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+      fail("search-many limit must be an integer from 1 to 50");
+    }
+    return { query: item.query.trim(), strategy, domains, excluded, limit };
+  });
+  const results = await withBrowser(options, async (browser) => {
+    const state = newSearchRunState();
+    const outcomes = [];
+    for (const item of searches) {
+      const outcome = item.strategy === "federated"
+        ? await searchFederated(
+            browser,
+            options,
+            item.query,
+            item.limit,
+            item.domains,
+            item.excluded,
+            state,
+          )
+        : await searchOne(
+            browser,
+            options,
+            item.query,
+            "auto",
+            item.limit,
+            item.domains,
+            item.excluded,
+            state,
+          );
+      outcomes.push({
+        query: item.query,
+        strategy: item.strategy,
+        scope: searchScope(item.query, item.domains, item.excluded),
+        ...outcome,
+      });
+    }
+    return outcomes;
+  });
+  console.log(JSON.stringify({ results }));
+}
+
 function checkedBatchOutput(value: string, resume: boolean, command: string) {
   const output = resolve(value);
   const parent = dirname(output);
@@ -4824,9 +5075,20 @@ async function commandRetrieve(args: string[]) {
   const timeoutMs = takeNumber(args, "--timeout-ms", 30_000, 100, 120_000);
   if (!args.length) fail("retrieve requires at least one URL");
   if (args.length > 100) fail("retrieve accepts at most 100 URLs");
-  const options = { allowPrivate, maxBytes, maxRedirects, timeoutMs };
-  const results = [];
-  for (const url of args) results.push(await retrieveOne(url, options));
+  const proxy = await safeProxy(allowPrivate);
+  let results;
+  try {
+    const options = {
+      allowPrivate,
+      proxyUrl: proxy.url,
+      maxBytes,
+      maxRedirects,
+      timeoutMs,
+    };
+    results = await boundedMap(args, 4, (url) => retrieveOne(url, options));
+  } finally {
+    await proxy.close();
+  }
   const retrieved = results.filter(
     (result) => result.outcome === "retrieved",
   ).length;
@@ -4934,6 +5196,7 @@ async function commandDownload(args: string[]) {
       interactionSteps: 0,
       captureNetworkJson: false,
       capture: false,
+      allowPrivate,
     };
     const downloadedPath = await withBrowser(
       browserOptions,
@@ -5119,6 +5382,7 @@ async function commandScrape(args: string[]) {
   }
   if (args.length !== 1) fail("scrape requires one URL");
   const url = checkedUrl(args[0]);
+  explicitNetworkTarget(url, options.allowPrivate);
   const cacheEligible =
     shouldPreflight &&
     format !== "html" &&
@@ -5188,6 +5452,74 @@ async function commandScrape(args: string[]) {
   } else {
     console.log(terminalText(content));
   }
+}
+
+async function commandScrapeMany(args: string[]) {
+  const options = browserOptions(args);
+  const shouldIndex = takeFlag(args, "--index");
+  rejectUnknownOptions(args, "scrape-many");
+  if (args.length) fail("scrape-many accepts its request on stdin");
+  let payload: unknown;
+  try {
+    payload = JSON.parse(await Bun.stdin.text());
+  } catch {
+    fail("scrape-many requires a JSON request on stdin");
+  }
+  const values = (payload as JsonObject).urls;
+  if (
+    !Array.isArray(values) ||
+    !values.length ||
+    values.length > 10 ||
+    !values.every((value) => typeof value === "string")
+  ) {
+    fail("scrape-many urls must contain 1–10 URL strings");
+  }
+  const urls = values.map((value) => checkedUrl(String(value)));
+  for (const url of urls) explicitNetworkTarget(url, options.allowPrivate);
+  const pages = new Array<Page>(urls.length);
+  const pending: Array<{ index: number; url: URL; cache: "miss" | "stale" }> = [];
+  for (const [index, url] of urls.entries()) {
+    const preflight = options.capture ? { cache: "bypass" as const } : cachedPage(url.href);
+    if (preflight.page) pages[index] = preflight.page;
+    else pending.push({
+      index,
+      url,
+      cache: preflight.cache === "stale" ? "stale" : "miss",
+    });
+  }
+  const indexer = shouldIndex ? pageIndexer() : null;
+  try {
+    if (pending.length) {
+      await withBrowser(options, async (browser) => {
+        for (const item of pending) {
+          let page = await navigateAndExtract(browser, item.url.href, options);
+          if (options.capture) page = storedCapture(page, browser);
+          if (page.outcome !== "partial") {
+            if (indexer) {
+              page.freshness = indexer.write(page, item.url.href, item.cache);
+            } else {
+              const retrievedAt = new Date().toISOString();
+              const policy = freshnessPolicy(page, retrievedAt);
+              page.freshness = {
+                retrieval: "live",
+                cache: item.cache,
+                change_likelihood: policy.changeLikelihood,
+                basis: policy.basis,
+                retrieved_at: retrievedAt,
+                indexed_at: null,
+                refresh_after: policy.refreshAfter,
+                content_sha256: contentHash(page),
+              };
+            }
+          }
+          pages[item.index] = page;
+        }
+      });
+    }
+  } finally {
+    indexer?.close();
+  }
+  console.log(JSON.stringify({ pages }));
 }
 
 function commandReplay(args: string[]) {
@@ -5620,6 +5952,7 @@ Browser options:
   --capture-network-json  Retain bounded same-origin JSON response evidence
   --capture               Retain sanitized extraction inputs for offline replay
   --preflight             Reuse fresh indexed text; refresh and re-index stale pages
+  --allow-private         Permit private network targets for this browser session
 
 Batch search options:
   --output PATH           Append-only NDJSON checkpoint (required)
@@ -5681,12 +6014,14 @@ try {
     help();
   else if (args.includes("--help") || args.includes("-h")) help();
   else if (command === "search") await commandSearch(args);
+  else if (command === "search-many") await commandSearchMany(args);
   else if (command === "search-batch") await commandSearchBatch(args);
   else if (command === "scrape-batch") await commandScrapeBatch(args);
   else if (command === "retrieve") await commandRetrieve(args);
   else if (command === "download") await commandDownload(args);
   else if (command === "scrape" || command === "fetch")
     await commandScrape(args);
+  else if (command === "scrape-many") await commandScrapeMany(args);
   else if (command === "replay") commandReplay(args);
   else if (command === "capture-gc") commandCaptureGc(args);
   else if (command === "map") await commandMap(args);

@@ -43,6 +43,16 @@ class WebResearchMcpTests(unittest.TestCase):
                     }],
                     attempts: [{ engine: "duckduckgo", outcome: "searched", duration_ms: 1 }],
                   }));
+                } else if (args[0] === "search-many") {
+                  const request = JSON.parse(await Bun.stdin.text());
+                  console.log(JSON.stringify({ results: request.searches.map(item => ({
+                    query: item.query,
+                    engine: "federated",
+                    strategy: item.strategy,
+                    scope: { domains: item.domains, excluded_domains: item.excluded, site_qualifier: "not-present" },
+                    results: [{ title: "Terms", url: "https://example.test/terms", snippet: item.query }],
+                    attempts: [{ engine: "duckduckgo", outcome: "searched", duration_ms: 1 }],
+                  })) }));
                 } else if (args[0] === "scrape") {
                   const target = args[1];
                   console.log(JSON.stringify({
@@ -70,6 +80,23 @@ class WebResearchMcpTests(unittest.TestCase):
                       content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     },
                     truncated: { text: false, markdown: false, html: false, links: false },
+                  }));
+                } else if (args[0] === "scrape-many") {
+                  const request = JSON.parse(await Bun.stdin.text());
+                  console.log(JSON.stringify({
+                    pages: request.urls.map(target => ({
+                      title: target.endsWith("privacy") ? "Privacy" : "Terms",
+                      url: target,
+                      canonicalUrl: target,
+                      published: "",
+                      byline: "",
+                      text: "Batched evidence",
+                      markdown: "# Batched evidence",
+                      html: "",
+                      links: [],
+                      sources: ["rendered-dom"],
+                      truncated: { text: false, markdown: false, html: false, links: false },
+                    })),
                   }));
                 } else if (args[0] === "local") {
                   console.log(JSON.stringify({
@@ -258,6 +285,33 @@ class WebResearchMcpTests(unittest.TestCase):
         self.assertIn("--preflight", scrapes[0])
         self.assertNotIn("--capture", scrapes[0])
         self.assertIn("--capture", scrapes[1])
+
+    def test_multiple_uncached_opens_share_one_backend_browser_batch(self):
+        self.request("initialize", {"protocolVersion": "2025-06-18"})
+
+        opened = self.call(
+            {
+                "open": [
+                    {"ref_id": "https://example.test/terms"},
+                    {"ref_id": "https://example.test/privacy"},
+                ]
+            }
+        )
+
+        self.assertEqual(len(opened["structuredContent"]["results"]), 2)
+        calls = [json.loads(line) for line in self.backend_log.read_text().splitlines()]
+        self.assertEqual([call[0] for call in calls], ["scrape-many"])
+
+    def test_multiple_searches_share_one_backend_browser_batch(self):
+        self.request("initialize", {"protocolVersion": "2025-06-18"})
+
+        searched = self.call(
+            {"search_query": [{"q": "first"}, {"q": "second"}]}
+        )
+
+        self.assertEqual(len(searched["structuredContent"]["results"]), 2)
+        calls = [json.loads(line) for line in self.backend_log.read_text().splitlines()]
+        self.assertEqual([call[0] for call in calls], ["search-many"])
 
 
 if __name__ == "__main__":

@@ -98,9 +98,12 @@ new inspection cannot silently mix with stale pages.
 ## `docs-exec`
 
 Extracts Markdown code fences by their `title=` values and executes declarative
-TOML cases in isolated temporary directories. Each result retains the command,
-extracted-file hashes, stdout, stderr, and status. The `docs-verification` skill
-defines how to rehearse reader-visible instructions safely.
+TOML cases in isolated temporary directories. Cases default to a 300-second
+deadline and 1 MiB per-stream output cap; `timeout_seconds` and
+`max_output_bytes` may set tighter bounds. Each result retains the command,
+extracted-file hashes, bounded output, truncation state, and status. The
+`docs-verification` skill defines how to rehearse reader-visible instructions
+safely.
 
 ## `evidence-review`
 
@@ -213,6 +216,13 @@ records include citation-ready URLs, freshness metadata, content hashes, and
 exact evidence lines in a deduplicated source ledger. Pi's installed
 `agency_web` extension speaks to the same server and retains those references
 for the life of its session.
+
+Automated browser and direct-HTTP traffic pass through a per-run validating
+proxy that resolves and pins each destination address and blocks private,
+link-local, and other non-public ranges at every request. `--allow-private` is
+an explicit opt-in for authorised local or intranet work. Multi-item MCP search,
+open, find, and click operations reuse one browser batch instead of launching a
+browser per item.
 
 An entirely empty document gets one bounded 500-millisecond recovery sample.
 If it remains empty, extraction returns a clear incomplete-content error rather

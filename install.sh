@@ -9,7 +9,7 @@ usage() {
 Usage: ./install.sh [--dry-run] [--update]
 
   --dry-run  Inspect the resolved install plan without changing the system.
-  --update   Update installed versioned tools managed outside pacman.
+  --update   Reinstall repository-pinned tools and update stable Rust.
   --help     Show this help.
 
 Without --update, existing stable Rust, yay, h2load, 1Password, Codex, Claude

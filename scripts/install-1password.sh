@@ -2,6 +2,8 @@
 set -euo pipefail
 
 update=false
+onepassword_revision=e323d0d1f8dea6b75bb651ce14acc73904cd0326
+onepassword_cli_revision=b0d208821677a5dbb883a8b92f06a5c92b9e861a
 case ${1:-} in
   --update) update=true ;;
   "") ;;
@@ -19,6 +21,21 @@ as_root() {
     printf 'The parent installer must establish sudo first.\n' >&2
     exit 1
   fi
+}
+
+clone_pinned_recipe() {
+  local package=$1 revision=$2 target=$3 actual
+  git clone --depth 1 "https://aur.archlinux.org/${package}.git" "$target"
+  git -C "$target" cat-file -e "${revision}^{commit}" || {
+    printf '%s AUR revision is no longer the fetched head; review and update the pin.\n' "$package" >&2
+    exit 1
+  }
+  actual=$(git -C "$target" rev-parse HEAD)
+  [[ $actual == "$revision" ]] || {
+    printf '%s AUR head %s does not match pinned revision %s.\n' \
+      "$package" "$actual" "$revision" >&2
+    exit 1
+  }
 }
 
 packages=()
@@ -48,7 +65,12 @@ if (( ${#packages[@]} )); then
   curl -fsSL https://downloads.1password.com/linux/keys/1password.asc | gpg --import
 
   for package in "${packages[@]}"; do
-    git clone --depth 1 "https://aur.archlinux.org/${package}.git" "$build_root/$package"
+    if [[ $package == 1password ]]; then
+      revision=$onepassword_revision
+    else
+      revision=$onepassword_cli_revision
+    fi
+    clone_pinned_recipe "$package" "$revision" "$build_root/$package"
     (
       cd "$build_root/$package"
       makepkg --noconfirm
@@ -77,5 +99,5 @@ EOF
 if (( ${#retained[@]} )); then
   printf '⚠ Already installed and left unchanged:\n'
   printf '  - %s\n' "${retained[@]}"
-  printf 'If any version is older than upstream, run ./install.sh --update.\n'
+  printf 'To upgrade, update the reviewed AUR revisions and run ./install.sh --update.\n'
 fi

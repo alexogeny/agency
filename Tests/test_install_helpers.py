@@ -502,8 +502,8 @@ class DryRunTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.snapshot(), before)
-        self.assertIn("update installed CLIs", result.stdout)
-        self.assertIn("update AUR tool", result.stdout)
+        self.assertIn("reinstall pins", result.stdout)
+        self.assertIn("reinstall tool", result.stdout)
         self.assertIn("1Password desktop", result.stdout)
         self.assertIn("1Password CLI", result.stdout)
         self.assertIn("Run ./install.sh --update", result.stdout)
