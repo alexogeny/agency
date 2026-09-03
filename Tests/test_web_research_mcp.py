@@ -83,8 +83,20 @@ class WebResearchMcpTests(unittest.TestCase):
                   }));
                 } else if (args[0] === "scrape-many") {
                   const request = JSON.parse(await Bun.stdin.text());
+                  if (request.urls.length > 4) {
+                    console.log("{invalid batch output");
+                    process.exit(0);
+                  }
                   console.log(JSON.stringify({
-                    pages: request.urls.map(target => ({
+                    pages: request.urls.map(target => target.includes("account-required") ? {
+                      url: target,
+                      error: {
+                        kind: "access",
+                        code: "interactive-login-required",
+                        message: "interactive login required",
+                        retriable: false,
+                      },
+                    } : ({
                       title: target.endsWith("privacy") ? "Privacy" : "Terms",
                       url: target,
                       canonicalUrl: target,
@@ -94,6 +106,15 @@ class WebResearchMcpTests(unittest.TestCase):
                       markdown: "# Batched evidence",
                       html: "",
                       links: [],
+                      jobs: target.endsWith("jobs") ? [{
+                        title: "Platform Engineer",
+                        url: "https://example.test/roles/platform-engineer",
+                        company: "Example Company",
+                        location: "Remote",
+                        posting_age: "2 days ago",
+                        published: "2026-08-31",
+                        summary: "Build reliable systems.",
+                      }] : [],
                       sources: ["rendered-dom"],
                       truncated: { text: false, markdown: false, html: false, links: false },
                     })),
@@ -301,6 +322,36 @@ class WebResearchMcpTests(unittest.TestCase):
         self.assertEqual(len(opened["structuredContent"]["results"]), 2)
         calls = [json.loads(line) for line in self.backend_log.read_text().splitlines()]
         self.assertEqual([call[0] for call in calls], ["scrape-many"])
+
+    def test_large_open_is_split_into_bounded_backend_batches(self):
+        self.request("initialize", {"protocolVersion": "2025-06-18"})
+        urls = [f"https://example.test/page-{index}" for index in range(8)]
+
+        opened = self.call({"open": [{"ref_id": url} for url in urls]})
+
+        self.assertNotIn("isError", opened)
+        self.assertEqual(len(opened["structuredContent"]["results"]), 8)
+        calls = [json.loads(line) for line in self.backend_log.read_text().splitlines()]
+        self.assertEqual([call[0] for call in calls], ["scrape-many", "scrape-many"])
+
+    def test_open_returns_per_page_errors_and_keeps_successful_pages(self):
+        self.request("initialize", {"protocolVersion": "2025-06-18"})
+
+        opened = self.call(
+            {
+                "open": [
+                    {"ref_id": "https://example.test/page-one"},
+                    {"ref_id": "https://account-required.example/page"},
+                    {"ref_id": "https://example.test/jobs"},
+                ]
+            }
+        )
+
+        results = opened["structuredContent"]["results"]
+        self.assertEqual([result["type"] for result in results], ["page", "page_error", "page"])
+        self.assertEqual(results[1]["error"]["code"], "interactive-login-required")
+        self.assertEqual(results[2]["jobs"][0]["title"], "Platform Engineer")
+        self.assertEqual(len(opened["structuredContent"]["sources"]), 2)
 
     def test_multiple_searches_share_one_backend_browser_batch(self):
         self.request("initialize", {"protocolVersion": "2025-06-18"})
