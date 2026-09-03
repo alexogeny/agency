@@ -9,19 +9,25 @@ Use the installed `sudo-gui` command only after the user explicitly authorizes
 the root-requiring operation. It is an authentication transport, not permission
 to broaden the task.
 
-Run the approved workflow in the same invocation so sudo's terminal- or
-process-scoped timestamp remains usable:
+Run the approved workflow in the same invocation:
 
 ```sh
 sudo-gui -- ./install.sh
 sudo-gui -- sudo systemctl restart example.service
 ```
 
-The tool checks for an existing authorization and active PAM lockout first. If
-needed, it opens one KDE password dialog, makes one password attempt, clears the
-shell variable immediately, and then replaces itself with the requested
-command. Never ask the user to put a password in chat, tool arguments, an
-environment variable, a file, or captured output.
+The tool gives the exact requested sudo command a one-attempt KDE askpass
+helper. For a script or installer, it temporarily routes PATH-resolved `sudo`
+calls through the same helper. Use ordinary `sudo` inside that workflow; do not
+add `-n`, which explicitly disables authentication. The workflow must stop if a
+sudo command fails.
+
+Sudo uses an existing authorization or a command-specific `NOPASSWD` rule
+without opening a dialog. If the exact command needs a password, the askpass
+helper checks for an active PAM lockout, opens one KDE password dialog, and
+makes one password attempt. The password exists only in the dialog helper's
+process memory and travels directly to sudo; it is never placed in arguments,
+the environment, a file, or captured output.
 
 If the dialog is cancelled, authentication fails, or the tool reports a
 lockout, stop. Do not retry automatically or work around PAM. Tell the user the

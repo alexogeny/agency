@@ -354,8 +354,8 @@ sees it, without borrowing a warm cache or a conveniently configured home.
 
 ## Supporting cast
 
-- `sudo-gui` carries one approved root operation through one KDE password
-  dialog and one authentication attempt without capturing the password.
+- `sudo-gui` runs one approved root operation through sudo's one-attempt KDE
+  askpass path without capturing the password or relying on a cached timestamp.
 - `comment-audit` finds empty, decorative, and historical comments without
   editing source or treating heuristic findings as verdicts.
 - [`assess`](Skills/assess/SKILL.md) evaluates writing, creative work, or

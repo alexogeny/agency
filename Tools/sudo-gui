@@ -5,9 +5,9 @@ usage() {
   cat <<'EOF'
 Usage: sudo-gui [--prompt TEXT] [-- COMMAND [ARG...]]
 
-Authorize sudo through one KDE password dialog, then run COMMAND in the same
-process and authorization context. On cancellation, failure, or active PAM
-lockout, stop without retrying.
+Run COMMAND with a one-attempt KDE askpass helper available to sudo. Direct
+sudo commands authenticate in that same sudo invocation. On cancellation,
+failure, or active PAM lockout, stop without retrying.
 EOF
 }
 
@@ -61,6 +61,72 @@ active_lock_remaining() {
   printf '%d\n' "$(( unlock_time - (now - last_failure) ))"
 }
 
+write_state() {
+  local state=$1
+  printf '%s\n' "$state" > "$SUDO_GUI_STATE_DIR/status"
+}
+
+sudo_command=${SUDO_GUI_SUDO:-sudo}
+kdialog_command=${SUDO_GUI_KDIALOG:-kdialog}
+faillock_command=${SUDO_GUI_FAILLOCK:-faillock}
+faillock_config=${SUDO_GUI_FAILLOCK_CONFIG:-/etc/security/faillock.conf}
+
+if [[ ${SUDO_GUI_PROXY_MODE:-} == 1 && ${0##*/} == sudo ]]; then
+  exec "$SUDO_GUI_SUDO_REAL" -A "$@"
+fi
+
+if [[ ${SUDO_GUI_ASKPASS_MODE:-} == 1 ]]; then
+  command -v "$kdialog_command" >/dev/null || {
+    write_state unavailable
+    printf 'KDE kdialog is unavailable; use sudo in a visible terminal.\n' >&2
+    exit 1
+  }
+
+  user=$(id -un)
+  if command -v "$faillock_command" >/dev/null; then
+    if remaining=$(active_lock_remaining \
+      "$faillock_command" "$faillock_config" "$user"); then
+      write_state locked
+      if [[ $remaining == indefinite ]]; then
+        message="sudo authentication is locked until an administrator resets faillock."
+      else
+        message="sudo authentication is locked for about $remaining more seconds."
+      fi
+      printf '%s Do not retry yet.\n' "$message" >&2
+      exit 1
+    fi
+  fi
+
+  if ! mkdir "$SUDO_GUI_STATE_DIR/prompt-attempted" 2>/dev/null; then
+    printf 'sudo-gui permits only one password attempt; not retrying.\n' >&2
+    exit 1
+  fi
+
+  password=""
+  if ! password=$("$kdialog_command" \
+    --title "Administrator authorization" \
+    --password "$SUDO_GUI_PROMPT"); then
+    password=""
+    unset password
+    write_state cancelled
+    printf 'sudo authorization was cancelled.\n' >&2
+    exit 1
+  fi
+
+  if [[ -z $password ]]; then
+    unset password
+    write_state cancelled
+    printf 'sudo authorization was cancelled before a password was entered.\n' >&2
+    exit 1
+  fi
+
+  write_state provided
+  printf '%s\n' "$password"
+  password=""
+  unset password
+  exit
+fi
+
 prompt="Administrator authorization is required for the approved task."
 while (( $# )); do
   case $1 in
@@ -84,69 +150,72 @@ while (( $# )); do
   esac
 done
 
-sudo_command=${SUDO_GUI_SUDO:-sudo}
-kdialog_command=${SUDO_GUI_KDIALOG:-kdialog}
-faillock_command=${SUDO_GUI_FAILLOCK:-faillock}
-faillock_config=${SUDO_GUI_FAILLOCK_CONFIG:-/etc/security/faillock.conf}
-user=$(id -un)
-
-if (( EUID == 0 )) || "$sudo_command" -n true 2>/dev/null; then
+if (( EUID == 0 )); then
   if (( $# )); then
     exec "$@"
   fi
-  printf 'sudo authorization is already available in this session.\n'
+  printf 'sudo authorization is unnecessary for the root user.\n'
   exit
 fi
 
-command -v "$kdialog_command" >/dev/null || {
-  printf 'KDE kdialog is unavailable; use sudo in a visible terminal.\n' >&2
+if [[ $sudo_command == */* ]]; then
+  sudo_executable=$sudo_command
+else
+  sudo_executable=$(command -v "$sudo_command" 2>/dev/null) || {
+    printf 'sudo is unavailable.\n' >&2
+    exit 69
+  }
+fi
+
+runtime_dir=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+state_dir=$(mktemp -d "$runtime_dir/sudo-gui.XXXXXX") || {
+  printf 'sudo-gui could not create its private runtime directory.\n' >&2
   exit 69
 }
+chmod 0700 "$state_dir"
 
-if command -v "$faillock_command" >/dev/null; then
-  if remaining=$(active_lock_remaining \
-    "$faillock_command" "$faillock_config" "$user"); then
-    if [[ $remaining == indefinite ]]; then
-      message="sudo authentication is locked until an administrator resets faillock."
-    else
-      message="sudo authentication is locked for about $remaining more seconds."
+cleanup() {
+  rm -f "$state_dir/sudo"
+  rm -f "$state_dir/status"
+  rmdir "$state_dir/prompt-attempted" 2>/dev/null || true
+  rmdir "$state_dir" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+self_path=$(readlink -f -- "${BASH_SOURCE[0]}")
+export SUDO_ASKPASS="$self_path"
+export SUDO_GUI_ASKPASS_MODE=1
+export SUDO_GUI_PROMPT="$prompt"
+export SUDO_GUI_STATE_DIR="$state_dir"
+export SUDO_GUI_SUDO_REAL="$sudo_executable"
+
+status=0
+if (( $# == 0 )); then
+  "$sudo_executable" -A -p '' -v || status=$?
+elif [[ ${1##*/} == sudo ]]; then
+  requested_sudo=$1
+  shift
+  "$requested_sudo" -A "$@" || status=$?
+else
+  ln -s "$self_path" "$state_dir/sudo"
+  export SUDO_GUI_PROXY_MODE=1
+  PATH="$state_dir:$PATH" "$@" || status=$?
+fi
+
+state=""
+[[ ! -f $state_dir/status ]] || state=$(<"$state_dir/status")
+case $state in
+  unavailable) exit 69 ;;
+  locked) exit 75 ;;
+  cancelled) exit 130 ;;
+  provided)
+    if (( status != 0 )); then
+      printf 'sudo authorization or the approved command failed; no retry was attempted.\n' >&2
     fi
-    printf '%s Do not retry yet.\n' "$message" >&2
-    exit 75
-  fi
-fi
+    ;;
+esac
 
-password=""
-if ! password=$("$kdialog_command" \
-  --title "Administrator authorization" \
-  --password "$prompt"); then
-  unset password
-  printf 'sudo authorization was cancelled.\n' >&2
-  exit 130
+if (( $# == 0 )) && (( status == 0 )); then
+  printf 'sudo authorization is available in this process context.\n'
 fi
-
-if [[ -z $password ]]; then
-  unset password
-  printf 'sudo authorization was cancelled before a password was entered.\n' >&2
-  exit 130
-fi
-
-set +e
-printf '%s\n' "$password" | "$sudo_command" -S -p '' -v 2>/dev/null
-status=$?
-set -e
-password=""
-unset password
-
-if (( status != 0 )); then
-  "$kdialog_command" --error \
-    "Authorization failed. No retry was attempted; check faillock before trying again." \
-    --title "Administrator authorization" >/dev/null 2>&1 || true
-  printf 'sudo authorization failed after one password attempt; not retrying.\n' >&2
-  exit "$status"
-fi
-
-if (( $# )); then
-  exec "$@"
-fi
-printf 'sudo authorization is available in this process context.\n'
+exit "$status"
