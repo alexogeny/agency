@@ -72,10 +72,21 @@ class YayH2loadInstallTests(unittest.TestCase):
             if [[ ${1:-} == clone ]]; then
               target=${@: -1}
               mkdir -p "$target"
-              if [[ $target == *nghttp2 ]]; then
+              if [[ $* == *nghttp2.git* ]]; then
                 printf "pkgname=nghttp2\ndepends=('zlib>=1.2.3')\n" > "$target/PKGBUILD"
               else
                 printf 'pkgname=yay\n' > "$target/PKGBUILD"
+              fi
+              exit
+            fi
+            if [[ ${1:-} == -C && ${3:-} == cat-file ]]; then
+              exit
+            fi
+            if [[ ${1:-} == -C && ${3:-} == rev-parse ]]; then
+              if [[ $2 == *yay.* ]]; then
+                printf '%s\n' cb43f84828ab4f9700f7c6f9c6d7a923d4cfaff0
+              else
+                printf '%s\n' 2f11414698d4a0190de1681f817855d93e29fcd9
               fi
               exit
             fi
@@ -126,13 +137,13 @@ class YayH2loadInstallTests(unittest.TestCase):
 
         result = self.run_installer()
 
-        recipe = self.home / ".cache/yay/nghttp2/PKGBUILD"
-        self.assertIn("depends=('zlib')", recipe.read_text())
         log = self.log.read_text()
         self.assertIn("makepkg cwd=", log)
         self.assertIn("yay --version", log)
         self.assertNotIn("yay -S", log)
         self.assertIn("aur.archlinux.org/nghttp2.git", log)
+        self.assertIn("cb43f84828ab4f9700f7c6f9c6d7a923d4cfaff0", log)
+        self.assertIn("2f11414698d4a0190de1681f817855d93e29fcd9", log)
         self.assertNotIn("sudo ", log)
         self.assertIn("h2load fixture", result.stdout)
 
@@ -205,7 +216,22 @@ class YayH2loadInstallTests(unittest.TestCase):
             if [[ ${1:-} == clone ]]; then
               target=${@: -1}
               mkdir -p "$target"
-              printf "pkgname=nghttp2\ndepends=('zlib>=1.2.3')\n" > "$target/PKGBUILD"
+              if [[ $* == *nghttp2.git* ]]; then
+                printf "pkgname=nghttp2\ndepends=('zlib>=1.2.3')\n" > "$target/PKGBUILD"
+              else
+                printf 'pkgname=yay\n' > "$target/PKGBUILD"
+              fi
+              exit
+            fi
+            if [[ ${1:-} == -C && ${3:-} == cat-file ]]; then
+              exit
+            fi
+            if [[ ${1:-} == -C && ${3:-} == rev-parse ]]; then
+              if [[ $2 == *yay.* ]]; then
+                printf '%s\n' cb43f84828ab4f9700f7c6f9c6d7a923d4cfaff0
+              else
+                printf '%s\n' 2f11414698d4a0190de1681f817855d93e29fcd9
+              fi
               exit
             fi
             if [[ ${1:-} == -C && ${3:-} == diff ]]; then
@@ -221,17 +247,23 @@ class YayH2loadInstallTests(unittest.TestCase):
             #!/usr/bin/env bash
             set -euo pipefail
             printf 'makepkg cwd=%s args=%s\n' "$PWD" "$*" >> "$AGENCY_TEST_LOG"
+            [[ $PWD == *yay.* ]] && exit
             grep -Fq "'zlib'" PKGBUILD
             ! grep -Fq "'zlib>=1.2.3'" PKGBUILD
             """,
         )
 
-        result = self.run_installer("--update")
+        result = self.run_installer("--update", check=False)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stderr + "\n" + (self.log.read_text() if self.log.exists() else ""),
+        )
         log = self.log.read_text()
-        self.assertIn("yay -S --needed --noconfirm yay", log)
+        self.assertIn("cb43f84828ab4f9700f7c6f9c6d7a923d4cfaff0", log)
         self.assertIn("aur.archlinux.org/nghttp2.git", log)
+        self.assertIn("2f11414698d4a0190de1681f817855d93e29fcd9", log)
         self.assertIn("makepkg cwd=", log)
         self.assertIn("h2load --version", log)
 

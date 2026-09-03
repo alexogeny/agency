@@ -388,8 +388,9 @@ untouched.
 A normal rerun installs missing tools but leaves existing stable Rust, yay,
 h2load, 1Password desktop and CLI, Codex, Claude Code, Pi, Gantry, Thoreau, and
 podman-compose versions untouched. It prints a warning so an older installation
-cannot look freshly updated. Pass `--update` to check and update those tools, or
-combine `--dry-run --update` to inspect that plan first.
+cannot look freshly updated. Versioned user tools and AUR recipes are pinned in
+the repository; update those reviewed pins, then pass `--update` to reinstall
+them. Combine `--dry-run --update` to inspect that plan first.
 
 `~/Scratch` is the durable home for reproducible task material. Installation
 migrates an older `~/scratch` without overwriting conflicts. Disposable outputs

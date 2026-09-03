@@ -27,9 +27,9 @@ while IFS='|' read -r command label package group; do
     retained+=("$label")
   fi
 done <<'EOF'
-codex|Codex|@openai/codex|standard
-claude|Claude Code|@anthropic-ai/claude-code|standard
-pi|Pi|@earendil-works/pi-coding-agent|pi
+codex|Codex|@openai/codex@0.151.0|standard
+claude|Claude Code|@anthropic-ai/claude-code@2.1.251|standard
+pi|Pi|@earendil-works/pi-coding-agent@0.84.4|pi
 EOF
 
 if (( ${#standard_packages[@]} )); then
@@ -42,5 +42,5 @@ fi
 if (( ${#retained[@]} )); then
   printf '⚠ Already installed and left unchanged:\n'
   printf '  - %s\n' "${retained[@]}"
-  printf 'If any version is older than upstream, run ./install.sh --update.\n'
+  printf 'To upgrade, update the reviewed version pins and run ./install.sh --update.\n'
 fi

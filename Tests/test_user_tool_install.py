@@ -90,12 +90,23 @@ class UserToolInstallTests(unittest.TestCase):
         self.assertEqual(agent_result.returncode, 0, agent_result.stderr)
         self.assertEqual(python_result.returncode, 0, python_result.stderr)
         log = self.log.read_text()
-        self.assertIn("bun add --global @openai/codex @anthropic-ai/claude-code", log)
         self.assertIn(
-            "bun add --global --ignore-scripts @earendil-works/pi-coding-agent",
+            "bun add --global @openai/codex@0.151.0 @anthropic-ai/claude-code@2.1.251",
             log,
         )
-        self.assertIn("uv tool install --python /usr/bin/python3", log)
+        self.assertIn(
+            "bun add --global --ignore-scripts @earendil-works/pi-coding-agent@0.84.4",
+            log,
+        )
+        self.assertIn(
+            "git+https://github.com/alexogeny/gantry-cli.git@7bb956643731aee0c4431aef455479abd79160f1",
+            log,
+        )
+        self.assertIn(
+            "git+https://github.com/alexogeny/thoreau.git@cf2b9a65d5d5116a4972d138b4f31a325f70b4ad",
+            log,
+        )
+        self.assertIn("podman-compose==1.6.0", log)
         self.assertNotIn("--upgrade", log)
 
     def test_update_reinstalls_managed_tools(self):
@@ -109,9 +120,12 @@ class UserToolInstallTests(unittest.TestCase):
         self.assertEqual(agent_result.returncode, 0, agent_result.stderr)
         self.assertEqual(python_result.returncode, 0, python_result.stderr)
         log = self.log.read_text()
-        self.assertIn("bun add --global @openai/codex @anthropic-ai/claude-code", log)
         self.assertIn(
-            "bun add --global --ignore-scripts @earendil-works/pi-coding-agent",
+            "bun add --global @openai/codex@0.151.0 @anthropic-ai/claude-code@2.1.251",
+            log,
+        )
+        self.assertIn(
+            "bun add --global --ignore-scripts @earendil-works/pi-coding-agent@0.84.4",
             log,
         )
         self.assertEqual(log.count("uv tool install"), 3)

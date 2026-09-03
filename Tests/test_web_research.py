@@ -1171,12 +1171,43 @@ class WebResearchTests(unittest.TestCase):
                 "500",
                 "--profile",
                 "rendered-regression-fixture",
+                "--allow-private",
                 environment=environment,
             )
 
         page = json.loads(result.stdout)
         self.assertIn("Hydrated evidence", page["text"])
         self.assertIn("Open shadow-root evidence", page["text"])
+
+    def test_browser_navigation_blocks_private_networks_without_opt_in(self):
+        self.fake_firefox()
+        marker = self.workspace / "firefox-launched"
+        environment = {
+            **self.environment(),
+            "FAKE_LAUNCH_MARKER": str(marker),
+        }
+
+        blocked = self.run_tool(
+            "scrape",
+            "http://127.0.0.1/private",
+            "--format",
+            "json",
+            check=False,
+            environment=environment,
+        )
+        allowed = self.run_tool(
+            "scrape",
+            "http://127.0.0.1/private",
+            "--format",
+            "json",
+            "--allow-private",
+            environment=environment,
+        )
+
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("private or non-public address", blocked.stderr)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(marker.read_text().splitlines(), ["launch"])
 
 
 if __name__ == "__main__":

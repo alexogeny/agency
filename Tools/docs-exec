@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 from pathlib import Path
 
@@ -93,12 +95,43 @@ def validate_case(case: dict, position: int) -> None:
         fail(f"case {name} has no document", 2)
     if not isinstance(files, dict) or not files:
         fail(f"case {name} has no files mapping", 2)
-    if not all(isinstance(key, str) and isinstance(value, str) for key, value in files.items()):
+    if not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in files.items()
+    ):
         fail(f"case {name} files must map output paths to fence titles", 2)
     if not isinstance(command, list) or not command or not all(
         isinstance(value, str) for value in command
     ):
         fail(f"case {name} command must be a non-empty string array", 2)
+    timeout = case.get("timeout_seconds", 300)
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not 0 < timeout <= 3600
+    ):
+        fail(f"case {name} timeout_seconds must be between 0 and 3600", 2)
+    maximum = case.get("max_output_bytes", 1024 * 1024)
+    if (
+        not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or not 1 <= maximum <= 100 * 1024 * 1024
+    ):
+        fail(f"case {name} max_output_bytes must be between 1 and 104857600", 2)
+
+
+def bounded_stream(stream, maximum: int, result: dict) -> None:
+    chunks = []
+    retained = 0
+    total = 0
+    for chunk in iter(lambda: stream.read(64 * 1024), b""):
+        total += len(chunk)
+        if retained < maximum:
+            selected = chunk[: maximum - retained]
+            chunks.append(selected)
+            retained += len(selected)
+    result["text"] = b"".join(chunks).decode(errors="replace")
+    result["truncated"] = total > maximum
 
 
 def execute_case(case: dict, root: Path, case_root: Path) -> dict:
@@ -136,24 +169,56 @@ def execute_case(case: dict, root: Path, case_root: Path) -> dict:
     ):
         fail(f"case {name} env must map names to strings", 2)
     environment.update(extra_environment)
-    result = subprocess.run(
+    timeout = case.get("timeout_seconds", 300)
+    maximum = case.get("max_output_bytes", 1024 * 1024)
+    process = subprocess.Popen(
         case["command"],
         cwd=case_root,
         env=environment,
-        check=False,
-        text=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
+    stdout = {}
+    stderr = {}
+    readers = [
+        threading.Thread(
+            target=bounded_stream, args=(process.stdout, maximum, stdout)
+        ),
+        threading.Thread(
+            target=bounded_stream, args=(process.stderr, maximum, stderr)
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+    for reader in readers:
+        reader.join()
+    status = "timed-out" if timed_out else "passed" if process.returncode == 0 else "failed"
     return {
         "name": name,
         "document": str(document),
         "command": case["command"],
         "command_display": shlex.join(case["command"]),
         "files": files,
-        "status": "passed" if result.returncode == 0 else "failed",
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "status": status,
+        "returncode": process.returncode,
+        "timeout_seconds": timeout,
+        "max_output_bytes": maximum,
+        "stdout": stdout["text"],
+        "stderr": stderr["text"],
+        "stdout_truncated": stdout["truncated"],
+        "stderr_truncated": stderr["truncated"],
     }
 
 
@@ -209,7 +274,7 @@ def main() -> None:
         "schema": "agency/docs-exec/1",
         "manifest": str(manifest_path),
         "root": str(root),
-        "status": "passed" if all(case["returncode"] == 0 for case in cases) else "failed",
+        "status": "passed" if all(case["status"] == "passed" for case in cases) else "failed",
         "cases": cases,
         "retained_workspace": retained,
     }
