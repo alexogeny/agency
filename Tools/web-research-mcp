@@ -10,6 +10,18 @@ type SearchReference = {
   title: string;
   url: string;
   snippet: string;
+  index_snapshot: IndexSnapshot;
+};
+type IndexSnapshot = {
+  type: "index_snapshot";
+  source_id: string;
+  title: string;
+  url: string;
+  snippet: string;
+  evidence_strength: "discovery";
+  page_verified: false;
+  score?: number;
+  sources?: JsonObject[];
 };
 type PageReference = {
   kind: "page";
@@ -23,6 +35,7 @@ type PageLoadError = {
   kind: "error";
   url: string;
   error: JsonObject;
+  index_snapshot?: IndexSnapshot;
 };
 type PageLoadResult = PageReference | PageLoadError;
 type Reference = SearchReference | PageReference;
@@ -38,7 +51,7 @@ const runTool = {
   name: "run",
   title: "Agency web research",
   description:
-    "Search and inspect the web with Agency's freshness-aware local Firefox research stack. Use this as the default web tool for substantive, source-sensitive, authenticated, JavaScript-heavy, or audit-sensitive research. URL opens preflight the local extracted-text index, reuse fresh or immutable evidence, and refresh stale pages. Search returns stable references accepted by open; opened pages support find, numbered-link click, and citation-ready source metadata with exact evidence lines. Federated search is the default and fuses DuckDuckGo, Brave, and Bing rankings in one browser session. Search snippets are discovery evidence, while opened pages, the local index, and reproducible offline captures are first-class evidence.",
+    "Search and inspect the web with Agency's freshness-aware local Firefox research stack. Use this as the default web tool for substantive, source-sensitive, authenticated, JavaScript-heavy, or audit-sensitive research. URL opens preflight the local extracted-text index, reuse fresh or immutable evidence, and refresh stale pages. Search returns stable references accepted by open; opened pages support find, numbered-link click, and citation-ready source metadata with exact evidence lines. Federated search is the default and fuses DuckDuckGo, Brave, and Bing rankings in one browser session. Search snippets and typed index snapshots are discovery evidence only; opened pages, the local index, and reproducible offline captures are first-class evidence.",
   inputSchema: {
     type: "object",
     additionalProperties: false,
@@ -264,12 +277,28 @@ async function invoke(arguments_: string[], input = "") {
 
 function addSearchReference(result: JsonObject) {
   const ref_id = `agency_search_${nextSearchReference++}`;
-  const reference: SearchReference = {
-    kind: "search",
-    ref_id,
+  const score = Number(result.score);
+  const resultSources = Array.isArray(result.sources)
+    ? result.sources.filter(isObject)
+    : [];
+  const index_snapshot: IndexSnapshot = {
+    type: "index_snapshot",
+    source_id: ref_id,
     title: String(result.title || ""),
     url: String(result.url || ""),
     snippet: String(result.snippet || ""),
+    evidence_strength: "discovery",
+    page_verified: false,
+    ...(Number.isFinite(score) ? { score } : {}),
+    ...(resultSources.length ? { sources: resultSources } : {}),
+  };
+  const reference: SearchReference = {
+    kind: "search",
+    ref_id,
+    title: index_snapshot.title,
+    url: index_snapshot.url,
+    snippet: index_snapshot.snippet,
+    index_snapshot,
   };
   references.set(ref_id, reference);
   return reference;
@@ -355,6 +384,43 @@ async function loadPage(value: string, evidence: string, profile: string) {
   return reference;
 }
 
+function pageLoadError(url: string, error: unknown): PageLoadError {
+  const message = error instanceof Error ? error.message : String(error);
+  let kind = "retrieval";
+  let code = "page-load-failed";
+  let retriable = true;
+  if (/interactive challenge required/i.test(message)) {
+    kind = "access";
+    code = "interactive-challenge-required";
+    retriable = false;
+  } else if (/interactive login required/i.test(message)) {
+    kind = "access";
+    code = "interactive-login-required";
+    retriable = false;
+  } else if (/rate limit/i.test(message)) {
+    kind = "network";
+    code = "rate-limited";
+  } else if (/invalid JSON|invalid scrape batch|invalid page result/i.test(message)) {
+    kind = "backend";
+    code = "invalid-backend-response";
+  }
+  return {
+    kind: "error",
+    url,
+    error: { kind, code, message, retriable },
+  };
+}
+
+async function loadPageResult(url: string, evidence: string, profile: string) {
+  try {
+    const reference = await loadPage(url, evidence, profile);
+    pageReferences.set(url, reference);
+    return reference as PageLoadResult;
+  } catch (error) {
+    return pageLoadError(url, error);
+  }
+}
+
 async function loadPages(values: string[], evidence: string, profile: string) {
   const resolved = values.map((value) => {
     const existing = references.get(value);
@@ -368,15 +434,20 @@ async function loadPages(values: string[], evidence: string, profile: string) {
     if (cached && hasEvidence(cached, evidence) && isFreshReference(cached)) {
       return { reference: cached, url };
     }
-    return { url };
+    return {
+      url,
+      ...(existing?.kind === "search"
+        ? { index_snapshot: existing.index_snapshot }
+        : {}),
+    };
   });
   const missing = [...new Set(
     resolved.filter((item) => !item.reference).map((item) => item.url),
   )];
   const failures = new Map<string, PageLoadError>();
   if (missing.length === 1) {
-    const reference = await loadPage(missing[0], evidence, profile);
-    pageReferences.set(missing[0], reference);
+    const result = await loadPageResult(missing[0], evidence, profile);
+    if (result.kind === "error") failures.set(missing[0], result);
   } else if (missing.length > 1) {
     for (let offset = 0; offset < missing.length; offset += pageBatchSize) {
       const batch = missing.slice(offset, offset + pageBatchSize);
@@ -384,24 +455,31 @@ async function loadPages(values: string[], evidence: string, profile: string) {
       if (evidence === "index") arguments_.push("--index");
       if (evidence === "capture") arguments_.push("--capture");
       if (profile) arguments_.push("--profile", profile);
-      const outcome = await invoke(
-        arguments_,
-        JSON.stringify({ urls: batch }),
-      );
-      if (!Array.isArray(outcome.pages) || outcome.pages.length !== batch.length) {
-        throw new Error("web-research returned an invalid scrape batch");
-      }
-      for (const [index, page] of outcome.pages.entries()) {
-        if (!isObject(page)) {
-          throw new Error("web-research returned an invalid page result");
+      try {
+        const outcome = await invoke(
+          arguments_,
+          JSON.stringify({ urls: batch }),
+        );
+        if (!Array.isArray(outcome.pages) || outcome.pages.length !== batch.length) {
+          throw new Error("web-research returned an invalid scrape batch");
         }
-        const url = batch[index];
-        if (isObject(page.error)) {
-          failures.set(url, { kind: "error", url, error: page.error });
-          continue;
+        for (const [index, page] of outcome.pages.entries()) {
+          if (!isObject(page)) {
+            throw new Error("web-research returned an invalid page result");
+          }
+          const url = batch[index];
+          if (isObject(page.error)) {
+            failures.set(url, { kind: "error", url, error: page.error });
+            continue;
+          }
+          const reference = addPageReference(page, evidence);
+          pageReferences.set(url, reference);
         }
-        const reference = addPageReference(page, evidence);
-        pageReferences.set(url, reference);
+      } catch {
+        for (const url of batch) {
+          const result = await loadPageResult(url, evidence, profile);
+          if (result.kind === "error") failures.set(url, result);
+        }
       }
     }
   }
@@ -409,7 +487,14 @@ async function loadPages(values: string[], evidence: string, profile: string) {
     const reference = item.reference || pageReferences.get(item.url);
     if (!reference) {
       const failure = failures.get(item.url);
-      if (failure) return failure;
+      if (failure) {
+        return {
+          ...failure,
+          ...(item.index_snapshot
+            ? { index_snapshot: item.index_snapshot }
+            : {}),
+        };
+      }
       throw new Error(`page was not loaded: ${item.url}`);
     }
     return reference;
@@ -672,10 +757,22 @@ async function performOpen(
         type: "page_error",
         url: page.url,
         error: page.error,
+        ...(page.index_snapshot
+          ? { index_snapshot: page.index_snapshot }
+          : {}),
       });
-      rendered.push(
-        `[page error] ${page.url}\n${String(page.error.message || "page could not be loaded")}`,
-      );
+      const lines = [
+        `[page error] ${page.url}`,
+        String(page.error.message || "page could not be loaded"),
+      ];
+      if (page.index_snapshot) {
+        lines.push(
+          `[index snapshot; not page-verified] ${page.index_snapshot.title}`,
+          page.index_snapshot.url,
+          page.index_snapshot.snippet,
+        );
+      }
+      rendered.push(lines.filter(Boolean).join("\n"));
       continue;
     }
     const view = renderPage(page, lineno, budget);
@@ -795,6 +892,10 @@ async function performReplay(items: JsonObject[], budget: number) {
 function sourceLedger(records: JsonObject[]) {
   const sources = new Map<string, JsonObject>();
   for (const record of records) {
+    if (isObject(record.index_snapshot)) {
+      const id = String(record.index_snapshot.source_id || "");
+      if (id) sources.set(id, record.index_snapshot);
+    }
     if (!isObject(record.citation)) continue;
     const {
       line_start: _lineStart,
@@ -923,7 +1024,7 @@ async function handle(message: unknown) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "agency-web", version: "1.0.0" },
         instructions:
-          "Prefer agency-web for substantive web research. Search snippets are discovery only: open candidate sources before relying on them. Cite direct URLs from structuredContent.sources and verify claims against each result's displayed or matching citation lines. URL opens automatically reuse fresh indexed text and refresh stale pages. Use local_query for indexed discovery and replay for a capture ID.",
+          "Prefer agency-web for substantive web research. Search snippets and index_snapshot records are discovery only: open candidate sources before relying on them. Cite page-verified direct URLs from structuredContent.sources and verify claims against each result's displayed or matching citation lines. URL opens automatically reuse fresh indexed text and refresh stale pages. Use local_query for indexed discovery and replay for a capture ID.",
       },
     });
     return;

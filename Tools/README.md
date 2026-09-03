@@ -223,6 +223,13 @@ available and citable. Extracted job cards are returned as structured records
 with title, URL, company, location, summary, visible posting age, and a normalized
 publication date when the page supplies enough evidence.
 
+If a backend batch is malformed, the MCP retries that bounded group as individual
+opens so recoverable pages remain available. Thin interstitials with a recognized
+challenge title are classified as access failures even when they expose no visible
+challenge control. A blocked search reference retains its ranking metadata as a
+typed `index_snapshot` with `page_verified: false`; snapshots remain auditable
+discovery evidence but do not become page-verified citations.
+
 Automated browser and direct-HTTP traffic pass through a per-run validating
 proxy that resolves and pins each destination address and blocks private,
 link-local, and other non-public ranges at every request. `--allow-private` is

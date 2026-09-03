@@ -2007,7 +2007,7 @@ function classifyPageAccess(signals: PageAccessSignals): PageAccessKind {
   if (
     signals.challengeControl ||
     challengeEvidence >= 2 ||
-    (challengeTitle && challengeEvidence >= 1)
+    (challengeTitle && (challengeEvidence >= 1 || !hasPublicEvidence))
   ) {
     if (
       hasPublicEvidence &&
