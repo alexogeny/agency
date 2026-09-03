@@ -1990,6 +1990,7 @@ function classifyPageAccess(signals: PageAccessSignals): PageAccessKind {
     "security verification",
     "unusual traffic",
     "enable javascript and cookies to continue",
+    "please wait",
   ];
   const challengeEvidence = challengePhrases.filter((phrase) =>
     compact.includes(phrase),

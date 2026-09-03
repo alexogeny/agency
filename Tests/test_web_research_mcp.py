@@ -50,11 +50,24 @@ class WebResearchMcpTests(unittest.TestCase):
                     engine: "federated",
                     strategy: item.strategy,
                     scope: { domains: item.domains, excluded_domains: item.excluded, site_qualifier: "not-present" },
-                    results: [{ title: "Terms", url: "https://example.test/terms", snippet: item.query }],
+                    results: item.query.includes("blocked result") ? [{
+                      title: "Example result",
+                      url: "https://challenge-required.example/page",
+                      snippet: "Search-index description",
+                      score: 0.032522,
+                      sources: [
+                        { engine: "duckduckgo", rank: 1 },
+                        { engine: "brave", rank: 2 },
+                      ],
+                    }] : [{ title: "Terms", url: "https://example.test/terms", snippet: item.query }],
                     attempts: [{ engine: "duckduckgo", outcome: "searched", duration_ms: 1 }],
                   })) }));
                 } else if (args[0] === "scrape") {
                   const target = args[1];
+                  if (target.includes("challenge-required.example")) {
+                    console.error("interactive challenge required");
+                    process.exit(1);
+                  }
                   console.log(JSON.stringify({
                     title: target.endsWith("privacy") ? "Privacy" : "Terms",
                     url: target,
@@ -83,7 +96,7 @@ class WebResearchMcpTests(unittest.TestCase):
                   }));
                 } else if (args[0] === "scrape-many") {
                   const request = JSON.parse(await Bun.stdin.text());
-                  if (request.urls.length > 4) {
+                  if (request.urls.length > 4 || request.urls.some(target => target.includes("batch-unstable"))) {
                     console.log("{invalid batch output");
                     process.exit(0);
                   }
@@ -334,6 +347,35 @@ class WebResearchMcpTests(unittest.TestCase):
         calls = [json.loads(line) for line in self.backend_log.read_text().splitlines()]
         self.assertEqual([call[0] for call in calls], ["scrape-many", "scrape-many"])
 
+    def test_invalid_batch_falls_back_to_per_page_results(self):
+        self.request("initialize", {"protocolVersion": "2025-06-18"})
+
+        opened = self.call(
+            {
+                "open": [
+                    {"ref_id": "https://example.test/page-one"},
+                    {"ref_id": "https://batch-unstable.example/page"},
+                    {"ref_id": "https://challenge-required.example/page"},
+                    {"ref_id": "https://example.test/page-two"},
+                ]
+            }
+        )
+
+        self.assertNotIn("isError", opened)
+        self.assertEqual(
+            [result["type"] for result in opened["structuredContent"]["results"]],
+            ["page", "page", "page_error", "page"],
+        )
+        self.assertEqual(
+            opened["structuredContent"]["results"][2]["error"]["code"],
+            "interactive-challenge-required",
+        )
+        calls = [json.loads(line) for line in self.backend_log.read_text().splitlines()]
+        self.assertEqual(
+            [call[0] for call in calls],
+            ["scrape-many", "scrape", "scrape", "scrape", "scrape"],
+        )
+
     def test_open_returns_per_page_errors_and_keeps_successful_pages(self):
         self.request("initialize", {"protocolVersion": "2025-06-18"})
 
@@ -352,6 +394,24 @@ class WebResearchMcpTests(unittest.TestCase):
         self.assertEqual(results[1]["error"]["code"], "interactive-login-required")
         self.assertEqual(results[2]["jobs"][0]["title"], "Platform Engineer")
         self.assertEqual(len(opened["structuredContent"]["sources"]), 2)
+
+    def test_blocked_search_result_retains_a_typed_index_snapshot(self):
+        self.request("initialize", {"protocolVersion": "2025-06-18"})
+        searched = self.call({"search_query": [{"q": "blocked result"}]})
+        search_ref = searched["structuredContent"]["results"][0]["results"][0]["ref_id"]
+
+        opened = self.call({"open": [{"ref_id": search_ref}]}, 3)
+
+        result = opened["structuredContent"]["results"][0]
+        snapshot = result["index_snapshot"]
+        self.assertEqual(result["type"], "page_error")
+        self.assertEqual(result["error"]["code"], "interactive-challenge-required")
+        self.assertEqual(snapshot["type"], "index_snapshot")
+        self.assertFalse(snapshot["page_verified"])
+        self.assertEqual(snapshot["score"], 0.032522)
+        self.assertEqual(snapshot["sources"][1], {"engine": "brave", "rank": 2})
+        self.assertEqual(opened["structuredContent"]["sources"], [snapshot])
+        self.assertIn("not page-verified", opened["content"][0]["text"])
 
     def test_multiple_searches_share_one_backend_browser_batch(self):
         self.request("initialize", {"protocolVersion": "2025-06-18"})

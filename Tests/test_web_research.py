@@ -252,22 +252,25 @@ class WebResearchTests(unittest.TestCase):
                         (process.env.FAKE_ALL_SEARCH_RATE_LIMIT === "1" &&
                           ["html.duckduckgo.com", "search.brave.com", "www.bing.com"].includes(new URL(currentUrl).hostname));
                       const gated = currentUrl.includes("account-required.example");
+                      const challenged = currentUrl.includes("challenge-only.example");
                       value = JSON.stringify({
-                        title: cooling ? "Too Many Requests" : gated ? "Sign in" : "Rendered title",
+                        title: cooling ? "Too Many Requests" : gated ? "Sign in" : challenged ? "Just a moment…" : "Rendered title",
                         url: currentUrl,
                         text: cooling
                           ? "Rate limit exceeded. Please try again later."
                           : gated
                             ? "Sign in to continue"
+                          : challenged
+                            ? "Please wait"
                           : process.env.FAKE_EMPTY_PAGE === "1"
                             ? ""
                             : "Repeated evidence block",
                         challengeControl: false,
                         loginControl: gated,
-                        mainTextLength: cooling || gated ? 0 : 48,
-                        articleCount: cooling || gated ? 0 : 1,
+                        mainTextLength: cooling || gated || challenged ? 0 : 48,
+                        articleCount: cooling || gated || challenged ? 0 : 1,
                         contentLinks: 0,
-                        structuredDataChars: cooling || gated ? 0 : 32,
+                        structuredDataChars: cooling || gated || challenged ? 0 : 32,
                       });
                     } else if (expression.includes("const engine =") && process.env.FAKE_SEARCH_RESULTS_BY_ENGINE) {
                       const engine = expression.match(/const engine = "([^"]+)"/)?.[1] || "";
@@ -1174,6 +1177,33 @@ class WebResearchTests(unittest.TestCase):
         self.assertNotIn("error", pages[0])
         self.assertEqual(pages[1]["error"]["code"], "interactive-login-required")
         self.assertNotIn("error", pages[2])
+
+    def test_challenge_title_without_controls_is_a_typed_page_error(self):
+        self.fake_firefox()
+        result = self.run_tool(
+            "scrape-many",
+            "--wait-ms",
+            "0",
+            "--settle-ms",
+            "0",
+            "--profile",
+            "challenge-title",
+            environment=self.environment(),
+            input=json.dumps(
+                {
+                    "urls": [
+                        "https://challenge-only.example/page",
+                        "https://example.test/page",
+                    ]
+                }
+            ),
+        )
+
+        pages = json.loads(result.stdout)["pages"]
+        self.assertEqual(pages[0]["error"]["kind"], "access")
+        self.assertEqual(pages[0]["error"]["code"], "interactive-challenge-required")
+        self.assertFalse(pages[0]["error"]["retriable"])
+        self.assertNotIn("error", pages[1])
 
     def test_preflight_resolves_requested_url_through_canonical_alias(self):
         self.fake_firefox()
