@@ -13,6 +13,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -22,6 +23,7 @@ import {
 } from "node:fs";
 import { BlockList, connect as connectTcp, isIP } from "node:net";
 import { homedir } from "node:os";
+import { StringDecoder } from "node:string_decoder";
 import {
   basename,
   dirname,
@@ -333,12 +335,13 @@ function redactedOutputUrl(value: string) {
 }
 
 function cleanExtractedMarkdown(value: string) {
-  return value
-    .split("\n")
-    .filter((line) => line.trim() !== "``")
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  if (value.includes("``")) {
+    value = value
+      .split("\n")
+      .filter((line) => line.trim() !== "``")
+      .join("\n");
+  }
+  return value.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function retrievalUrl(value: string) {
@@ -477,6 +480,42 @@ function explicitNetworkTarget(url: URL, allowPrivate: boolean) {
   }
 }
 
+function pinnedLookup(addresses: string[]) {
+  const targets = addresses.map((address) => ({
+    address,
+    family: isIP(address),
+  }));
+  return (_hostname: string, options: any, callback: any) => {
+    const requestedFamily =
+      typeof options === "number" ? options : Number(options?.family || 0);
+    const eligible = requestedFamily
+      ? targets.filter((target) => target.family === requestedFamily)
+      : targets;
+    if (!eligible.length) {
+      const error = new Error(
+        `no validated address for family ${requestedFamily}`,
+      ) as Error & { code?: string };
+      error.code = "EAI_ADDRFAMILY";
+      callback(error);
+      return;
+    }
+    if (typeof options === "object" && options?.all) {
+      callback(null, eligible);
+      return;
+    }
+    callback(null, eligible[0].address, eligible[0].family);
+  };
+}
+
+function pinnedConnection(hostname: string, addresses: string[]) {
+  return {
+    host: hostname,
+    lookup: pinnedLookup(addresses),
+    autoSelectFamily: addresses.length > 1,
+    autoSelectFamilyAttemptTimeout: 250,
+  };
+}
+
 async function safeProxy(allowPrivate: boolean) {
   const sockets = new Set<any>();
   const server = createHttpServer((request, response) => {
@@ -495,14 +534,13 @@ async function safeProxy(allowPrivate: boolean) {
         );
       }
       const safety = await checkRetrievalSafety(target, allowPrivate);
-      const address = String((safety.resolved_addresses as string[])[0]);
+      const addresses = safety.resolved_addresses as string[];
       const headers = { ...request.headers, host: target.host };
       delete headers["proxy-authorization"];
       delete headers["proxy-connection"];
       const upstream = httpRequest(
         {
-          hostname: address,
-          family: isIP(address),
+          ...pinnedConnection(normalizedHostname(target.hostname), addresses),
           port: Number(target.port || 80),
           path: `${target.pathname}${target.search}`,
           method: request.method,
@@ -521,7 +559,7 @@ async function safeProxy(allowPrivate: boolean) {
       );
       sockets.add(upstream);
       upstream.once("close", () => sockets.delete(upstream));
-      upstream.once("error", (error) => response.destroy(error));
+      upstream.once("error", () => response.destroy());
       request.pipe(upstream);
     })().catch((error) => {
       response.writeHead(error instanceof RetrievalFailure ? 403 : 502, {
@@ -545,8 +583,11 @@ async function safeProxy(allowPrivate: boolean) {
       }
       const target = new URL(`https://${authority.hostname}:${port}/`);
       const safety = await checkRetrievalSafety(target, allowPrivate);
-      const address = String((safety.resolved_addresses as string[])[0]);
-      const upstream = connectTcp({ host: address, port, family: isIP(address) });
+      const addresses = safety.resolved_addresses as string[];
+      const upstream = connectTcp({
+        ...pinnedConnection(normalizedHostname(target.hostname), addresses),
+        port,
+      });
       sockets.add(upstream);
       upstream.once("close", () => sockets.delete(upstream));
       upstream.once("connect", () => {
@@ -555,7 +596,7 @@ async function safeProxy(allowPrivate: boolean) {
         client.pipe(upstream);
         upstream.pipe(client);
       });
-      upstream.once("error", (error) => client.destroy(error));
+      upstream.once("error", () => client.destroy());
     })().catch((error) => {
       client.end(
         `HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
@@ -989,23 +1030,24 @@ function claimProfile(
   const root = profileRoot(profile, ephemeral);
   const lock = ephemeral ? join(root, ".agency.lock") : `${root}.lock`;
   mkdirSync(root, { recursive: true });
+  let descriptor: number;
   try {
-    const descriptor = openSync(lock, "wx", 0o600);
-    writeFileSync(descriptor, String(process.pid));
-    closeSync(descriptor);
-  } catch {
-    let owner = 0;
+    descriptor = openSync(lock, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const owner = Number(readFileSync(lock, "utf8"));
+    if (!Number.isSafeInteger(owner) || owner <= 0) {
+      throw new Error(`browser profile '${profile}' has an invalid lock owner`);
+    }
     try {
-      owner = Number(readFileSync(lock, "utf8"));
       process.kill(owner, 0);
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       if (ephemeral) {
         rmSync(root, { recursive: true, force: true });
         throw new Error("could not claim a new ephemeral Firefox profile");
       }
-      try {
-        unlinkSync(lock);
-      } catch {}
+      unlinkSync(lock);
       return claimProfile(
         profile,
         transientPreferences,
@@ -1017,32 +1059,44 @@ function claimProfile(
       `browser profile '${profile}' is already in use by process ${owner}`,
     );
   }
-  const userJs = join(root, "user.js");
-  const previousUserJs = existsSync(userJs) ? readFileSync(userJs, "utf8") : null;
-  if (managePreferences) {
-    const preferences: FirefoxPreference[] = [
-      ["browser.shell.checkDefaultBrowser", false],
-      ["browser.startup.homepage_override.mstone", "ignore"],
-      ["browser.aboutwelcome.enabled", false],
-      ["datareporting.policy.dataSubmissionEnabled", false],
-      ["toolkit.telemetry.reportingpolicy.firstRun", false],
-      ...transientPreferences,
-    ];
-    const managed = preferences
-      .map(([name, value]) => `user_pref(${JSON.stringify(name)}, ${JSON.stringify(value)});`)
-      .join("\n");
-    const prefix = previousUserJs
-      ? `${previousUserJs}${previousUserJs.endsWith("\n") ? "" : "\n"}`
-      : "";
+  try {
     try {
-      writeFileSync(userJs, `${prefix}${managed}\n`, { mode: 0o600 });
-    } catch (error) {
-      try {
-        unlinkSync(lock);
-      } catch {}
-      if (ephemeral) rmSync(root, { recursive: true, force: true });
-      throw error;
+      writeFileSync(descriptor, String(process.pid));
+    } finally {
+      closeSync(descriptor);
     }
+  } catch (error) {
+    unlinkSync(lock);
+    if (ephemeral) rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+  const userJs = join(root, "user.js");
+  let previousUserJs: string | null = null;
+  try {
+    previousUserJs = existsSync(userJs) ? readFileSync(userJs, "utf8") : null;
+    if (managePreferences) {
+      const preferences: FirefoxPreference[] = [
+        ["browser.shell.checkDefaultBrowser", false],
+        ["browser.startup.homepage_override.mstone", "ignore"],
+        ["browser.aboutwelcome.enabled", false],
+        ["datareporting.policy.dataSubmissionEnabled", false],
+        ["toolkit.telemetry.reportingpolicy.firstRun", false],
+        ...transientPreferences,
+      ];
+      const managed = preferences
+        .map(([name, value]) => `user_pref(${JSON.stringify(name)}, ${JSON.stringify(value)});`)
+        .join("\n");
+      const prefix = previousUserJs
+        ? `${previousUserJs}${previousUserJs.endsWith("\n") ? "" : "\n"}`
+        : "";
+      writeFileSync(userJs, `${prefix}${managed}\n`, { mode: 0o600 });
+    }
+  } catch (error) {
+    try {
+      unlinkSync(lock);
+    } catch {}
+    if (ephemeral) rmSync(root, { recursive: true, force: true });
+    throw error;
   }
   return {
     root,
@@ -1081,6 +1135,8 @@ function releaseProfile(claimed: ReturnType<typeof claimProfile>) {
 class Bidi {
   socket: WebSocket;
   capabilities: JsonObject = {};
+  connectionError: Error | null = null;
+  openingRejects = new Set<(error: Error) => void>();
   nextId = 0;
   pending = new Map<
     number,
@@ -1095,6 +1151,12 @@ class Bidi {
 
   constructor(url: string) {
     this.socket = new WebSocket(url);
+    this.socket.addEventListener("close", () => {
+      this.rejectPending(new Error("Firefox WebDriver BiDi connection closed"));
+    });
+    this.socket.addEventListener("error", () => {
+      this.rejectPending(new Error("Firefox WebDriver BiDi connection failed"));
+    });
     this.socket.addEventListener("message", (event) => {
       const message = JSON.parse(String(event.data));
       if (typeof message.id !== "number") {
@@ -1117,19 +1179,47 @@ class Bidi {
   }
 
   async open() {
-    await new Promise<void>((resolveOpen, rejectOpen) => {
-      this.socket.addEventListener("open", () => resolveOpen(), { once: true });
-      this.socket.addEventListener(
-        "error",
-        () => rejectOpen(new Error("Firefox WebDriver BiDi connection failed")),
-        { once: true },
-      );
-    });
+    if (this.connectionError || this.socket.readyState >= WebSocket.CLOSING) {
+      throw this.connectionError || new Error("Firefox WebDriver BiDi connection closed");
+    }
+    if (this.socket.readyState !== WebSocket.OPEN) {
+      await new Promise<void>((resolveOpen, rejectOpen) => {
+        const cleanup = () => {
+          this.socket.removeEventListener("open", opened);
+          this.openingRejects.delete(failed);
+        };
+        const opened = () => {
+          cleanup();
+          resolveOpen();
+        };
+        const failed = (error: Error) => {
+          cleanup();
+          rejectOpen(error);
+        };
+        this.openingRejects.add(failed);
+        this.socket.addEventListener("open", opened, { once: true });
+      });
+    }
     const session = await this.command("session.new", { capabilities: {} });
     this.capabilities = session?.capabilities || {};
   }
 
+  rejectPending(error: Error) {
+    this.connectionError ??= error;
+    for (const rejectOpen of this.openingRejects) rejectOpen(this.connectionError);
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(this.connectionError);
+    }
+    this.pending.clear();
+  }
+
   command(method: string, params: JsonObject, timeout = 90_000) {
+    if (this.connectionError || this.socket.readyState >= WebSocket.CLOSING) {
+      return Promise.reject(
+        this.connectionError || new Error("Firefox WebDriver BiDi connection closed"),
+      );
+    }
     return new Promise<any>((resolveCommand, rejectCommand) => {
       const id = ++this.nextId;
       const timer = setTimeout(() => {
@@ -1141,7 +1231,13 @@ class Bidi {
         reject: rejectCommand,
         timer,
       });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      try {
+        this.socket.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        rejectCommand(error);
+      }
     });
   }
 
@@ -1207,6 +1303,7 @@ class Bidi {
   }
 
   close() {
+    this.rejectPending(new Error("Firefox WebDriver BiDi connection closed"));
     this.socket.close();
   }
 }
@@ -1297,11 +1394,21 @@ async function startBrowser(
   ];
   if (options.headless) command.push("--headless");
   command.push("about:blank");
-  const processHandle = Bun.spawn(command, {
-    stdout: "ignore",
-    stderr: "ignore",
-    stdin: "ignore",
-  });
+  let processHandle: ReturnType<typeof Bun.spawn>;
+  try {
+    processHandle = Bun.spawn(command, {
+      stdout: "ignore",
+      stderr: "ignore",
+      stdin: "ignore",
+    });
+  } catch (error) {
+    try {
+      releaseProfile(claimed);
+    } finally {
+      await proxy.close();
+    }
+    throw error;
+  }
   const deadline = Date.now() + 20_000;
   let ready = false;
   while (Date.now() < deadline) {
@@ -1370,7 +1477,10 @@ function sanitizedNetworkJson(value: unknown) {
     nodes += 1;
     if (nodes > 2_000 || depth > 8 || item === null) return null;
     if (typeof item === "string") {
-      const cleaned = terminalText(item).slice(0, 4_000);
+      const prefix = terminalText(item.slice(0, 4_000));
+      const cleaned = prefix.length === 4_000 || item.length <= 4_000
+        ? prefix
+        : terminalText(item).slice(0, 4_000);
       return /^https?:\/\//i.test(cleaned)
         ? redactedOutputUrl(cleaned)
         : cleaned;
@@ -1384,14 +1494,14 @@ function sanitizedNetworkJson(value: unknown) {
     }
     if (typeof item !== "object") return null;
     const result: JsonObject = {};
-    for (const [key, value] of Object.entries(item).slice(0, 100)) {
+    for (const key of Object.keys(item).slice(0, 100)) {
       if (
         sensitiveQueryParameter(key) ||
         /^(?:cookie|set-cookie|password|passwd|authorization)$/i.test(key)
       ) {
         continue;
       }
-      const sanitized = visit(value, depth + 1);
+      const sanitized = visit((item as JsonObject)[key], depth + 1);
       if (sanitized !== null) result[key] = sanitized;
     }
     return result;
@@ -2136,7 +2246,18 @@ function extractionExpression(options: BrowserOptions) {
   }
   const candidates = queryAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content')
   const score = element => (element.innerText || "").length - [...element.querySelectorAll("a")].reduce((total, link) => total + (link.innerText || "").length, 0) * 0.35
-  const source = candidates.sort((a, b) => score(b) - score(a))[0] || document.body || document.documentElement
+  let source = candidates[0] || document.body || document.documentElement
+  if (candidates.length > 1) {
+    let bestScore = score(source)
+    for (let index = 1; index < candidates.length; index += 1) {
+      const candidate = candidates[index]
+      const candidateScore = score(candidate)
+      if (candidateScore > bestScore) {
+        source = candidate
+        bestScore = candidateScore
+      }
+    }
+  }
   if (!source) return JSON.stringify({ title: document.title || "", url: absolute(location.href), canonicalUrl: absolute(location.href), published: "", byline: "", text: "", markdown: "", html: "", links: [] })
   const root = source.cloneNode(true)
   root.querySelectorAll('script, style, nav, footer, header, aside, form, noscript, svg, canvas, iframe, button, [aria-hidden="true"]').forEach(node => node.remove())
@@ -2372,11 +2493,19 @@ const scrollExpression = String.raw`(() => {
     const bounds = element.getBoundingClientRect()
     return bounds.width > 0 && bounds.height >= 150 && ['auto', 'scroll'].includes(style.overflowY) && element.scrollHeight - element.clientHeight > 100
   })
-  candidates.sort((left, right) => {
+  let target = candidates[0]
+  if (candidates.length > 1) {
     const score = element => (element.innerText || '').length + element.querySelectorAll('article, [role="article"]').length * 500
-    return score(right) - score(left)
-  })
-  const target = candidates[0]
+    let bestScore = score(target)
+    for (let index = 1; index < candidates.length; index += 1) {
+      const candidate = candidates[index]
+      const candidateScore = score(candidate)
+      if (candidateScore > bestScore) {
+        target = candidate
+        bestScore = candidateScore
+      }
+    }
+  }
   if (target) {
     const before = target.scrollTop
     target.scrollTop = target.scrollHeight
@@ -3038,7 +3167,18 @@ async function navigateAndExtract(
 const frameExtractExpression = String.raw`(() => {
   const candidates = [...document.querySelectorAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content')]
   const score = element => (element.innerText || "").length - [...element.querySelectorAll("a")].reduce((total, link) => total + (link.innerText || "").length, 0) * 0.35
-  const source = candidates.sort((a, b) => score(b) - score(a))[0] || document.body
+  let source = candidates[0] || document.body
+  if (candidates.length > 1) {
+    let bestScore = score(source)
+    for (let index = 1; index < candidates.length; index += 1) {
+      const candidate = candidates[index]
+      const candidateScore = score(candidate)
+      if (candidateScore > bestScore) {
+        source = candidate
+        bestScore = candidateScore
+      }
+    }
+  }
   const clean = value => value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/[ \t\f\v]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim()
   return JSON.stringify({ title: document.title || "", text: clean(source?.innerText || "") })
 })()`;
@@ -3760,38 +3900,53 @@ async function searchFederated(
 function database() {
   mkdirSync(dataRoot, { recursive: true });
   const db = new Database(join(dataRoot, "index.sqlite"), { create: true });
-  db.run("PRAGMA journal_mode = WAL");
-  db.run("PRAGMA synchronous = NORMAL");
-  db.run(
-    "CREATE TABLE IF NOT EXISTS pages (url TEXT PRIMARY KEY, title TEXT NOT NULL, text TEXT NOT NULL, markdown TEXT NOT NULL, fetched_at TEXT NOT NULL)",
-  );
-  const columns = new Set(
-    (db.query("PRAGMA table_info(pages)").all() as any[]).map(
-      (column) => String(column.name),
-    ),
-  );
-  const migrations = [
-    ["published", "TEXT NOT NULL DEFAULT ''"],
-    ["byline", "TEXT NOT NULL DEFAULT ''"],
-    ["links_json", "TEXT NOT NULL DEFAULT '[]'"],
-    ["jobs_json", "TEXT NOT NULL DEFAULT '[]'"],
-    ["sources_json", "TEXT NOT NULL DEFAULT '[]'"],
-    ["change_likelihood", "TEXT NOT NULL DEFAULT 'medium'"],
-    ["freshness_basis", "TEXT NOT NULL DEFAULT '[\"legacy-index-entry\"]'"],
-    ["refresh_after", "TEXT"],
-    ["content_sha256", "TEXT NOT NULL DEFAULT ''"],
-  ];
-  for (const [name, definition] of migrations) {
-    if (!columns.has(name)) {
-      db.run(`ALTER TABLE pages ADD COLUMN ${name} ${definition}`);
+  try {
+    db.run("PRAGMA journal_mode = WAL");
+    db.run("PRAGMA synchronous = NORMAL");
+    db.run(
+      "CREATE TABLE IF NOT EXISTS pages (url TEXT PRIMARY KEY, title TEXT NOT NULL, text TEXT NOT NULL, markdown TEXT NOT NULL, fetched_at TEXT NOT NULL)",
+    );
+    const columns = new Set(
+      (db.query("PRAGMA table_info(pages)").all() as any[]).map(
+        (column) => String(column.name),
+      ),
+    );
+    const migrations = [
+      ["published", "TEXT NOT NULL DEFAULT ''"],
+      ["byline", "TEXT NOT NULL DEFAULT ''"],
+      ["links_json", "TEXT NOT NULL DEFAULT '[]'"],
+      ["jobs_json", "TEXT NOT NULL DEFAULT '[]'"],
+      ["sources_json", "TEXT NOT NULL DEFAULT '[]'"],
+      ["change_likelihood", "TEXT NOT NULL DEFAULT 'medium'"],
+      ["freshness_basis", "TEXT NOT NULL DEFAULT '[\"legacy-index-entry\"]'"],
+      ["refresh_after", "TEXT"],
+      ["content_sha256", "TEXT NOT NULL DEFAULT ''"],
+    ];
+    for (const [name, definition] of migrations) {
+      if (!columns.has(name)) {
+        db.run(`ALTER TABLE pages ADD COLUMN ${name} ${definition}`);
+      }
     }
+    db.run(
+      "CREATE TABLE IF NOT EXISTS page_aliases (request_url TEXT PRIMARY KEY, page_url TEXT NOT NULL)",
+    );
+    db.run(
+      "CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, text, tokenize='unicode61')",
+    );
+    if (!columns.has("fts_rowid")) {
+      db.transaction(() => {
+        const current = db.query("PRAGMA table_info(pages)").all() as any[];
+        if (current.some((column) => column.name === "fts_rowid")) return;
+        db.run("ALTER TABLE pages ADD COLUMN fts_rowid INTEGER");
+        db.run(
+          "UPDATE pages SET fts_rowid = f.rowid FROM pages_fts AS f WHERE pages.url = f.url",
+        );
+      }).immediate();
+    }
+  } catch (error) {
+    db.close();
+    throw error;
   }
-  db.run(
-    "CREATE TABLE IF NOT EXISTS page_aliases (request_url TEXT PRIMARY KEY, page_url TEXT NOT NULL)",
-  );
-  db.run(
-    "CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, text, tokenize='unicode61')",
-  );
   return db;
 }
 
@@ -4055,119 +4210,148 @@ function parsedJobCards(value: unknown) {
   }
 }
 
-function cachedPage(url: string) {
+function cachedPageReader() {
   const db = database();
   try {
-    const normalized = normalizedPageUrl(url);
-    const row = db
-      .query(
-        "SELECT pages.* FROM pages WHERE pages.url = COALESCE((SELECT page_url FROM page_aliases WHERE request_url = ?), ?) LIMIT 1",
-      )
-      .get(normalized, normalized) as any;
-    if (!row) return { cache: "miss" as const };
-    const likelihood = new Set(["immutable", "low", "medium", "high"]).has(
-      row.change_likelihood,
-    )
-      ? (row.change_likelihood as ChangeLikelihood)
-      : "medium";
-    const immutable = likelihood === "immutable";
-    const fresh =
-      immutable ||
-      (typeof row.refresh_after === "string" &&
-        Date.parse(row.refresh_after) > Date.now());
-    if (!fresh) return { cache: "stale" as const };
-    const page: Page = {
-      title: String(row.title),
-      url: String(row.url),
-      canonicalUrl: String(row.url),
-      published: String(row.published || ""),
-      byline: String(row.byline || ""),
-      text: String(row.text),
-      markdown: String(row.markdown),
-      html: "",
-      links: parsedArray(row.links_json),
-      jobs: parsedJobCards(row.jobs_json),
-      sources: [...new Set([...parsedArray(row.sources_json), "local-index"])],
-      freshness: {
-        retrieval: "local-index",
-        cache: immutable ? "immutable" : "fresh",
-        change_likelihood: likelihood,
-        basis: parsedArray(row.freshness_basis),
-        retrieved_at: String(row.fetched_at),
-        indexed_at: String(row.fetched_at),
-        refresh_after:
-          row.refresh_after === null ? null : String(row.refresh_after),
-        content_sha256: String(row.content_sha256 || contentHash(row)),
+    const lookup = db.query(
+      "SELECT pages.* FROM pages WHERE pages.url = COALESCE((SELECT page_url FROM page_aliases WHERE request_url = ?), ?) LIMIT 1",
+    );
+    return {
+      get(url: string) {
+        const normalized = normalizedPageUrl(url);
+        const row = lookup.get(normalized, normalized) as any;
+        if (!row) return { cache: "miss" as const };
+        const likelihood = new Set(["immutable", "low", "medium", "high"]).has(
+          row.change_likelihood,
+        )
+          ? (row.change_likelihood as ChangeLikelihood)
+          : "medium";
+        const immutable = likelihood === "immutable";
+        const fresh =
+          immutable ||
+          (typeof row.refresh_after === "string" &&
+            Date.parse(row.refresh_after) > Date.now());
+        if (!fresh) return { cache: "stale" as const };
+        const page: Page = {
+          title: String(row.title),
+          url: String(row.url),
+          canonicalUrl: String(row.url),
+          published: String(row.published || ""),
+          byline: String(row.byline || ""),
+          text: String(row.text),
+          markdown: String(row.markdown),
+          html: "",
+          links: parsedArray(row.links_json),
+          jobs: parsedJobCards(row.jobs_json),
+          sources: [...new Set([...parsedArray(row.sources_json), "local-index"])],
+          freshness: {
+            retrieval: "local-index",
+            cache: immutable ? "immutable" : "fresh",
+            change_likelihood: likelihood,
+            basis: parsedArray(row.freshness_basis),
+            retrieved_at: String(row.fetched_at),
+            indexed_at: String(row.fetched_at),
+            refresh_after:
+              row.refresh_after === null ? null : String(row.refresh_after),
+            content_sha256: String(row.content_sha256 || contentHash(row)),
+          },
+        };
+        return { cache: page.freshness!.cache, page };
       },
+      close: () => db.close(),
     };
-    return { cache: page.freshness!.cache, page };
-  } finally {
+  } catch (error) {
     db.close();
+    throw error;
+  }
+}
+
+function cachedPage(url: string) {
+  const reader = cachedPageReader();
+  try {
+    return reader.get(url);
+  } finally {
+    reader.close();
   }
 }
 
 function pageIndexer() {
   const db = database();
-  const upsert = db.query(
-    "INSERT INTO pages (url, title, text, markdown, fetched_at, published, byline, links_json, jobs_json, sources_json, change_likelihood, freshness_basis, refresh_after, content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at, published=excluded.published, byline=excluded.byline, links_json=excluded.links_json, jobs_json=excluded.jobs_json, sources_json=excluded.sources_json, change_likelihood=excluded.change_likelihood, freshness_basis=excluded.freshness_basis, refresh_after=excluded.refresh_after, content_sha256=excluded.content_sha256",
-  );
-  const prior = db.query("SELECT content_sha256 FROM pages WHERE url = ?");
-  const addAlias = db.query(
-    "INSERT INTO page_aliases (request_url, page_url) VALUES (?, ?) ON CONFLICT(request_url) DO UPDATE SET page_url=excluded.page_url",
-  );
-  const removeSearch = db.query("DELETE FROM pages_fts WHERE url = ?");
-  const addSearch = db.query(
-    "INSERT INTO pages_fts (url, title, text) VALUES (?, ?, ?)",
-  );
-  const write = db.transaction(
-    (page: Page, requestedUrl = "", cache = "bypass") => {
-      const url = pageIndexUrl(page);
-      const indexedAt = new Date().toISOString();
-      const policy = freshnessPolicy(page, indexedAt);
-      const hash = contentHash(page);
-      const previous = prior.get(url) as any;
-      upsert.run(
-        url,
-        page.title,
-        page.text,
-        page.markdown,
-        indexedAt,
-        page.published,
-        page.byline,
-        JSON.stringify(page.links),
-        JSON.stringify(page.jobs || []),
-        JSON.stringify(page.sources || []),
-        policy.changeLikelihood,
-        JSON.stringify(policy.basis),
-        policy.refreshAfter,
-        hash,
-      );
-      for (const alias of new Set(
-        [url, page.url, page.canonicalUrl, requestedUrl]
-          .filter(Boolean)
-          .map(normalizedPageUrl),
-      )) addAlias.run(alias, url);
-      removeSearch.run(url);
-      addSearch.run(url, page.title, page.text);
-      return {
-        retrieval: "live",
-        cache,
-        change_likelihood: policy.changeLikelihood,
-        basis: policy.basis,
-        retrieved_at: indexedAt,
-        indexed_at: indexedAt,
-        refresh_after: policy.refreshAfter,
-        content_sha256: hash,
-        ...(previous?.content_sha256
-          ? { changed: previous.content_sha256 !== hash }
-          : {}),
-      } as PageFreshness;
-    },
-  );
-  return {
-    write,
-    close: () => db.close(),
-  };
+  try {
+    const upsert = db.query(
+      "INSERT INTO pages (url, title, text, markdown, fetched_at, published, byline, links_json, jobs_json, sources_json, change_likelihood, freshness_basis, refresh_after, content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at, published=excluded.published, byline=excluded.byline, links_json=excluded.links_json, jobs_json=excluded.jobs_json, sources_json=excluded.sources_json, change_likelihood=excluded.change_likelihood, freshness_basis=excluded.freshness_basis, refresh_after=excluded.refresh_after, content_sha256=excluded.content_sha256",
+    );
+    const prior = db.query(
+      "SELECT content_sha256, CAST(fts_rowid AS TEXT) AS fts_rowid, title = ? AND text = ? AS search_unchanged FROM pages WHERE url = ?",
+    );
+    const addAlias = db.query(
+      "INSERT INTO page_aliases (request_url, page_url) VALUES (?, ?) ON CONFLICT(request_url) DO UPDATE SET page_url=excluded.page_url",
+    );
+    const removeSearch = db.query("DELETE FROM pages_fts WHERE rowid = ? AND url = ?");
+    const removeSearchByUrl = db.query("DELETE FROM pages_fts WHERE url = ?");
+    const mapSearch = db.query("UPDATE pages SET fts_rowid = last_insert_rowid() WHERE url = ?");
+    const addSearch = db.query(
+      "INSERT INTO pages_fts (url, title, text) VALUES (?, ?, ?)",
+    );
+    const write = db.transaction(
+      (page: Page, requestedUrl = "", cache = "bypass") => {
+        const url = pageIndexUrl(page);
+        const indexedAt = new Date().toISOString();
+        const policy = freshnessPolicy(page, indexedAt);
+        const hash = contentHash(page);
+        const previous = prior.get(page.title, page.text, url) as any;
+        upsert.run(
+          url,
+          page.title,
+          page.text,
+          page.markdown,
+          indexedAt,
+          page.published,
+          page.byline,
+          JSON.stringify(page.links),
+          JSON.stringify(page.jobs || []),
+          JSON.stringify(page.sources || []),
+          policy.changeLikelihood,
+          JSON.stringify(policy.basis),
+          policy.refreshAfter,
+          hash,
+        );
+        for (const alias of new Set(
+          [url, page.url, page.canonicalUrl, requestedUrl]
+            .filter(Boolean)
+            .map(normalizedPageUrl),
+        )) addAlias.run(alias, url);
+        if (!previous?.search_unchanged) {
+          if (previous && (previous.fts_rowid == null ||
+              !removeSearch.run(previous.fts_rowid, url).changes)) {
+            removeSearchByUrl.run(url);
+          }
+          addSearch.run(url, page.title, page.text);
+          mapSearch.run(url);
+        }
+        return {
+          retrieval: "live",
+          cache,
+          change_likelihood: policy.changeLikelihood,
+          basis: policy.basis,
+          retrieved_at: indexedAt,
+          indexed_at: indexedAt,
+          refresh_after: policy.refreshAfter,
+          content_sha256: hash,
+          ...(previous?.content_sha256
+            ? { changed: previous.content_sha256 !== hash }
+            : {}),
+        } as PageFreshness;
+      },
+    );
+    return {
+      write,
+      close: () => db.close(),
+    };
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 }
 
 function indexPage(page: Page, requestedUrl = "", cache = "bypass") {
@@ -4999,24 +5183,55 @@ function batchUrls(value: string) {
   return { input, urls, discoveryEvidence };
 }
 
+function* utf8FileLines(path: string) {
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const decoder = new StringDecoder("utf8");
+    let parts: string[] = [];
+    let length: number;
+    while ((length = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      const chunk = decoder.write(buffer.subarray(0, length));
+      let start = 0;
+      let end: number;
+      while ((end = chunk.indexOf("\n", start)) !== -1) {
+        let line = chunk.slice(start, end);
+        if (parts.length) {
+          parts.push(line);
+          line = parts.join("");
+          parts = [];
+        }
+        yield line.endsWith("\r") ? line.slice(0, -1) : line;
+        start = end + 1;
+      }
+      if (start < chunk.length) parts.push(chunk.slice(start));
+    }
+    parts.push(decoder.end());
+    yield parts.join("");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function completedBatchUrls(output: string, retryFailures: boolean) {
   const completed = new Set<string>();
-  for (const [index, line] of readFileSync(output, "utf8")
-    .split(/\r?\n/)
-    .entries()) {
+  const outcomes = new Set(["scraped", "partial", "failed"]);
+  let lineNumber = 0;
+  for (const line of utf8FileLines(output)) {
+    lineNumber += 1;
     if (!line.trim()) continue;
     let record: any;
     try {
       record = JSON.parse(line);
     } catch {
-      fail(`scrape-batch output has invalid JSON on line ${index + 1}`);
+      fail(`scrape-batch output has invalid JSON on line ${lineNumber}`);
     }
     if (
       record.schema !== "agency/web-page-result/1" ||
       typeof record.requested_url !== "string" ||
-      !new Set(["scraped", "partial", "failed"]).has(record.outcome)
+      !outcomes.has(record.outcome)
     ) {
-      fail(`scrape-batch output has an invalid record on line ${index + 1}`);
+      fail(`scrape-batch output has an invalid record on line ${lineNumber}`);
     }
     if (!retryFailures || record.outcome === "scraped") {
       completed.add(record.requested_url);
@@ -5684,14 +5899,19 @@ async function commandScrapeMany(args: string[]) {
   for (const url of urls) explicitNetworkTarget(url, options.allowPrivate);
   const pages = new Array<Page | PageBatchFailure>(urls.length);
   const pending: Array<{ index: number; url: URL; cache: "miss" | "stale" }> = [];
-  for (const [index, url] of urls.entries()) {
-    const preflight = options.capture ? { cache: "bypass" as const } : cachedPage(url.href);
-    if (preflight.page) pages[index] = preflight.page;
-    else pending.push({
-      index,
-      url,
-      cache: preflight.cache === "stale" ? "stale" : "miss",
-    });
+  const reader = options.capture ? null : cachedPageReader();
+  try {
+    for (const [index, url] of urls.entries()) {
+      const preflight = reader ? reader.get(url.href) : { cache: "bypass" as const };
+      if (preflight.page) pages[index] = preflight.page;
+      else pending.push({
+        index,
+        url,
+        cache: preflight.cache === "stale" ? "stale" : "miss",
+      });
+    }
+  } finally {
+    reader?.close();
   }
   const indexer = shouldIndex ? pageIndexer() : null;
   try {
@@ -6128,17 +6348,32 @@ async function commandBrowser(args: string[]) {
   if (args.length > 1) fail("browser accepts at most one URL");
   const url = args.length ? checkedUrl(args[0]).href : "about:blank";
   const claimed = claimProfile(profile, [], false);
-  const child = Bun.spawn(
-    ["firefox", "--no-remote", "--profile", claimed.root, url],
-    {
-      stdin: detach ? "ignore" : "inherit",
-      stdout: "ignore",
-      stderr: "ignore",
-    },
-  );
+  let child: ReturnType<typeof Bun.spawn>;
+  try {
+    child = Bun.spawn(
+      ["firefox", "--no-remote", "--profile", claimed.root, url],
+      {
+        stdin: detach ? "ignore" : "inherit",
+        stdout: "ignore",
+        stderr: "ignore",
+      },
+    );
+  } catch (error) {
+    releaseProfile(claimed);
+    throw error;
+  }
   if (detach) {
-    writeFileSync(claimed.lock, String(child.pid), { mode: 0o600 });
-    child.unref();
+    try {
+      writeFileSync(claimed.lock, String(child.pid), { mode: 0o600 });
+      child.unref();
+    } catch (error) {
+      try {
+        await terminateBrowserProcess(child);
+      } finally {
+        releaseProfile(claimed);
+      }
+      throw error;
+    }
     info(`opened detached persistent profile '${profile}' in Firefox`);
     return;
   }
