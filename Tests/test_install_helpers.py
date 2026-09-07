@@ -1,11 +1,11 @@
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "scripts/lib.sh"
@@ -46,6 +46,33 @@ class GlobalAgentGuidanceTests(unittest.TestCase):
         guidance = (ROOT / "Agents/AGENTS.md").read_text()
 
         self.assertIn("Use Agency's web tool by default for substantive", guidance)
+
+
+class AgentThroughputSkillTests(unittest.TestCase):
+    def test_entrypoint_is_bounded_and_routes_to_existing_references(self):
+        skill_path = ROOT / "Skills/agent-throughput/SKILL.md"
+        skill = skill_path.read_text()
+        reference_links = {
+            match.group(1)
+            for match in re.finditer(r"\]\((references/[^)]+\.md)\)", skill)
+        }
+
+        self.assertLessEqual(skill_path.stat().st_size, 4 * 1024)
+        self.assertEqual(
+            reference_links,
+            {
+                "references/context-budget.md",
+                "references/evaluation.md",
+                "references/model-routing.md",
+            },
+        )
+        for relative_path in reference_links:
+            reference = skill_path.parent / relative_path
+            self.assertTrue(reference.is_file(), relative_path)
+            self.assertLessEqual(reference.stat().st_size, 8 * 1024)
+
+    def test_skill_has_no_duplicate_readme(self):
+        self.assertFalse((ROOT / "Skills/agent-throughput/README.md").exists())
 
 
 class WorkstationManifestTests(unittest.TestCase):
@@ -327,6 +354,7 @@ class LaptopDetectionTests(unittest.TestCase):
         environment["AGENCY_SYSFS_ROOT"] = str(self.sysfs)
         return subprocess.run(
             ["bash", "-c", 'source "$1"; detect_laptop', "bash", str(POWER)],
+            check=False,
             text=True,
             capture_output=True,
             env=environment,
@@ -350,6 +378,7 @@ class LaptopDetectionTests(unittest.TestCase):
                 "bash",
                 str(POWER),
             ],
+            check=False,
             text=True,
             capture_output=True,
             env=environment,
@@ -436,6 +465,7 @@ class DryRunTests(unittest.TestCase):
         before = self.snapshot()
         result = subprocess.run(
             [INSTALLER, "--dry-run"],
+            check=False,
             text=True,
             capture_output=True,
             env={
@@ -470,6 +500,7 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("perf-diagnose", result.stdout)
         self.assertIn("resource-bench", result.stdout)
         self.assertIn("performance-design", result.stdout)
+        self.assertIn("agent-throughput", result.stdout)
         self.assertIn("comment-audit", result.stdout)
         self.assertIn("No changes were made", result.stdout)
 
@@ -477,6 +508,7 @@ class DryRunTests(unittest.TestCase):
         before = self.snapshot()
         result = subprocess.run(
             [INSTALLER, "--help"],
+            check=False,
             text=True,
             capture_output=True,
             env={**os.environ, "HOME": str(self.home)},
@@ -491,6 +523,7 @@ class DryRunTests(unittest.TestCase):
         before = self.snapshot()
         result = subprocess.run(
             [INSTALLER, "--dry-run", "--update"],
+            check=False,
             text=True,
             capture_output=True,
             env={

@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tomllib
+from collections import defaultdict
+from pathlib import Path
+
+
+DEFAULT_MAX_BYTES = 32 * 1024
+STANDARD_FILENAMES = ("AGENTS.override.md", "AGENTS.md")
+DEFAULT_ROOT_MARKERS = (".git",)
+
+
+def parser():
+    command = argparse.ArgumentParser(
+        prog="agent-context",
+        description="Audit the instruction context selected by an agent client.",
+    )
+    command.add_argument("client", choices=("codex",))
+    command.add_argument("path", nargs="?", default=".")
+    command.add_argument("--json", action="store_true", dest="as_json")
+    command.add_argument("--check", action="store_true")
+    return command
+
+
+def load_config_file(path):
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("rb") as stream:
+            return tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"cannot read {path}: {error}") from error
+
+
+def filename_list(values, name, default):
+    result = values.get(name, default)
+    if not isinstance(result, list) or not all(
+        isinstance(value, str) and value and Path(value).name == value
+        for value in result
+    ):
+        raise ValueError(f"{name} must be a list of file names")
+    return result
+
+
+def instruction_config(user_values, project_values=None):
+    values = {**user_values, **(project_values or {})}
+    maximum = values.get("project_doc_max_bytes", DEFAULT_MAX_BYTES)
+    if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
+        raise ValueError("project_doc_max_bytes must be a non-negative integer")
+    return {
+        "project_doc_max_bytes": maximum,
+        "project_doc_fallback_filenames": filename_list(
+            values, "project_doc_fallback_filenames", []
+        ),
+        "project_root_markers": filename_list(
+            user_values, "project_root_markers", list(DEFAULT_ROOT_MARKERS)
+        ),
+    }
+
+
+def project_trust(values, root):
+    projects = values.get("projects", {})
+    if not isinstance(projects, dict):
+        raise ValueError("projects must be a table")
+    project = projects.get(str(root), {})
+    if not isinstance(project, dict):
+        raise ValueError(f"projects.{root} must be a table")
+    trust = project.get("trust_level")
+    if trust not in (None, "trusted", "untrusted"):
+        raise ValueError("project trust_level must be 'trusted' or 'untrusted'")
+    return trust
+
+
+def first_nonempty(directory, filenames):
+    for filename in filenames:
+        path = directory / filename
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        if data.strip():
+            return path.absolute(), data
+    return None
+
+
+def first_project_document(directory, filenames):
+    for filename in filenames:
+        path = directory / filename
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        return (path.absolute(), data) if data.strip() else None
+    return None
+
+
+def project_root(directory, markers):
+    for candidate in (directory, *directory.parents):
+        if any((candidate / marker).exists() for marker in markers):
+            return candidate
+    return directory
+
+
+def directory_chain(root, cwd):
+    relative = cwd.relative_to(root)
+    yield root
+    current = root
+    for part in relative.parts:
+        current /= part
+        yield current
+
+
+def metadata(path, data, included_bytes=None):
+    item = {
+        "path": str(path),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if included_bytes is not None:
+        item["included_bytes"] = included_bytes
+        item["truncated"] = included_bytes < len(data)
+    return item
+
+
+def hidden_headings(data, offset):
+    headings = []
+    position = 0
+    for raw_line in data.splitlines(keepends=True):
+        line_end = position + len(raw_line)
+        if line_end > offset:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line.startswith("#") and line.lstrip("#").startswith(" "):
+                headings.append(line)
+        position = line_end
+    return headings
+
+
+def audit(target, codex_home):
+    cwd = target.resolve()
+    if cwd.is_file():
+        cwd = cwd.parent
+    if not cwd.is_dir():
+        raise ValueError(f"path is not a directory: {cwd}")
+
+    user_values = load_config_file(codex_home / "config.toml")
+    base_config = instruction_config(user_values)
+    global_selected = first_nonempty(codex_home, STANDARD_FILENAMES)
+    root = project_root(cwd, base_config["project_root_markers"])
+    trust = project_trust(user_values, root)
+    project_values = (
+        load_config_file(root / ".codex" / "config.toml")
+        if trust == "trusted"
+        else None
+    )
+    config = instruction_config(user_values, project_values)
+    maximum = config["project_doc_max_bytes"]
+    fallbacks = config["project_doc_fallback_filenames"]
+    names = (*STANDARD_FILENAMES, *fallbacks)
+    selected = []
+    if trust != "untrusted":
+        for directory in directory_chain(root, cwd):
+            document = first_project_document(directory, names)
+            if document:
+                selected.append(document)
+
+    remaining = maximum
+    project_items = []
+    truncation = None
+    for path, data in selected:
+        included = min(len(data), remaining)
+        project_items.append(metadata(path, data, included))
+        if included < len(data) and truncation is None:
+            truncation = {
+                "path": str(path),
+                "byte_offset": included,
+                "line": data[:included].count(b"\n") + 1,
+                "headings_hidden": hidden_headings(data, included),
+            }
+        remaining -= included
+
+    if truncation is not None:
+        cut_index = next(
+            index
+            for index, item in enumerate(project_items)
+            if item["path"] == truncation["path"]
+        )
+        for _, data in selected[cut_index + 1 :]:
+            truncation["headings_hidden"].extend(hidden_headings(data, 0))
+
+    all_documents = ([] if global_selected is None else [global_selected]) + selected
+    by_content = defaultdict(list)
+    for path, data in all_documents:
+        by_content[data].append(str(path))
+    duplicates = sorted(
+        (sorted(paths) for paths in by_content.values() if len(paths) > 1),
+        key=lambda paths: paths[0],
+    )
+
+    return {
+        "schema_version": 1,
+        "client": "codex",
+        "cwd": str(cwd),
+        "project_root": str(root),
+        "config": {**config, "trust_level": trust or "unspecified"},
+        "global_instructions": (
+            []
+            if global_selected is None
+            else [metadata(global_selected[0], global_selected[1])]
+        ),
+        "project_instructions": project_items,
+        "project_bytes": {
+            "selected": sum(len(data) for _, data in selected),
+            "included": maximum - remaining,
+            "limit": maximum,
+        },
+        "truncated": truncation is not None,
+        "truncation": truncation,
+        "duplicates": duplicates,
+    }
+
+
+def plural(count, singular):
+    return f"{count} {singular}{'' if count == 1 else 's'}"
+
+
+def print_plain(result):
+    project = result["project_bytes"]
+    print("Codex instruction context")
+    print(f"cwd: {result['cwd']}")
+    print(f"project root: {result['project_root']}")
+    print(f"project trust: {result['config']['trust_level']}")
+    print(f"global: {plural(len(result['global_instructions']), 'file')}")
+    print(
+        f"project: {plural(len(result['project_instructions']), 'file')}, "
+        f"{project['included']}/{project['limit']} bytes"
+    )
+    if result["truncation"] is None:
+        print("truncation: none")
+    else:
+        cut = result["truncation"]
+        print(
+            f"truncation: {cut['path']} at byte {cut['byte_offset']}, "
+            f"line {cut['line']}"
+        )
+        if cut["headings_hidden"]:
+            print(f"hidden headings: {', '.join(cut['headings_hidden'])}")
+    print(f"duplicate groups: {len(result['duplicates'])}")
+
+
+def main(argv=None):
+    arguments = parser().parse_args(argv)
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
+    try:
+        result = audit(Path(arguments.path), codex_home)
+    except (OSError, ValueError) as error:
+        print(f"agent-context: {error}", file=sys.stderr)
+        return 2
+    if arguments.as_json:
+        json.dump(result, sys.stdout, indent=2, sort_keys=True)
+        print()
+    else:
+        print_plain(result)
+    return 1 if arguments.check and result["truncated"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -113,6 +113,7 @@ agency_plan_user_links() {
     long-processes
     sandbox
     agent-work
+    agent-context
     comment-audit
     docs-exec
     document-inspect
