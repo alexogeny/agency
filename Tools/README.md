@@ -65,6 +65,18 @@ inspecting a claimed path remains allowed. `inspect TASK_ID` reads one exact
 record; `inspect` without an ID opens or emits the active board. Use
 `agent-work --help` for the task lifecycle and JSON interface.
 
+## `agent-context`
+
+Audits the instruction files Codex would select for a working directory without
+loading repository code or changing files. It follows configured root markers,
+global and project override precedence, trusted project configuration, trust
+state, fallback names, and the combined project-byte budget. The report
+pinpoints the first truncated byte and line, lists Markdown headings hidden
+beyond the cutoff, and detects identical selected documents.
+Use `agent-context codex PATH`, add `--json` for stable structured output, or
+`--check` to fail only when project guidance is truncated. Configuration output
+is restricted to instruction-discovery keys.
+
 ## `repository-setup`
 
 Renders Agency's Python, JavaScript, TypeScript, Go, and Rust repository

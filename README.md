@@ -196,6 +196,23 @@ claims about those resources. A material resource reduction remains a real win
 when instructions are flat, but it does not establish an unmeasured downstream
 benefit.
 
+### Spend model capacity on accepted work
+
+[`agent-throughput`](Skills/agent-throughput/SKILL.md) selects a provisional
+model-and-effort lane from the task's shape and failure cost, then bounds the
+handoff with an explicit outcome, scope, acceptance check, escalation condition,
+and stopping condition. It treats Astra medium as the starting lane for
+substantial repository work while keeping smaller, higher-risk, review, and
+judgment-heavy work distinct.
+
+The workflow measures total cost per accepted task, including failed attempts
+and human repair, instead of optimizing price per token. It uses
+`agent-context codex .` to expose oversized or truncated instruction context and
+loads model routing, context budgeting, or evaluation guidance only when that
+decision arises. Concurrent or durable work continues through
+[`coordinate`](Skills/coordinate/SKILL.md); ordinary coding does not activate
+either workflow merely because an agent performs it.
+
 ### Stamp out repository plumbing
 
 The [`setup-repository`](Skills/setup-repository/SKILL.md) skill turns Agency's
