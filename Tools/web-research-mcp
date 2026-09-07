@@ -607,7 +607,8 @@ function renderPage(reference: PageReference, lineno: number, budget: number) {
   while (!truncated && cursor <= content.length) {
     const separator = content.indexOf("\n", cursor);
     const end = separator < 0 ? content.length : separator;
-    const complete = append(`${currentLine}: ${content.slice(cursor, end)}\n`);
+    const clippedEnd = Math.min(end, cursor + maximum - rendered.length);
+    const complete = append(`${currentLine}: ${content.slice(cursor, clippedEnd)}\n`);
     lastLine = currentLine;
     if (!complete) break;
     if (separator < 0) break;
@@ -805,22 +806,29 @@ async function performFind(
     const page = requirePage(result);
     const { pattern } = requests[index];
     const needle = pattern.toLocaleLowerCase();
-    const matches = pageLines(page)
-      .map((line, lineIndex) => ({ line, lineno: lineIndex + 1 }))
-      .filter(({ line }) => line.toLocaleLowerCase().includes(needle));
+    const lines = pageLines(page);
+    const matches: { line: string; lineno: number }[] = [];
+    let matchCount = 0;
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const line = lines[lineIndex];
+      if (!line.toLocaleLowerCase().includes(needle)) continue;
+      matchCount++;
+      if (matches.length < 50) matches.push({ line, lineno: lineIndex + 1 });
+    }
+    const evidenceLines = matches.map(({ lineno }) => lineno);
     records.push({
       type: "find",
       ref_id: page.ref_id,
       pattern,
-      matches: matches.length,
-      lines: matches.slice(0, 50).map(({ lineno }) => lineno),
+      matches: matchCount,
+      lines: evidenceLines,
       citation: {
         ...pageCitation(page),
-        evidence_lines: matches.slice(0, 50).map(({ lineno }) => lineno),
+        evidence_lines: evidenceLines,
       },
     });
     rendered.push(
-      `[${page.ref_id}] ${pattern}: ${matches.length} match${matches.length === 1 ? "" : "es"}\n${matches.slice(0, 50).map(({ line, lineno }) => `${lineno}: ${line}`).join("\n")}`.trim(),
+      `[${page.ref_id}] ${pattern}: ${matchCount} match${matchCount === 1 ? "" : "es"}\n${matches.map(({ line, lineno }) => `${lineno}: ${line}`).join("\n")}`.trim(),
     );
   }
   return { records, rendered };

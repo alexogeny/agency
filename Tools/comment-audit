@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 import tokenize
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 
@@ -93,7 +93,12 @@ def python_docstrings(path: Path, source: str) -> list[dict[str, str | int]]:
     except SyntaxError:
         return []
     found = []
-    for node in ast.walk(tree):
+    pending = deque([tree])
+    while pending:
+        node = pending.popleft()
+        pending.extend(
+            child for child in ast.iter_child_nodes(node) if not isinstance(child, ast.expr)
+        )
         if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         body = getattr(node, "body", ())
@@ -144,7 +149,7 @@ def paths(targets: list[Path], visible_only: bool) -> list[Path]:
         if candidates is None:
             candidates = resolved.rglob("*")
         for candidate in candidates:
-            if candidate.is_file() and candidate.suffix.casefold() in SUPPORTED:
+            if candidate.suffix.casefold() in SUPPORTED and candidate.is_file():
                 found.add(candidate.resolve())
     return sorted(found)
 

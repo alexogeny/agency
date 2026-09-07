@@ -50,20 +50,20 @@ def read_spec(path):
     missing = required - spec.keys()
     if missing:
         fail(f"benchmark spec is missing: {', '.join(sorted(missing))}", 2)
-    if not isinstance(spec["cpu"], int) or spec["cpu"] < 0:
+    if type(spec["cpu"]) is not int or spec["cpu"] < 0:
         fail("cpu must be a non-negative integer", 2)
     spec["runs"] = spec.get("runs", 7)
     spec["warmups"] = spec.get("warmups", 2)
-    if not isinstance(spec["runs"], int) or spec["runs"] < 3:
+    if type(spec["runs"]) is not int or spec["runs"] < 3:
         fail("runs must be an integer of at least 3", 2)
-    if not isinstance(spec["warmups"], int) or spec["warmups"] < 1:
+    if type(spec["warmups"]) is not int or spec["warmups"] < 1:
         fail("warmups must be an integer of at least 1", 2)
     spec["output_equivalence"] = spec.get("output_equivalence", "exact")
     if spec["output_equivalence"] not in {"exact", "per-arm"}:
         fail("output_equivalence must be 'exact' or 'per-arm'", 2)
     spec["sample_interval_ms"] = spec.get("sample_interval_ms", 5)
     if (
-        not isinstance(spec["sample_interval_ms"], int)
+        type(spec["sample_interval_ms"]) is not int
         or spec["sample_interval_ms"] < 1
     ):
         fail("sample_interval_ms must be a positive integer", 2)
@@ -177,10 +177,15 @@ def process_tree(root_pid):
             continue
         found.append(pid)
         try:
-            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            tasks = list(Path(f"/proc/{pid}/task").iterdir())
         except OSError:
             continue
-        pending.extend(int(child) for child in children)
+        for task in tasks:
+            try:
+                children = (task / "children").read_text().split()
+            except OSError:
+                continue
+            pending.extend(int(child) for child in children)
     return found
 
 
@@ -219,23 +224,20 @@ def launch_and_observe(launch, cwd, environment, cpu, sample_memory, interval_ms
         stdout, stderr = process.communicate()
         return process.returncode, stdout, stderr, []
     memory_samples = []
-    if sample_memory:
-        sample = process_tree_memory(process.pid)
-        if sample:
-            memory_samples.append(sample)
+    sample = process_tree_memory(process.pid)
+    if sample:
+        memory_samples.append(sample)
     while True:
         try:
             stdout, stderr = process.communicate(timeout=interval_ms / 1000)
             break
         except subprocess.TimeoutExpired:
-            if sample_memory:
-                sample = process_tree_memory(process.pid)
-                if sample:
-                    memory_samples.append(sample)
-    if sample_memory:
-        sample = process_tree_memory(process.pid)
-        if sample:
-            memory_samples.append(sample)
+            sample = process_tree_memory(process.pid)
+            if sample:
+                memory_samples.append(sample)
+    sample = process_tree_memory(process.pid)
+    if sample:
+        memory_samples.append(sample)
     return process.returncode, stdout, stderr, memory_samples
 
 

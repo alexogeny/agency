@@ -114,6 +114,9 @@ def run_command(arguments):
         except KeyboardInterrupt:
             emit("warning", f"Cancelled {arguments.label}", arguments.indent)
             return 130
+        except OSError as error:
+            emit("error", f"{arguments.failure}: {error}", arguments.indent)
+            return 127
         elapsed = time.monotonic() - started
         if result.returncode == 0:
             emit("success", arguments.success or arguments.label, arguments.indent, elapsed)

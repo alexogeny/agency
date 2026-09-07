@@ -14,7 +14,7 @@ from pathlib import Path
 
 import tomllib
 
-PARSER_VERSION = 1
+PARSER_VERSION = 4
 SOURCE_SUFFIXES = {
     ".c": "c",
     ".cc": "cpp",
@@ -160,16 +160,20 @@ def cache_database():
     )
     base.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(base / "facts.sqlite3")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS facts (
-            digest TEXT NOT NULL,
-            parser_version INTEGER NOT NULL,
-            facts_json TEXT NOT NULL,
-            PRIMARY KEY (digest, parser_version)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS facts (
+                digest TEXT NOT NULL,
+                parser_version INTEGER NOT NULL,
+                facts_json TEXT NOT NULL,
+                PRIMARY KEY (digest, parser_version)
+            )
+            """
         )
-        """
-    )
+    except BaseException:
+        connection.close()
+        raise
     return connection
 
 
@@ -212,16 +216,33 @@ def file_language(path, data):
     language = SOURCE_SUFFIXES.get(Path(path).suffix.lower())
     if language or not data.startswith(b"#!"):
         return language
-    first_line = data.splitlines()[0].decode(errors="ignore")
+    line_end = re.search(b"[\r\n]", data)
+    first_line = data[:line_end.start() if line_end else len(data)].decode(errors="ignore")
     for marker, detected in (
         ("python", "python"),
         ("bash", "shell"),
-        ("sh", "shell"),
         ("fish", "fish"),
+        ("sh", "shell"),
         ("ruby", "ruby"),
     ):
         if marker in first_line:
             return detected
+    command = first_line[2:].split()
+    if command and Path(command[0]).name == "env":
+        command = command[1:]
+        if command[:1] == ["-S"]:
+            command = command[1:]
+    if not command:
+        return None
+    runtime = Path(command[0]).name
+    if runtime == "bun":
+        return "typescript"
+    if runtime == "uv" and command[1:2] == ["run"]:
+        option = 2
+        while option < len(command) and command[option] in {"--quiet", "-q"}:
+            option += 1
+        if command[option:option + 1] == ["--script"]:
+            return "python"
     return None
 
 
@@ -287,10 +308,13 @@ def script_imports(text, language):
     if not pattern:
         return []
     imports = []
+    line = 1
+    previous_start = 0
     for match in re.finditer(pattern, text, flags=re.MULTILINE):
-        imports.append(
-            {"module": match.group(1), "line": text.count("\n", 0, match.start()) + 1}
-        )
+        start = match.start()
+        line += text.count("\n", previous_start, start)
+        previous_start = start
+        imports.append({"module": match.group(1), "line": line})
     return imports
 
 
@@ -301,15 +325,38 @@ def manifest_facts(path, text):
         if name == "pyproject.toml":
             document = tomllib.loads(text)
             project = document.get("project", {})
-            facts["requires_python"] = project.get("requires-python")
-            facts["dependencies"] = sorted(project.get("dependencies", []))
+            if not isinstance(project, dict):
+                facts["parse_error"] = "pyproject.toml field 'project' must be a table"
+                return facts
+            dependencies = project.get("dependencies", [])
+            if not isinstance(dependencies, list) or any(
+                not isinstance(dependency, str) for dependency in dependencies
+            ):
+                facts["parse_error"] = "pyproject.toml field 'project.dependencies' must be an array of strings"
+                return facts
             scripts = project.get("scripts", {})
+            if not isinstance(scripts, dict):
+                facts["parse_error"] = "pyproject.toml field 'project.scripts' must be a table"
+                return facts
+            facts["requires_python"] = project.get("requires-python")
+            facts["dependencies"] = sorted(dependencies)
             facts["commands"] = [
                 {"name": key, "command": value}
                 for key, value in sorted(scripts.items())
             ]
         elif name == "package.json":
             document = json.loads(text)
+            if not isinstance(document, dict):
+                facts["parse_error"] = "package.json must contain a JSON object"
+                return facts
+            for field in ("dependencies", "devDependencies", "scripts"):
+                if field in document and not isinstance(document[field], dict):
+                    facts["parse_error"] = f"package.json field '{field}' must be an object"
+                    return facts
+            binaries = document.get("bin", {})
+            if not isinstance(binaries, (dict, str)):
+                facts["parse_error"] = "package.json field 'bin' must be an object or string"
+                return facts
             dependencies = {
                 **document.get("dependencies", {}),
                 **document.get("devDependencies", {}),
@@ -319,7 +366,6 @@ def manifest_facts(path, text):
                 {"name": key, "command": value}
                 for key, value in sorted(document.get("scripts", {}).items())
             ]
-            binaries = document.get("bin", {})
             if isinstance(binaries, str):
                 binaries = {document.get("name", "package"): binaries}
             facts["entrypoints"] = [
@@ -328,8 +374,15 @@ def manifest_facts(path, text):
             ]
         elif name == "Cargo.toml":
             document = tomllib.loads(text)
-            facts["dependencies"] = sorted(document.get("dependencies", {}))
+            dependencies = document.get("dependencies", {})
+            if not isinstance(dependencies, dict):
+                facts["parse_error"] = "Cargo.toml field 'dependencies' must be a table"
+                return facts
             package = document.get("package", {})
+            if not isinstance(package, dict):
+                facts["parse_error"] = "Cargo.toml field 'package' must be a table"
+                return facts
+            facts["dependencies"] = sorted(dependencies)
             facts["package"] = package.get("name")
         elif name == "go.mod":
             match = re.search(r"^module\s+(\S+)", text, flags=re.MULTILINE)
@@ -372,7 +425,9 @@ def parse_facts(path, data, kind, max_bytes):
 
 
 def cached_facts(connection, path, data, kind, digest, max_bytes, use_cache):
-    cache_digest = hashlib.sha256(f"{path}\0{digest}\0{max_bytes}".encode()).hexdigest()
+    cache_digest = hashlib.sha256(
+        f"{path}\0{kind}\0{digest}\0{max_bytes}".encode()
+    ).hexdigest()
     if use_cache:
         row = connection.execute(
             "SELECT facts_json FROM facts WHERE digest = ? AND parser_version = ?",
@@ -396,20 +451,38 @@ def cached_facts(connection, path, data, kind, digest, max_bytes, use_cache):
 def build_map(root, scopes, max_bytes, use_cache):
     paths = [path for path in visible_files(root) if in_scope(path, scopes)]
     workers = min(32, (os.cpu_count() or 1) + 4)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        loaded = list(pool.map(lambda path: read_file(root, path), paths))
     connection = cache_database() if use_cache else None
     files = []
-    for path, data, kind, digest in loaded:
-        facts = cached_facts(connection, path, data, kind, digest, max_bytes, use_cache)
-        files.append(
-            {"path": path, "kind": kind, "bytes": len(data), "sha256": digest, **facts}
-        )
-    if connection:
-        connection.commit()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for start in range(0, len(paths), workers):
+                batch = paths[start : start + workers]
+                for path, data, kind, digest in pool.map(
+                    lambda path: read_file(root, path), batch
+                ):
+                    facts = cached_facts(
+                        connection, path, data, kind, digest, max_bytes, use_cache
+                    )
+                    files.append(
+                        {
+                            "path": path,
+                            "kind": kind,
+                            "bytes": len(data),
+                            "sha256": digest,
+                            **facts,
+                        }
+                    )
+                    del data
+        if connection:
+            connection.commit()
+    finally:
+        if connection:
+            connection.close()
     tree_hash = hashlib.sha256()
     for item in files:
         tree_hash.update(item["path"].encode())
+        tree_hash.update(b"\0")
+        tree_hash.update(item["kind"].encode())
         tree_hash.update(b"\0")
         tree_hash.update(item["sha256"].encode())
         tree_hash.update(b"\0")

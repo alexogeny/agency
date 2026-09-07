@@ -123,15 +123,57 @@ class WebResearchTests(unittest.TestCase):
             "firefox",
             r'''
             #!/usr/bin/env bun
-            import { appendFileSync } from "node:fs";
+            import { appendFileSync, readFileSync } from "node:fs";
+            import { connect } from "node:net";
 
             const port = Number(Bun.argv[Bun.argv.indexOf("--remote-debugging-port") + 1]);
+            const profile = Bun.argv[Bun.argv.indexOf("--profile") + 1];
             if (process.env.FAKE_LAUNCH_MARKER) {
               appendFileSync(process.env.FAKE_LAUNCH_MARKER, "launch\n");
             }
             if (process.env.FAKE_PROFILE_MARKER) {
-              const profile = Bun.argv[Bun.argv.indexOf("--profile") + 1];
               appendFileSync(process.env.FAKE_PROFILE_MARKER, profile + "\n");
+            }
+            if (process.env.FAKE_PROXY_CONNECT_TARGET) {
+              const preferences = readFileSync(`${profile}/user.js`, "utf8");
+              const proxyPort = Number(
+                preferences.match(/network\.proxy\.ssl_port", (\d+)/)?.[1],
+              );
+              await new Promise((resolve, reject) => {
+                const socket = connect({ host: "127.0.0.1", port: proxyPort }, () => {
+                  socket.write(
+                    `CONNECT ${process.env.FAKE_PROXY_CONNECT_TARGET} HTTP/1.1\r\n` +
+                    `Host: ${process.env.FAKE_PROXY_CONNECT_TARGET}\r\n\r\n`,
+                  );
+                });
+                let response = "";
+                const timer = setTimeout(() => {
+                  socket.destroy();
+                  reject(new Error("proxy CONNECT probe timed out"));
+                }, 2000);
+                socket.on("data", chunk => {
+                  response += String(chunk);
+                  if (!response.includes("\r\n\r\n")) return;
+                  clearTimeout(timer);
+                  socket.destroy();
+                  if (response.startsWith("HTTP/1.1 200 ")) resolve();
+                  else {
+                    reject(
+                      new Error(`proxy CONNECT probe failed: ${response.split("\r\n")[0]}`),
+                    );
+                  }
+                });
+                socket.once("error", error => {
+                  clearTimeout(timer);
+                  reject(error);
+                });
+                socket.once("close", () => {
+                  if (!response.includes("\r\n\r\n")) {
+                    clearTimeout(timer);
+                    reject(new Error("proxy CONNECT probe closed without a response"));
+                  }
+                });
+              });
             }
             let currentUrl = "about:blank";
             let remainingNavigationTimeouts = Number(process.env.FAKE_NAV_TIMEOUTS || "0");
@@ -1314,6 +1356,60 @@ class WebResearchTests(unittest.TestCase):
         page = json.loads(result.stdout)
         self.assertIn("Hydrated evidence", page["text"])
         self.assertIn("Open shadow-root evidence", page["text"])
+
+    def test_proxy_falls_back_across_resolved_addresses(self):
+        self.fake_firefox()
+        environment = self.environment()
+        with rendered_fixture_server() as origin:
+            port = origin.rsplit(":", 1)[1].rstrip("/")
+            environment["FAKE_PROXY_CONNECT_TARGET"] = (
+                f"localhost.localdomain:{port}"
+            )
+            result = self.run_tool(
+                "scrape",
+                "https://evidence.example/page",
+                "--format",
+                "json",
+                "--wait-ms",
+                "0",
+                "--settle-ms",
+                "0",
+                "--profile",
+                "resolved-address-fallback-fixture",
+                "--allow-private",
+                check=False,
+                environment=environment,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Repeated evidence block", json.loads(result.stdout)["text"])
+
+    def test_proxy_does_not_leak_connection_error_stacks(self):
+        self.fake_firefox()
+        environment = self.environment()
+        with rendered_fixture_server() as origin:
+            port = origin.rsplit(":", 1)[1].rstrip("/")
+        environment["FAKE_PROXY_CONNECT_TARGET"] = f"localhost.localdomain:{port}"
+
+        result = self.run_tool(
+            "scrape",
+            "https://evidence.example/page",
+            "--format",
+            "json",
+            "--wait-ms",
+            "0",
+            "--settle-ms",
+            "0",
+            "--profile",
+            "quiet-proxy-failure-fixture",
+            "--allow-private",
+            check=False,
+            environment=environment,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("ECONNREFUSED", result.stderr)
+        self.assertIn("Firefox exited before its local control socket", result.stderr)
 
     def test_real_firefox_extracts_generic_job_cards(self):
         environment = self.environment(fake_firefox=False)
