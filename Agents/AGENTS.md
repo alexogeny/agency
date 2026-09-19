@@ -64,6 +64,14 @@ Claude Code, and Pi.
   repository work. Claim the narrowest write scope; reads never need a claim.
   Heartbeat long work and close with changed paths and concrete checks.
 - Use `repo-map` before broad exploration of an unfamiliar repository.
+- Use `decision-routing` and `agency-decide` for repeated or ambiguous semantic
+  classification of optional skills, retrieved passages, research evidence, or
+  agent updates when OpenRouter is configured and the input may be sent there.
+  Skip calls that explicit instructions, exact rules, or ordinary judgment
+  already resolve. Jev returns advisory labels; it never grants permission,
+  removes mandatory context, proves correctness, or overrides a failed check.
+  Treat it as System One: small inputs and immediate recognition. Keep
+  multi-step reasoning, planning, and ambiguous decisions with the reasoning agent.
 - Use Agency's web tool by default for substantive, source-sensitive,
   JavaScript-heavy, authenticated, or audit-sensitive web research. Use native
   search for quick lookups or when Agency's tool is unavailable. Never automate

@@ -109,6 +109,8 @@ agency_plan_user_links() {
   local tool skill_dir skill_name
   local -a tools=(
     agency-ui
+    agency-decide
+    agency-decide-mcp
     git-get
     long-processes
     sandbox
@@ -154,6 +156,8 @@ agency_plan_user_links() {
   agency_plan_hook_merge "$AGENCY_DIR/config/codex/hooks.json" "$HOME/.codex/hooks.json"
   agency_plan_hook_merge "$AGENCY_DIR/config/claude/hooks.json" "$HOME/.claude/settings.json"
   printf '  [%-16s] agency-web MCP for Codex and Claude Code\n' "register tool"
+  printf '  [%-16s] agency-decide MCP for Codex and Claude Code\n' "register tool"
+  printf '  [%-16s] discover OpenRouter secret reference after 1Password setup; missing keys are reported\n' "optional setup"
 }
 
 agency_plan_power() {

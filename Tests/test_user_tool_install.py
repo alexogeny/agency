@@ -190,7 +190,7 @@ class UserToolInstallTests(unittest.TestCase):
             ["rustup toolchain list", "rustup default stable"],
         )
 
-    def test_agent_web_tool_is_registered_when_missing(self):
+    def test_agent_tools_are_registered_when_missing(self):
         for name in ("codex", "claude"):
             self.executable(
                 name,
@@ -211,10 +211,12 @@ class UserToolInstallTests(unittest.TestCase):
             [
                 f"codex mcp add agency-web -- {self.workspace}/home/.local/bin/web-research-mcp",
                 f"claude mcp add --scope user agency-web -- {self.workspace}/home/.local/bin/web-research-mcp",
+                f"codex mcp add agency-decide -- {self.workspace}/home/.local/bin/agency-decide-mcp",
+                f"claude mcp add --scope user agency-decide -- {self.workspace}/home/.local/bin/agency-decide-mcp",
             ],
         )
 
-    def test_existing_agent_web_registration_is_preserved(self):
+    def test_existing_agent_registrations_are_preserved(self):
         for name in ("codex", "claude"):
             self.executable(
                 name,
@@ -232,6 +234,7 @@ class UserToolInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.log.exists())
         self.assertIn("existing agency-web", result.stdout)
+        self.assertIn("existing agency-decide", result.stdout)
 
 
 if __name__ == "__main__":

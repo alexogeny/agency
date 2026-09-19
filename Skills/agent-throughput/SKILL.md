@@ -43,6 +43,12 @@ For concurrent or durable work, use [`coordinate`](../coordinate/SKILL.md) for
 claims, scratch space, heartbeats, and handoffs. Do not reproduce those
 mechanics here or invoke coordination for a single ordinary task.
 
+For repeated semantic classification before a handoff, use
+[`decision-routing`](../decision-routing/SKILL.md) when OpenRouter is configured.
+Jev can suggest a listed skill, classify a candidate passage, or label an update.
+It does not choose a coding model or effort level, authorize work, or certify
+completion. Keep direct task instructions and deterministic checks authoritative.
+
 ## Compare only when it can change routing
 
 Run a comparison when selecting a repeated workflow or when a second pass is
