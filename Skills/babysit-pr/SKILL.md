@@ -26,8 +26,9 @@ supervision; otherwise stop before the first unauthorised mutation.
   metadata.
 - Never force-push, merge the PR, rewrite published commits, or change its base
   without explicit permission.
-- Prefer HTTPS authenticated by `gh` when an SSH remote would request an
-  interactive key passphrase.
+- Use `gh` for GitHub authentication, repository and PR inspection, PR writes,
+  and CI supervision. Use Git for local history and HTTPS transfers authenticated
+  by `gh`; do not try an SSH remote first.
 - Report skipped checks, warnings, partial inspection, authentication failures,
   and unavailable services accurately.
 
@@ -38,23 +39,32 @@ and documented validation commands. Determine the repository, remote, default
 branch, current branch, and whether a matching open PR already exists; never
 assume the checked-out branch owns the intended PR.
 
-Inspect authentication before refreshing so a password-protected SSH key does
-not stall the workflow:
+Inspect the configured remote and human identity locally, then check GitHub CLI
+authentication before any fetch or push:
 
 ```sh
 git remote -v
 git config --get user.name
 git config --get user.email
-gh auth status
+gh auth status --hostname github.com
 gh repo view --json nameWithOwner,defaultBranchRef
 ```
 
-Then refresh and inspect with the repository's actual remote names. If SSH
-would prompt for a key passphrase, use the HTTPS fetch below in place of
-`git fetch --all --prune`:
+For GitHub, use the verified `OWNER/REPO` and actual remote name to refresh over
+HTTPS with the `gh` credential helper from the outset, even when the saved
+remote uses SSH. Repeat for each relevant GitHub remote. These command-local
+options leave the user's remote and credential configuration unchanged:
 
 ```sh
-git fetch --all --prune
+git -c credential.helper= \
+  -c credential.helper='!gh auth git-credential' \
+  fetch --prune https://github.com/OWNER/REPO.git \
+  '+refs/heads/*:refs/remotes/REMOTE/*'
+```
+
+Then inspect the refreshed checkout and forge:
+
+```sh
 git status --short
 git diff --stat
 git diff --check
@@ -68,20 +78,10 @@ binary or generated files rather than treating a summary as a review. Query an
 existing PR with `gh pr view` and match its repository, author, head, base, and
 conversation context.
 
-When SSH requires an interactive passphrase, obtain `OWNER/REPO` from the
-verified remote or `gh repo view`, then fetch the relevant remote through GitHub
-CLI authentication:
-
-```sh
-git -c credential.helper= \
-  -c credential.helper='!gh auth git-credential' \
-  fetch --prune https://github.com/OWNER/REPO.git \
-  '+refs/heads/*:refs/remotes/REMOTE/*'
-```
-
-Do not expose credentials or credential-helper output. If the repository is not
-hosted on GitHub, use its configured forge and authentication flow instead of
-pretending `gh` applies.
+If `gh` authentication is unavailable, report that blocker without falling back
+to SSH or printing credentials. Never print token or credential-helper output.
+For GitHub Enterprise, use the verified host in both `gh` and HTTPS commands.
+For another forge, use its configured authentication flow instead of `gh`.
 
 ## Validate the proposed change
 
@@ -127,9 +127,8 @@ trailers before pushing.
 
 ## Push and create or update the PR
 
-Prefer the configured remote when it is non-interactive. When SSH would request
-a key passphrase, push through `gh` authentication without changing the user's
-stored remote:
+Push through the same GitHub CLI authentication path used for fetch, without
+changing the stored remote:
 
 ```sh
 git -c credential.helper= \
