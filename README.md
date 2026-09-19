@@ -213,6 +213,23 @@ decision arises. Concurrent or durable work continues through
 [`coordinate`](Skills/coordinate/SKILL.md); ordinary coding does not activate
 either workflow merely because an agent performs it.
 
+For small semantic decisions, [`decision-routing`](Skills/decision-routing/SKILL.md)
+uses Jev through OpenRouter's Decisions API. `agency-decide` classifies skill
+suggestions, candidate context, evidence relationships, and agent updates with
+versioned rubrics and typed probabilities. The same interface is available as
+an MCP tool for Codex and Claude Code. Results are advisory; explicit instructions,
+permissions, required context, and check results retain authority.
+
+Jev supplies System One recognition: a small input and a bounded immediate
+judgment. The reasoning agent supplies System Two: investigation, planning,
+and handling ambiguity. Exact rules run first; classification is useful only
+for the remaining semantic choice. Low-confidence or unclear decisions stay
+with the reasoning agent, and no universal automation threshold is assumed.
+
+The installer discovers the OpenRouter **API Key** field through 1Password and
+saves only its secret reference. See [`agency-decide`](Tools/README.md#agency-decide)
+for setup and the supported command interface.
+
 ### Stamp out repository plumbing
 
 The [`setup-repository`](Skills/setup-repository/SKILL.md) skill turns Agency's

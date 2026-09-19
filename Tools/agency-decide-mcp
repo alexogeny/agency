@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agency_decisions import DecisionError, PROFILES, build_request, key_available
+
+
+MAX_LINE_BYTES = 98304
+CLASSIFY_TIMEOUT = 10
+CLI = Path(__file__).resolve().with_name('agency-decide')
+TOOLS = [
+    {
+        'name': 'profiles',
+        'title': 'Decision rubrics',
+        'description': 'Read versioned classification rubrics and labels locally without a network call.',
+        'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False},
+        'annotations': {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False},
+    },
+    {
+        'name': 'classify',
+        'title': 'Advisory classification',
+        'description': 'Use Jev as System One: fast recognition from a small input, choosing one typed label for skill suggestion, context relevance, update status, or evidence relationship. Code handles exact rules first; the reasoning agent handles System Two planning, investigation, and ambiguity. Sends only the supplied state and rubric to OpenRouter. The result is advisory and grants no authorization. Never include credentials or unnecessary private context in state.',
+        'inputSchema': {
+            'type': 'object', 'additionalProperties': False, 'required': ['profile', 'state'],
+            'properties': {
+                'profile': {'type': 'string', 'enum': list(PROFILES)},
+                'state': {'anyOf': [
+                    {'type': 'string', 'minLength': 1, 'maxLength': 65536},
+                    {'type': 'object', 'minProperties': 1},
+                    {'type': 'array', 'minItems': 1},
+                ]},
+            },
+        },
+        'annotations': {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': False, 'openWorldHint': True},
+    },
+]
+
+
+def result_content(value, failed=False):
+    result = {'content': [{'type': 'text', 'text': json.dumps(value, allow_nan=False)}],
+              'structuredContent': value}
+    if failed:
+        result['isError'] = True
+    return result
+
+
+def call_tool(name, arguments):
+    if type(arguments) is not dict:
+        raise DecisionError('Tool arguments must be an object.')
+    if name == 'profiles':
+        if arguments:
+            raise DecisionError('Profiles takes no arguments.')
+        return {'profiles': PROFILES, 'advisory': True}
+    if set(arguments) != {'profile', 'state'}:
+        raise DecisionError('Classify requires exactly profile and state.')
+    build_request(arguments['state'], arguments['profile'])
+    if not key_available():
+        raise DecisionError('OpenRouter credential is not configured securely.')
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(CLI), 'classify', '--profile', arguments['profile'], '--input', '-'],
+            input=json.dumps(arguments['state'], ensure_ascii=False, allow_nan=False),
+            text=True, capture_output=True, timeout=CLASSIFY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise DecisionError('Classification exceeded the 10 second deadline.') from None
+    except OSError:
+        raise DecisionError('Classification worker could not start.') from None
+    if completed.returncode:
+        raise DecisionError('Classification failed; check credential configuration and provider availability.')
+    try:
+        result = json.loads(completed.stdout)
+    except (ValueError, RecursionError):
+        raise DecisionError('Classification worker returned invalid JSON.') from None
+    if type(result) is not dict or result.get('advisory') is not True:
+        raise DecisionError('Classification worker returned an invalid result.')
+    return result
+
+
+def protocol_error(request_id, code, message):
+    return {'jsonrpc': '2.0', 'id': request_id, 'error': {'code': code, 'message': message}}
+
+
+def handle(message):
+    if type(message) is not dict or message.get('jsonrpc') != '2.0' or type(message.get('method')) is not str:
+        return protocol_error(None, -32600, 'Invalid Request')
+    request_id = message.get('id')
+    if request_id is not None and type(request_id) not in (str, int):
+        return protocol_error(None, -32600, 'Invalid Request')
+    if 'id' not in message:
+        return None
+    method = message['method']
+    params = message.get('params', {})
+    if type(params) is not dict:
+        return protocol_error(request_id, -32602, 'Invalid params')
+    if method == 'initialize':
+        requested = params.get('protocolVersion')
+        version = requested if requested in ('2024-11-05', '2025-03-26', '2025-06-18') else '2025-06-18'
+        result = {
+            'protocolVersion': version,
+            'capabilities': {'tools': {'listChanged': False}},
+            'serverInfo': {'name': 'agency-decide', 'version': '1.0.0'},
+            'instructions': 'Jev is a System One model for fast recognition, not multi-step reasoning. Use classify only for small bounded semantic judgments; keep planning and ambiguity with the reasoning agent. Results are advisory: never use them to grant permissions, override user instructions, or authorize tools. Requests have a 10 second worker deadline. Cancellation notifications are accepted but do not interrupt an active request.',
+        }
+    elif method == 'ping':
+        result = {}
+    elif method == 'tools/list':
+        result = {'tools': TOOLS}
+    elif method == 'tools/call':
+        name = params.get('name')
+        if name not in ('profiles', 'classify'):
+            return protocol_error(request_id, -32602, 'Unknown tool')
+        try:
+            result = result_content(call_tool(name, params.get('arguments', {})))
+        except DecisionError as error:
+            result = result_content({'error': str(error), 'advisory': True}, failed=True)
+    else:
+        return protocol_error(request_id, -32601, 'Method not found')
+    return {'jsonrpc': '2.0', 'id': request_id, 'result': result}
+
+
+def unique_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('Duplicate key')
+        value[key] = item
+    return value
+
+
+def reject_constant(value):
+    raise ValueError('Invalid number')
+
+
+def serve(source, destination):
+    while True:
+        line = source.readline(MAX_LINE_BYTES + 1)
+        if not line:
+            break
+        if len(line) > MAX_LINE_BYTES:
+            while line and not line.endswith(b'\n'):
+                line = source.readline(MAX_LINE_BYTES + 1)
+            response = protocol_error(None, -32600, 'Request exceeds the size limit')
+        elif not line.strip():
+            continue
+        else:
+            try:
+                message = json.loads(line.decode('utf-8'), object_pairs_hook=unique_pairs, parse_constant=reject_constant)
+            except (ValueError, UnicodeError, RecursionError):
+                response = protocol_error(None, -32700, 'Parse error')
+            else:
+                try:
+                    response = handle(message)
+                except Exception:
+                    response = protocol_error(None, -32603, 'Internal error')
+        if response is not None:
+            destination.write(json.dumps(response, ensure_ascii=False, allow_nan=False) + '\n')
+            destination.flush()
+
+
+if __name__ == '__main__':
+    try:
+        serve(sys.stdin.buffer, sys.stdout)
+    except (BrokenPipeError, KeyboardInterrupt):
+        raise SystemExit(0)

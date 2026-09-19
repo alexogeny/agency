@@ -4,6 +4,72 @@ Reusable, machine-agnostic utilities graduate here from `~/Scratch` once they
 are useful beyond a single task. Each tool should be documented and independently
 runnable; transient experiments stay out of this directory.
 
+## `agency-decide`
+
+Uses Jev as Agency's System One model: fast recognition from a small input,
+with a fixed answer space. Code handles exact rules; the reasoning agent handles
+planning, investigation, and ambiguity. Four versioned rubrics cover skill
+suggestions, candidate context, agent updates, and evidence relationships.
+
+```sh
+agency-decide setup --interactive
+agency-decide doctor
+agency-decide profiles
+printf '%s\n' '{"task":"Check that the README commands execute as documented."}' |
+  agency-decide classify --profile skill --input - --dry-run
+```
+
+For setup, add a concealed field named **API Key** to the 1Password item titled
+**OpenRouter**. Setup finds exactly one matching item and field and saves only
+its ID-based `op://` reference in
+`${XDG_CONFIG_HOME:-~/.config}/agency/openrouter.json`, with mode `0600`.
+The field may initially be empty; classification reports when the key still
+needs to be added. Setup never edits the vault. Item values returned during
+metadata discovery remain in process memory and are never logged or persisted.
+Ambiguous matches require correction rather than guessing.
+
+The installer calls prompt-free setup after installing 1Password. Missing or
+locked access is reported without blocking installation. `setup --interactive`
+permits normal desktop authorization; `setup --dry-run` performs no vault access
+or writes. Existing configuration is preserved on reruns.
+
+The runtime resolves the saved reference through `op read` only when making a
+classification. `OPENROUTER_API_KEY` is an optional process-environment override
+for automation. `doctor` reports local configuration without resolving a vault
+secret or contacting OpenRouter. `credential_verified` means local syntax
+validation for an environment override; it does not mean provider authentication.
+Never put credentials in command arguments, agent configuration, or this repository.
+
+Remove `--dry-run` to send the displayed request to OpenRouter's dedicated
+`POST /api/alpha/decisions` endpoint using `typesafe/jev-1.13`. Input may be UTF-8
+text or a JSON object/array/string, from a file or standard input. The result
+contains a label, full probability distribution, optional confidence, actual
+model ID, rubric version, usage, and request latency. Missing confidence stays
+null. See [`decision-routing`](../Skills/decision-routing/SKILL.md) for the state
+shapes and how to use the outputs.
+
+`agency_decisions.py` is the shared implementation behind the CLI and MCP
+adapter. It stays beside the executable when installed by symlink. Requests use
+one fixed HTTPS endpoint, refuse redirects, disable environment proxies, bound
+input and response sizes, and do not retry automatically. The CLI uses a
+10-second socket timeout, not a total elapsed deadline. Invalid results remain
+errors; CLI failures exit 2 with JSON diagnostics on stderr. No classification
+executes an action or supplies permission.
+
+## `agency-decide-mcp`
+
+Exposes `profiles` and `classify` through newline-delimited stdio MCP, using the
+same implementation and credentials as the CLI. The installer registers
+`agency-decide` for Codex and Claude Code while preserving existing registrations.
+Restart the client to discover newly registered tools. Pi and shell workflows
+can use `agency-decide` directly.
+
+Classification workers have a hard 10-second deadline and are killed and reaped
+on timeout. Cancellation notifications do not interrupt an active request before
+that deadline. Provider failures are tool errors, never manufactured predictions.
+Only the supplied state and selected rubric are sent to OpenRouter; private
+profiles and transcript history are not automatically included.
+
 ## `agency-ui`
 
 Renders phased terminal work with a soft pink-and-purple palette and a bounded

@@ -71,6 +71,8 @@ mkdir -p \
   "$HOME/.pi/agent/extensions"
 mkdir -p "$HOME/.local/bin"
 agency_link "$AGENCY_DIR/Tools/agency-ui" "$HOME/.local/bin/agency-ui"
+agency_link "$AGENCY_DIR/Tools/agency-decide" "$HOME/.local/bin/agency-decide"
+agency_link "$AGENCY_DIR/Tools/agency-decide-mcp" "$HOME/.local/bin/agency-decide-mcp"
 agency_link "$AGENCY_DIR/Tools/git-get" "$HOME/.local/bin/git-get"
 agency_link "$AGENCY_DIR/Tools/long-processes" "$HOME/.local/bin/long-processes"
 agency_link "$AGENCY_DIR/Tools/sandbox" "$HOME/.local/bin/sandbox"
@@ -170,5 +172,6 @@ agency_as_root systemctl restart scx_loader.service
 agency_as_root systemctl enable --now fstrim.timer
 
 "$AGENCY_DIR/scripts/install-1password.sh" "${update_arguments[@]}"
+"$AGENCY_DIR/scripts/configure-openrouter.sh"
 
 printf '\n\033[1;35m✨ Workstation bootstrap complete. Restart Firefox to apply policy.\033[0m\n'
