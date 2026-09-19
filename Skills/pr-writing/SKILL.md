@@ -5,94 +5,57 @@ description: Research and write or revise a pull-request title and body from the
 
 # Write a pull request
 
-Create a reviewer-facing map of the change, not a transcript of how it was
-built and not a restatement of the diff.
+## Establish the evidence
 
-## Establish the change
+Refresh remote state using the authenticated GitHub flow in
+[babysit-pr](../babysit-pr/SKILL.md). Identify an existing PR by repository,
+author, head, base, and conversation; do not assume the checkout owns it.
+Read repository guidance and the PR template, then inspect the exact head/base
+range: commits, meaningful source changes, tests, docs, compatibility surfaces,
+and retained measurements. State whether the description covers committed
+content or also uncommitted work.
 
-1. Refresh remote state before inspecting branches or pull requests. If the
-   request concerns an existing or live PR, query the forge first and identify
-   it from repository, author, head, base, and conversation context; do not
-   assume the checked-out branch owns it.
-2. Read repository guidance and any PR template. Establish the exact head/base
-   range, then inspect the commit subjects and bodies, diff summary, meaningful
-   source changes, tests, documentation, compatibility surface, and retained
-   measurements.
-3. Preserve unrelated work. Distinguish committed branch content from local
-   uncommitted changes and say which one the body describes.
+Ground claims in the implementation and verification. Commit titles and prior
+agent narratives cannot establish intent or behaviour.
 
-Every claim must be grounded in the range. If the title or commits undersell,
-overstate, or misdescribe the diff, follow the implementation and verified
-behaviour instead. Do not infer design intent from comments or previous agent
-narratives.
+## Group verified impact
 
-## Compose for review
+Use [decision-routing](../decision-routing/SKILL.md) with `pr-writing/impact`
+when several changes need grouping by audience. Supply one verified behaviour
+change per item. Use compatibility, user, operator, developer, and internal
+labels to organize the description. Verify compatibility candidates against
+supported interfaces; labels do not establish breakage or select versions.
+For uncertain draft claims, use `research` against relevant diff or check
+evidence before retaining them.
 
-Scale the body to the change and omit empty sections. A substantial PR often
-benefits from:
+## Write for the reviewer
 
-- **Summary:** the outcome and scope in one short paragraph or a few cohesive
-  bullets.
-- **Why:** the concrete problem, missing boundary, or measured cost that made
-  the change necessary. Explain the problem rather than narrating the patch.
-- **Main changes:** groups organised by behaviour or subsystem, not a file dump.
-- **Compatibility and failure modes:** defaults, migrations, refusal paths,
-  security boundaries, and operational consequences reviewers must verify.
-- **Measured result:** exact retained measurements with baseline, workload,
-  units, controls, and caveats. Never manufacture a benchmark narrative from a
-  code-level optimisation claim.
-- **Review guide:** a short ordered path through the riskiest or most important
-  code, with what to examine at each stop.
-- **Quick test:** the shortest copy-paste command or manual path that lets a
-  reviewer observe the changed behaviour, followed by the expected result.
-- **Verification:** commands or CI checks actually run and their outcomes.
-  Distinguish passed, failed, skipped, unavailable, and not run.
+Follow repository title conventions; use a concrete verb naming the dominant
+outcome. Lead the body with the problem and resulting behaviour, using a
+before/after example when useful. Scale to complexity: a small PR needs only
+a short explanation and verification. For larger changes, include only useful
+sections covering:
 
-Small changes may need only Summary and Verification. Do not bury the point
-under generated inventories, exhaustive test filenames, raw commit lists,
-diff statistics, or boilerplate. Include them only when they materially help a
-reviewer understand scope or confidence.
+- Behaviour or subsystem changes, grouped by purpose.
+- Compatibility, migrations, refusal paths, and operational consequences.
+- Measured results with baseline, workload, units, controls, and caveats.
+- A short review path through consequential code and what to inspect.
+- Checks actually run, distinguishing passes, failures, skips, and unavailable
+  checks.
+
+Omit empty sections, file inventories, raw commit lists, and generic prose.
+Write the final implementation, not a development diary. Keep abandoned
+approaches only when they explain a trade-off.
 
 ## Make reproduction cheap
 
-When the change can be exercised directly, include this compact block near
-Verification:
+Include the smallest useful command or manual path and its observable expected
+result. Add prerequisites only beyond normal repository setup; name environment
+variables without values. Prefer deterministic fixtures. For regressions, state
+what fails before and passes after. If reproduction is blocked, name the blocker.
+Full suites belong after the quick check.
 
-````markdown
-### Quick test
-
-```sh
-exact command
-```
-
-Expected: one observable result.
-````
-
-Optimise for time to first signal: lead with the smallest useful check and put
-full suites later in Verification. Add one prerequisite line only when a clean
-checkout and the repository's normal setup are insufficient. Name required
-environment variables without values, use a small deterministic input or
-fixture, and prefer one useful path over a testing catalogue. For a regression,
-say what fails before the change and passes after it. If no honest reproduction
-is available, state the exact blocker instead of giving vague instructions.
-
-## Title and voice
-
-Follow the repository's title convention. Name the dominant user-visible or
-architectural outcome with a concrete verb; do not join unrelated commit titles
-or append vague scope such as “updates” or “improvements.”
-
-Lead with the result. Use plain, specific, active language. Keep one idea per
-dense sentence, repeat the clearest term, vary rhythm naturally, and state
-uncertainty or tradeoffs directly. Cut puffery, promotional claims, canned
-phrases, vague attribution, generic conclusions, unnecessary headings,
-decorative emoji, and implementation explanations a reviewer can read in the
-diff. Remove any sentence that could describe an arbitrary pull request.
-
-Never add or check an authorship declaration, co-authorship trailer, generation
-notice, tool attribution, signature, or certification on the user's behalf.
-Preserve required template text but leave personal attestations for the user.
-
-Return a ready-to-paste title and body, plus any unresolved factual gaps. Do not
-create or edit the forge PR unless the user explicitly asks for that external
-mutation.
+Return a ready-to-paste title and body plus unresolved factual gaps. Preserve
+required template text, but leave personal attestations unchecked for the user.
+Never add authorship declarations, signatures, or tool attribution. Create or
+edit the forge PR only when the request authorizes that action.

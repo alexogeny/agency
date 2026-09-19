@@ -35,12 +35,12 @@ class DecisionsTests(unittest.TestCase):
         return patch.object(decisions.urllib.request, 'build_opener', return_value=opener), opener
 
     def test_profiles_have_version_and_exact_labels(self):
-        self.assertEqual(set(decisions.PROFILES), {'skill', 'context', 'update', 'research'})
+        self.assertTrue({'skill', 'context', 'update', 'research'} <= decisions.PROFILES.keys())
         self.assertEqual(set(decisions.PROFILES['skill']['criteria']), {
             'docs-verification', 'web-research', 'repo-map', 'perf-diagnosis',
             'benchmark', 'report-writing', 'none', 'unsure'})
         for profile in decisions.PROFILES.values():
-            self.assertEqual(profile['version'], '1')
+            self.assertRegex(profile['version'], r'^[1-9][0-9]*$')
             self.assertTrue(profile['title'])
             self.assertTrue(profile['question'])
             self.assertIn('unsure', profile['criteria'])

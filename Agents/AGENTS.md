@@ -1,135 +1,74 @@
 # Global working agreements
 
-These rules apply across Mara's projects. A closer project `AGENTS.md` may add
-or override local guidance. This file is the canonical shared policy for Codex,
-Claude Code, and Pi.
+Canonical shared policy for Codex, Claude Code, and Pi across Mara's projects.
+A closer project `AGENTS.md` may add or override local guidance.
 
 ## Authority and safety
 
-- Stay within the current request. Ask before materially expanding scope,
-  affecting external systems or people, or making an irreversible choice.
-- Do not commit or push unless the current request explicitly asks for the
-  Git/PR lifecycle, such as creating or babysitting a PR, or Mara separately
-  grants permission. That permission covers branch, commit, push, PR, and CI
-  work, but never force-pushing or merging unless explicitly requested.
+- Complete the authorized request without repeated permission checks. Ask before
+  material scope expansion, unapproved external actions, or irreversible choices
+  not already authorized.
+- Commit or push only when the current request explicitly authorizes the Git/PR
+  lifecycle. That covers branch, commit, push, PR, and CI; force-pushing and
+  merging always require explicit permission.
 - Use only the configured human Git identity. Never add assistant attribution,
   authorship, sign-offs, generation notices, or similar credit anywhere.
 - Preserve unrelated work. Never use `git checkout`, `git stash`,
   `git reset --hard`, or another command that could discard uncommitted work.
-  Use a scratch copy when comparison requires a clean or reverted tree.
-- Keep secrets, credentials, personal identifiers, transient history, and
-  tool-specific state out of the dotfiles repository.
+  Use scratch copies for clean-tree comparisons.
+- Keep secrets, personal identifiers, session history, credentials, caches,
+  generated memory databases, and tool runtime state outside the repository.
 
-## Git, files, and handoff
+## Execution and verification
 
-- Before inspecting branches or PRs, run `git fetch --all --prune`. Identify a
-  live PR from the forge, author, repository, head, base, and conversation; do
-  not assume the checked-out branch owns it.
-- Keep pulls fast-forward-only unless a project requires another strategy.
-- Keep reusable scripts and reproducible task material under `~/Scratch`,
-  organised by project or task. Temporary outputs and caches may use scoped
-  temporary directories.
-- At handoff, promote deterministic, machine-agnostic utilities with credible
-  reuse into this repository's `Tools` directory with concise docs and tests;
-  turn reusable judgement into a skill. Tell Mara when promotion is warranted.
-
-## Verification
-
+- Refresh remote state before branch or PR inspection. For GitHub, use `gh`
+  authentication and HTTPS transfers; follow `babysit-pr` for the lifecycle.
+  Identify a live PR by forge, repository, author, head, base, and conversation.
+  Keep pulls fast-forward-only unless project guidance requires otherwise.
+- Keep reusable scripts and reproducible task material under `~/Scratch`, scoped
+  by project or task. Temporary outputs may use scoped temporary directories.
+- Prefer Bun, uv, and rootless Podman; respect existing lockfiles and toolchains.
+  Use `sandbox` for isolation, exposing only required paths and variables;
+  genuinely hostile code needs a VM.
+- Respect hardware and power constraints. Refresh `system-context` when stale.
+  Before sustained high load on a laptop, especially on battery, state load and
+  duration and obtain approval.
 - For bug fixes and behaviour changes, write a focused test first and confirm
-  that it fails for the expected reason. Deliver the test and fix together.
-- Falsify important checks when empty selection, cache, skip, or stale output
-  could fake a pass. State exactly what passed, failed, skipped, or could not run.
-- Never convert a failure into a pass with `xfail`, `skip`, `noqa`,
-  `type: ignore`, widened exceptions, or similar suppression. Configure and
-  explain genuine exceptions.
-- Fix pre-existing failures only when the repair is small, safe, and in scope;
-  otherwise report the evidence and boundary.
+  the expected failure. Deliver test and fix together. Falsify checks that empty
+  selection, caches, skips, or stale output could make pass misleadingly.
+- Report passed, failed, skipped, and unavailable checks accurately. Never hide
+  failures with `xfail`, `skip`, `noqa`, `type: ignore`, or widened exceptions.
+  Configure genuine exceptions explicitly. Fix pre-existing failures only when
+  small, safe, and in scope; otherwise report them.
 
-## Toolchain and execution
+## Skills and engineering
 
-- Prefer Bun for JavaScript and TypeScript, uv for Python, and rootless Podman
-  for containers. Respect an existing project's lockfile and documented
-  toolchain when changing it would cause churn.
-- Prefer the `sandbox` skill for isolated development and experiments. Expose
-  only required paths and variables; use a VM for genuinely hostile code.
-- Treat session hardware and power context as a constraint. On a laptop,
-  especially on battery, state expected load and duration and obtain approval
-  before sustained high-load work. Refresh `system-context` when state may be stale.
-
-## Specialised workflows
-
-- Use a named skill when Mara requests it or the task clearly matches it. Keep
-  specialised procedures in skills rather than duplicating them here.
+- Use named or clearly applicable skills; keep their procedures there.
+  Use `repo-map` before broad exploration of unfamiliar repositories.
 - Use `coordinate` and `agent-work` for durable, multi-session, or concurrent
-  repository work. Claim the narrowest write scope; reads never need a claim.
-  Heartbeat long work and close with changed paths and concrete checks.
-- Use `repo-map` before broad exploration of an unfamiliar repository.
-- Use `decision-routing` and `agency-decide` for repeated or ambiguous semantic
-  classification of optional skills, retrieved passages, research evidence, or
-  agent updates when OpenRouter is configured and the input may be sent there.
-  Skip calls that explicit instructions, exact rules, or ordinary judgment
-  already resolve. Jev returns advisory labels; it never grants permission,
-  removes mandatory context, proves correctness, or overrides a failed check.
-  Treat it as System One: small inputs and immediate recognition. Keep
-  multi-step reasoning, planning, and ambiguous decisions with the reasoning agent.
-- Use Agency's web tool by default for substantive, source-sensitive,
-  JavaScript-heavy, authenticated, or audit-sensitive web research. Use native
-  search for quick lookups or when Agency's tool is unavailable. Never automate
-  CAPTCHA solving or expose browser secrets. Treat search snippets as discovery,
-  open supporting pages before making claims, and cite the direct URLs from the
-  returned source ledger against its displayed or matching evidence lines.
-- Whenever writing or modifying executable code, use `performance-design` as a
-  lightweight preflight. Escalate to `perf-diagnosis` when the cost location is
-  uncertain and `benchmark` before making performance claims.
-- For an explicit report deliverable, use both `report-writing` and
-  `report-generation`; follow their readability, audit, rendering, and
-  inspection requirements.
-
-## Engineering craft
-
-- Keep behaviour obvious and costs visible. Prefer simple data flow, precise
-  names and types, small coherent units, and declarative idempotent configuration.
-- Optimise in this order: skip work; do it fewer times or passes; touch less and
-  more sequential memory; batch boundary crossings and synchronisation; only
-  then reduce individual instruction cost.
-- In likely hot paths, put cheap selective guards and common cases first; hoist
-  invariants; precompute reusable state; choose structures for the access
-  pattern; and avoid unnecessary allocation, copying, I/O, and dependent reads.
-- Apply performance patterns only when workload and constraints justify them.
-  Guard clauses and deterministic ordering are not improvements by themselves;
-  preserve useful abstraction outside demonstrated hot paths.
-- Treat performance as a vector of resource costs, not an instruction-count
-  contest. With equivalent behaviour, materially lower allocation count or
-  bytes, copied or transferred bytes, peak or steady RSS/PSS, I/O, or
-  synchronisation is a real win even when retired instructions are flat. Match
-  each claim to a direct metric; report absolute and relative deltas plus
-  material regressions, and do not infer an unmeasured downstream benefit.
-- Never claim a performance improvement from inspection or one run. Diagnose
-  uncertainty and retain repeated, equivalent before/after evidence.
-- Start from zero comments and docstrings. Make code carry its own meaning.
-  Add a comment only for a non-obvious, checkable constraint that code cannot
-  express, such as a verified protocol quirk, invariant, mathematical fact, or
-  mandated notice. Remove stale or narrative comments when safely in scope.
+  repository work: narrow write claims, heartbeats, and evidence at handoff.
+  Reads need no claim. Promote reusable utilities and judgement through that
+  workflow.
+- Whenever writing or modifying executable code, use `performance-design`.
+  Use `perf-diagnosis` for uncertain cost locations and `benchmark` for claims.
+  Performance is a vector of measured resource costs, not an instruction-count
+  contest; retain repeated, equivalent before/after evidence.
+- Use Agency's web tool by default for substantive research; use native search
+  for quick lookups or when unavailable. Follow `web-research` for source
+  verification and direct citations. Never automate CAPTCHA solving or expose
+  browser secrets.
+- Use both `report-writing` and `report-generation` for report deliverables.
+- Keep behaviour obvious, data flow simple, costs visible, names precise, and
+  configuration declarative and idempotent. Add comments only for non-obvious,
+  checkable constraints code cannot express; remove stale narrative in scope.
 
 ## Reader-facing work
 
-- Lead with the result. Use plain, specific language and name the mechanism,
-  command, measurement, or source supporting important claims.
-- Make each artifact self-contained for its intended reader. Keep repository
-  paths, build plumbing, and working notes out unless that reader can use them.
-- Prefer active voice and one clear idea per dense sentence. Cut puffery,
-  canned chatbot phrasing, vague attribution, filler, synonym cycling, and
-  generic conclusions. State uncertainty and trade-offs directly.
-- Keep interface copy short and task-centred: direct labels, current state, the
-  next action, and recovery. Put optional technical detail in help, diagnostics,
-  docs, or a details view rather than primary application chrome.
-- Make user-facing visuals polished, warm, and subtly pretty, favouring an
-  accessible soft pink/purple palette when appropriate. Keep academic and
-  formal professional documents restrained and mostly black on white.
-- Before sending prose, remove anything that sounds templated or machine-written
-  without changing the intended meaning or voice.
-
-## Portability
-
-- Keep credentials, session history, caches, generated memory databases, and
-  other tool-specific runtime state outside this repository.
+- Lead with the result and concrete evidence. Use plain, active language;
+  state uncertainty and trade-offs directly. Cut filler and generic conclusions.
+- Make artifacts self-contained for their reader. Include working paths and
+  implementation details only when useful to that reader.
+- Keep interface copy focused on the task, state, next action, and recovery;
+  move optional technical detail to help or diagnostics. Favour accessible,
+  warm pink/purple visuals where appropriate; keep academic and formal
+  professional documents restrained and mostly black on white.

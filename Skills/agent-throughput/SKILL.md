@@ -49,6 +49,21 @@ Jev can suggest a listed skill, classify a candidate passage, or label an update
 It does not choose a coding model or effort level, authorize work, or certify
 completion. Keep direct task instructions and deterministic checks authoritative.
 
+## Use feedback without an annotation session
+
+When normal work produces ambiguous explicit feedback, use `feedback` through
+[decision-routing](../decision-routing/SKILL.md) to distinguish a correction,
+recurring preference, task instruction, acceptance, or question. Use `steering`
+when the relationship of a new message to active work is unclear. Preserve the
+message and scope; one-off instructions are not standing preferences.
+
+Use explicit corrections as candidate evaluation labels only when they resolve
+the same decision. A successful command or an inferred preference is not a human
+label. Keep optional decision records local, minimal, and within the user's
+retention instructions. Do not automatically write memories or copy session
+history. Apply existing preferences to a task with `context` rather than adding
+a second preference-ranking mechanism.
+
 ## Compare only when it can change routing
 
 Run a comparison when selecting a repeated workflow or when a second pass is

@@ -1,0 +1,18 @@
+{
+  "pattern": {
+    "title": "Observed execution-cost pattern",
+    "version": "1",
+    "required_fields": [
+      "observation"
+    ],
+    "question": "Identify the dominant pattern explicitly shown by this observation or small code excerpt. Do not infer runtime magnitude, complexity, or a performance improvement. Multiple equally dominant patterns mean unsure.",
+    "criteria": {
+      "repeated_work": "Shows repeated computation, queries, or transformations on equivalent input.",
+      "copying": "Shows data allocation, copying, materialization, or movement.",
+      "boundary": "Shows repeated I/O, process, network, FFI, or synchronization boundaries.",
+      "waiting": "Shows observed lock contention or waiting.",
+      "no_pattern": "Shows no identifiable execution-cost pattern.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    }
+  }
+}

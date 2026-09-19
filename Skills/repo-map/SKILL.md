@@ -33,6 +33,13 @@ Use the map to find:
 - documentation, workflow, test, lockfile, and source roles;
 - precise paths and lines to inspect next.
 
+When a static map leaves several plausible modules, use
+[decision-routing](../decision-routing/SKILL.md) with `context` on the current
+task and a compact candidate description from the map or source. Use relevant
+labels to order the next reads, and inspect conflicting/unsure candidates.
+Keep exact path matches and mandatory guidance ahead of semantic ranking;
+preserve the complete map and do not infer relationships from labels alone.
+
 The map records observable structure, not architectural intent or ownership.
 Treat prose documentation and comments as claims to verify against code,
 manifests, tests, history, and behaviour. Do not infer a relationship the map

@@ -52,6 +52,27 @@ weighting rather than grading every component as though it were the same form.
 - Keep criticism proportional. Separate correctness or requirement failures
   from optional improvements and personal taste.
 
+## Make criterion decisions with Jev
+
+Follow [decision-routing](../decision-routing/SKILL.md) for the shared Jev workflow.
+Once the rubric and evidence are established, run `assess/criterion` for the
+bounded semantic criteria. A substantial assessment will commonly yield 5–10
+independent judgments; use fewer when fewer are meaningful. Check exact counts,
+format rules, and arithmetic in code before preparing model questions.
+
+Read the contract with `agency-decide profiles --profile assess/criterion`.
+For each criterion, supply its exact requirement, a concise evidence excerpt,
+`evidence_complete`, and the rubric's actual `bands`. Set completeness only when
+the supplied packet covers the evidence needed for that criterion. Use stable
+band IDs and preserve original names, descriptors, score ranges, and exceptions
+in their definitions. Keep the criterion ID and source locations in the local
+assessment record. Do not send a whole submission by default.
+
+Use the returned bands as provisional criterion judgments. Check evidence
+coverage, hard-gate implications, and consequential band boundaries before
+scoring. Keep the band and final score alongside the criterion's evidence in the
+assessment record. Calculate weights and totals in code using the actual rubric.
+
 ## Report the assessment
 
 Match the supplied output format when one exists. Otherwise report:

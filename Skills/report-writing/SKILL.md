@@ -32,10 +32,7 @@ declared by the report index. If structured YAML citations are required, use
 exact bibliography IDs such as `{cite: {ids: [S101], mode: narrative}}` and
 `{cite: {ids: [S101, S337], mode: parenthetical}}`.
 
-Never invent a source, citation ID, bibliographic field, quote, finding, figure,
-or measurement. Do not turn planning notes, grading criteria, source-search
-history, or implementation commentary into report prose. Explain specialised
-terms only when the intended reader needs the explanation.
+Explain specialised terms only when the intended reader needs the explanation.
 
 ## Revise for the reader
 
@@ -68,3 +65,12 @@ that explain the production process rather than the subject. Then check the
 argument against the rubric and evidence again. Report the measured grade level,
 remaining difficult passages, word limits, unresolved evidence questions, and
 human-only verification or declaration steps.
+
+## Check semantic evidence before synthesis
+
+Use [decision-routing](../decision-routing/SKILL.md) when selecting among several
+opened passages or reconciling repeated findings. Batch `research` for one
+claim/passage pair at a time; use `novelty` against an existing finding to group
+repetition and surface additions or contradictions. Use the labels to organize
+source-backed drafting, then trace each consequential claim to its source.
+Retain unresolved evidence and never treat a label as citation verification.

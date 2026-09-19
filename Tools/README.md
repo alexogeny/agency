@@ -8,43 +8,51 @@ runnable; transient experiments stay out of this directory.
 
 Uses Jev as Agency's System One model: fast recognition from a small input,
 with a fixed answer space. Code handles exact rules; the reasoning agent handles
-planning, investigation, and ambiguity. Four versioned rubrics cover skill
-suggestions, candidate context, agent updates, and evidence relationships.
+planning, investigation, and ambiguity. Versioned contracts cover shared
+classifications and skill-owned decisions, including supplied assessment bands,
+evidence screening, comment purpose, observed cost patterns, and change impact.
 
 ```sh
 agency-decide setup --interactive
 agency-decide doctor
-agency-decide profiles
+agency-decide profiles --profile assess/criterion
 printf '%s\n' '{"task":"Check that the README commands execute as documented."}' |
   agency-decide classify --profile skill --input - --dry-run
 ```
 
-For setup, add a concealed field named **API Key** to the 1Password item titled
-**OpenRouter**. Setup finds exactly one matching item and field and saves only
-its ID-based `op://` reference in
-`${XDG_CONFIG_HOME:-~/.config}/agency/openrouter.json`, with mode `0600`.
-The field may initially be empty; classification reports when the key still
-needs to be added. Setup never edits the vault. Item values returned during
-metadata discovery remain in process memory and are never logged or persisted.
-Ambiguous matches require correction rather than guessing.
+The full installer imports the concealed **API Key** field from the single
+1Password item titled **OpenRouter**. Initial setup allows desktop authorization;
+each vault operation has a 30-second timeout. It writes the key to
+`${XDG_CONFIG_HOME:-~/.config}/agency/openrouter.json` as `{"api_key":"…"}`,
+with mode `0600` in a directory created with mode `0700`, outside the repository.
+The write is atomic. Setup never changes the vault or logs the key. Empty keys
+and ambiguous matches leave configuration untouched and report the problem.
 
-The installer calls prompt-free setup after installing 1Password. Missing or
-locked access is reported without blocking installation. `setup --interactive`
-permits normal desktop authorization; `setup --dry-run` performs no vault access
-or writes. Existing configuration is preserved on reruns.
+CLI and MCP classifications read this local file, with no 1Password dependency
+at runtime or on subsequent boots. An `OPENROUTER_API_KEY` process-environment
+override takes precedence. There is no session cache or background credential
+service. Existing local credentials are preserved when setup or the installer
+reruns. Setup checks the local file even when an environment override is present;
+a temporary environment key does not replace the persistent import.
+An older reference-only configuration is imported in place during setup; runtime
+reports that setup is needed instead of resolving a legacy reference itself.
 
-The runtime resolves the saved reference through `op read` only when making a
-classification. `OPENROUTER_API_KEY` is an optional process-environment override
-for automation. `doctor` reports local configuration without resolving a vault
-secret or contacting OpenRouter. `credential_verified` means local syntax
-validation for an environment override; it does not mean provider authentication.
-Never put credentials in command arguments, agent configuration, or this repository.
+`setup --interactive` imports a missing key or old reference with desktop
+authorization. Plain `setup` disables desktop prompts for automation;
+`setup --dry-run` makes no changes or vault calls. To reimport a rotated vault
+key, remove the local credential file and rerun setup. Updating the vault alone
+does not change the imported copy.
+
+`doctor` checks local configuration without contacting either service.
+`credential_verified` means valid local syntax, not successful provider
+authentication. Keep the credential file private; never put its contents in
+arguments, prompts, repository files, or troubleshooting output.
 
 Remove `--dry-run` to send the displayed request to OpenRouter's dedicated
 `POST /api/alpha/decisions` endpoint using `typesafe/jev-1.13`. Input may be UTF-8
 text or a JSON object/array/string, from a file or standard input. The result
 contains a label, full probability distribution, optional confidence, actual
-model ID, rubric version, usage, and request latency. Missing confidence stays
+model ID, rubric version and hash, usage, and request latency. Missing confidence stays
 null. See [`decision-routing`](../Skills/decision-routing/SKILL.md) for the state
 shapes and how to use the outputs.
 
@@ -56,16 +64,53 @@ input and response sizes, and do not retry automatically. The CLI uses a
 errors; CLI failures exit 2 with JSON diagnostics on stderr. No classification
 executes an action or supplies permission.
 
+For independent judgments, use `agency-decide classify-batch --input FILE`
+(or `--input -`). A manifest contains `items` with unique `id`, `profile`, and
+`state` values. Defaults are 10 unique calls, four workers, and a 30-second
+batch deadline. Optional `max_calls`, `concurrency`, and `deadline_seconds`
+allow at most 32 calls, four workers, and 60 seconds. Up to 32 items and 256 KiB
+are accepted per batch; the minimum deadline is five seconds and each state is
+limited to 64 KiB. Item IDs contain letters, digits, periods, underscores, or
+hyphens, at most 80 characters. Identical requests reuse one result within the batch.
+Credentials resolve once and stay in process memory and worker environments.
+Each classification runs in a subprocess that is killed and reaped on timeout.
+
+Results retain input order and per-item errors. A partial batch exits 1 and
+preserves successful rows; invalid manifests exit 2 before credential access.
+`--dry-run` validates the batch and displays requests without vault or provider
+access. Call and input limits bound usage, not a guaranteed dollar charge.
+Usage counts successful unique calls; `usage_complete` is false after errors,
+on dry runs, or when any successful call omits cost. Cost remains null when a
+complete amount is unavailable; a known zero cost is complete. Budget across
+batches in the caller; the runtime stores no automatic history or cache.
+
+`agency-decide evaluate --input FILE` runs a batch whose items also contain
+`expected` labels. It reports agreement, errors, and a confusion table; all
+cases remain in the denominator. Mismatches or provider failures exit 1, and
+invalid or empty sets exit 2. `Tests/fixtures/decisions.json` contains synthetic
+contract checks, not human-labelled calibration data. Running it uses hosted
+requests. Keep private examples and evaluation outputs outside the repository.
+
+Shared contracts live in `Skills/decision-routing/decisions.json`; skill-owned
+contracts live beside the owning `SKILL.md` and use names such as
+`assess/criterion`. The runtime discovers these trusted repository definitions
+through the same installed symlink. It validates required evidence fields and
+preserves supplied band descriptors. See the routing skill for complete state
+shapes and skill-specific use.
+
 ## `agency-decide-mcp`
 
-Exposes `profiles` and `classify` through newline-delimited stdio MCP, using the
+Exposes `profiles`, `classify`, and `classify_batch` through newline-delimited
+stdio MCP, using the
 same implementation and credentials as the CLI. The installer registers
 `agency-decide` for Codex and Claude Code while preserving existing registrations.
 Restart the client to discover newly registered tools. Pi and shell workflows
 can use `agency-decide` directly.
 
-Classification workers have a hard 10-second deadline and are killed and reaped
-on timeout. Cancellation notifications do not interrupt an active request before
+Single classification workers have a hard 10-second deadline. Batch workers
+share the batch deadline and each have at most 10 seconds; expired workers are
+killed and reaped. Read one contract with the optional `profile` argument to
+`profiles`, keeping unrelated rubrics out of agent context. Cancellation notifications do not interrupt an active request before
 that deadline. Provider failures are tool errors, never manufactured predictions.
 Only the supplied state and selected rubric are sent to OpenRouter; private
 profiles and transcript history are not automatically included.

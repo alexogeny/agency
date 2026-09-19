@@ -172,6 +172,6 @@ agency_as_root systemctl restart scx_loader.service
 agency_as_root systemctl enable --now fstrim.timer
 
 "$AGENCY_DIR/scripts/install-1password.sh" "${update_arguments[@]}"
-"$AGENCY_DIR/scripts/configure-openrouter.sh"
+"$AGENCY_DIR/scripts/configure-openrouter.sh" --interactive
 
 printf '\n\033[1;35m✨ Workstation bootstrap complete. Restart Firefox to apply policy.\033[0m\n'

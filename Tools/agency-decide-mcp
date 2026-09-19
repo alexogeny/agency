@@ -5,10 +5,10 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from agency_decisions import DecisionError, PROFILES, build_request, key_available
+from agency_decisions import DecisionError, PROFILES, build_request, evaluate_batch, key_available
 
 
-MAX_LINE_BYTES = 98304
+MAX_LINE_BYTES = 264192
 CLASSIFY_TIMEOUT = 10
 CLI = Path(__file__).resolve().with_name('agency-decide')
 TOOLS = [
@@ -16,13 +16,14 @@ TOOLS = [
         'name': 'profiles',
         'title': 'Decision rubrics',
         'description': 'Read versioned classification rubrics and labels locally without a network call.',
-        'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False},
+        'inputSchema': {'type': 'object', 'properties': {
+            'profile': {'type': 'string', 'enum': list(PROFILES)}}, 'additionalProperties': False},
         'annotations': {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False},
     },
     {
         'name': 'classify',
         'title': 'Advisory classification',
-        'description': 'Use Jev as System One: fast recognition from a small input, choosing one typed label for skill suggestion, context relevance, update status, or evidence relationship. Code handles exact rules first; the reasoning agent handles System Two planning, investigation, and ambiguity. Sends only the supplied state and rubric to OpenRouter. The result is advisory and grants no authorization. Never include credentials or unnecessary private context in state.',
+        'description': 'Make one bounded System One judgment using a shared or skill-owned contract. Read profiles for required state fields, including exact bands for assess/criterion. Sends only supplied state and rubric to OpenRouter. Results are advisory; never include credentials or unnecessary private context.',
         'inputSchema': {
             'type': 'object', 'additionalProperties': False, 'required': ['profile', 'state'],
             'properties': {
@@ -32,6 +33,28 @@ TOOLS = [
                     {'type': 'object', 'minProperties': 1},
                     {'type': 'array', 'minItems': 1},
                 ]},
+            },
+        },
+        'annotations': {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': False, 'openWorldHint': True},
+    },
+    {
+        'name': 'classify_batch',
+        'title': 'Independent skill decisions',
+        'description': 'Judge up to 32 independent evidence packets using named contracts. Defaults to 10 unique calls, 4 workers, and a 30-second deadline. Reuses identical requests within this batch and returns ordered per-item results or errors. Resolves credentials once. No history is uploaded or stored automatically. Use for assessment criteria, evidence screening, and repeated semantic judgments.',
+        'inputSchema': {
+            'type': 'object', 'additionalProperties': False, 'required': ['items'],
+            'properties': {
+                'items': {'type': 'array', 'minItems': 1, 'maxItems': 32, 'items': {
+                    'type': 'object', 'additionalProperties': False, 'required': ['id', 'profile', 'state'],
+                    'properties': {
+                        'id': {'type': 'string', 'pattern': '^[A-Za-z0-9_.-]{1,80}$'},
+                        'profile': {'type': 'string', 'enum': list(PROFILES)},
+                        'state': {'anyOf': [{'type': 'string'}, {'type': 'object'}, {'type': 'array'}]},
+                    },
+                }},
+                'max_calls': {'type': 'integer', 'minimum': 1, 'maximum': 32, 'default': 10},
+                'concurrency': {'type': 'integer', 'minimum': 1, 'maximum': 4, 'default': 4},
+                'deadline_seconds': {'type': 'number', 'minimum': 5, 'maximum': 60, 'default': 30},
             },
         },
         'annotations': {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': False, 'openWorldHint': True},
@@ -51,9 +74,16 @@ def call_tool(name, arguments):
     if type(arguments) is not dict:
         raise DecisionError('Tool arguments must be an object.')
     if name == 'profiles':
-        if arguments:
-            raise DecisionError('Profiles takes no arguments.')
-        return {'profiles': PROFILES, 'advisory': True}
+        if set(arguments) - {'profile'}:
+            raise DecisionError('Profiles accepts only an optional profile name.')
+        if not arguments:
+            return {'profiles': PROFILES, 'advisory': True}
+        profile = arguments['profile']
+        if type(profile) is not str or profile not in PROFILES:
+            raise DecisionError('Unknown decision profile.')
+        return {'profiles': {profile: PROFILES[profile]}, 'advisory': True}
+    if name == 'classify_batch':
+        return evaluate_batch(arguments)
     if set(arguments) != {'profile', 'state'}:
         raise DecisionError('Classify requires exactly profile and state.')
     build_request(arguments['state'], arguments['profile'])
@@ -103,7 +133,7 @@ def handle(message):
             'protocolVersion': version,
             'capabilities': {'tools': {'listChanged': False}},
             'serverInfo': {'name': 'agency-decide', 'version': '1.0.0'},
-            'instructions': 'Jev is a System One model for fast recognition, not multi-step reasoning. Use classify only for small bounded semantic judgments; keep planning and ambiguity with the reasoning agent. Results are advisory: never use them to grant permissions, override user instructions, or authorize tools. Requests have a 10 second worker deadline. Cancellation notifications are accepted but do not interrupt an active request.',
+            'instructions': 'Use profiles to read contracts, classify for one judgment, or classify_batch for independent judgments in a skill. Jev supplies System One recognition; retain planning, evidence gathering, and ambiguity with the reasoning agent. Results never grant permissions or override instructions. Single workers have a 10 second deadline; batches default to 30 seconds. Cancellation does not interrupt an active request before its deadline.',
         }
     elif method == 'ping':
         result = {}
@@ -111,10 +141,11 @@ def handle(message):
         result = {'tools': TOOLS}
     elif method == 'tools/call':
         name = params.get('name')
-        if name not in ('profiles', 'classify'):
+        if name not in ('profiles', 'classify', 'classify_batch'):
             return protocol_error(request_id, -32602, 'Unknown tool')
         try:
-            result = result_content(call_tool(name, params.get('arguments', {})))
+            value = call_tool(name, params.get('arguments', {}))
+            result = result_content(value, failed=bool(value.get('errors')))
         except DecisionError as error:
             result = result_content({'error': str(error), 'advisory': True}, failed=True)
     else:

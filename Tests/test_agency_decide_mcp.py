@@ -27,19 +27,33 @@ def message(method, params=None, request_id=1):
 
 
 class DecisionMCPTests(unittest.TestCase):
+    def test_profile_lookup_loads_only_the_requested_contract(self):
+        result = mcp.handle(message('tools/call', {'name': 'profiles',
+                            'arguments': {'profile': 'assess/criterion'}}))['result']
+        self.assertEqual(set(result['structuredContent']['profiles']), {'assess/criterion'})
+
+    def test_batch_reports_partial_failure_as_tool_error_without_losing_results(self):
+        batch = {'items': [{'id': 'one', 'profile': 'context', 'state': 'x'}]}
+        payload = {'advisory': True, 'errors': 1, 'items': [{'id': 'one', 'error': 'Unavailable'}]}
+        with patch.object(mcp, 'evaluate_batch', return_value=payload) as run:
+            result = mcp.handle(message('tools/call', {'name': 'classify_batch', 'arguments': batch}))['result']
+        run.assert_called_once_with(batch)
+        self.assertTrue(result['isError'])
+        self.assertEqual(result['structuredContent'], payload)
+
     def test_initialize_list_and_profiles_offline(self):
         initialized = mcp.handle(message('initialize', {'protocolVersion': '2025-06-18'}))['result']
         self.assertEqual(initialized['protocolVersion'], '2025-06-18')
         self.assertEqual(initialized['serverInfo']['name'], 'agency-decide')
         tools = mcp.handle(message('tools/list'))['result']['tools']
-        self.assertEqual({tool['name'] for tool in tools}, {'profiles', 'classify'})
+        self.assertEqual({tool['name'] for tool in tools}, {'profiles', 'classify', 'classify_batch'})
         classify = next(tool for tool in tools if tool['name'] == 'classify')
         self.assertEqual(set(classify['inputSchema']['properties']), {'profile', 'state'})
         with patch.object(mcp.subprocess, 'run') as run:
             result = mcp.handle(message('tools/call', {'name': 'profiles', 'arguments': {}}))['result']
         run.assert_not_called()
         self.assertTrue(result['structuredContent']['advisory'])
-        self.assertEqual(set(result['structuredContent']['profiles']), {'skill', 'context', 'update', 'research'})
+        self.assertTrue({'skill', 'context', 'update', 'research', 'assess/criterion'} <= result['structuredContent']['profiles'].keys())
 
     def test_classify_subprocess_has_hard_timeout_and_no_secret_argv(self):
         payload = {'advisory': True, 'decision': 'none', 'confidence': 0.5}

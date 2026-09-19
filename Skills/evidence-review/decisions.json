@@ -1,0 +1,18 @@
+{
+  "eligibility": {
+    "title": "One eligibility criterion",
+    "version": "1",
+    "required_fields": [
+      "criterion",
+      "evidence",
+      "evidence_complete"
+    ],
+    "question": "Assess one explicit eligibility criterion using only the inspected evidence. Absence is not evidence of exclusion unless coverage is complete and the criterion explicitly requires presence. Do not infer unavailable full text or source metadata.",
+    "criteria": {
+      "include": "The evidence establishes this inclusion criterion is satisfied.",
+      "exclude": "The evidence establishes this inclusion criterion is not satisfied.",
+      "pending": "The evidence does not establish whether this criterion is satisfied.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    }
+  }
+}
