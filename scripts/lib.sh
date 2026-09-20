@@ -191,7 +191,7 @@ agency_merge_agent_hooks() {
   if "$merger" --check "$target" "$fragment"; then
     agency_backup_copy "$target"
     "$merger" "$target" "$fragment"
-    printf 'Added session context hook to %s\n' "$target"
+    printf 'Updated Agency lifecycle hooks in %s\n' "$target"
     return
   else
     status=$?

@@ -73,6 +73,13 @@ coverage, hard-gate implications, and consequential band boundaries before
 scoring. Keep the band and final score alongside the criterion's evidence in the
 assessment record. Calculate weights and totals in code using the actual rubric.
 
+For requirement-coverage reviews, reuse this contract with one literal
+requirement per item and explicit met/unmet bands, or the supplied descriptors.
+Set `evidence_complete` for that requirement only. Missing inspection yields
+insufficient evidence, not an invented unmet finding. Verify deterministic
+requirements directly; provisional coverage labels do not approve a release or
+establish that the overall task is complete.
+
 ## Report the assessment
 
 Match the supplied output format when one exists. Otherwise report:

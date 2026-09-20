@@ -123,3 +123,10 @@ Report medians, dispersion, absolute and percentage differences, workload,
 machine/build facts, equivalence evidence, collection method, limitations,
 material regressions, and the retained JSON path. Never report a percentage
 that cannot be recomputed from raw samples.
+
+For several draft performance claims, use
+[decision-routing](../decision-routing/SKILL.md) with `claim-fit` against the
+retained measurements, equivalence checks, workload, and limitations. Inspect
+claims that extend an allocation result to latency, or a workload result to all
+inputs. Calculate numerical comparisons in code; the semantic label cannot
+validate a measurement or replace the benchmark evidence.

@@ -249,6 +249,16 @@ independent judgments with one credential lookup, per-item errors, and reuse
 within the batch. Labelled evaluation checks preserve mismatches and errors;
 no decision history or personal profile is uploaded automatically.
 
+Daily hooks also cover candidate-test relevance, documentation drift, review
+comments, dependency changes, requirement coverage, and whether draft claims
+match their evidence. New contracts remain advisory and require review.
+The installed clients show `Jev: N decisions`, with errors and reused results
+separate: a turn-end hook message in Codex and Claude Code, and a footer item in
+Pi. Counts exclude dry runs and use only observed result receipts; they do not
+change the clients' native elapsed-time line. See
+[`agency-decision-usage`](Tools/README.md#agency-decision-usage) for setup,
+counting boundaries, and private runtime storage.
+
 ### Stamp out repository plumbing
 
 The [`setup-repository`](Skills/setup-repository/SKILL.md) skill turns Agency's

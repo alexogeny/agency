@@ -142,3 +142,9 @@ reuse for promotion into Agency's `Tools` with concise docs and tests; reusable
 judgement belongs in a skill. Tell Mara when promotion is warranted. Carry out
 promotion only within authorized scope; do not add Agency infrastructure to
 unrelated project repositories.
+
+Before handing work back, use `claim-fit` from the shared decision workflow
+when several consequential summary claims need comparison with the retained
+diff, checks, unresolved failures, and scope. Include unavailable verification
+and active processes in the evidence. Correct overstatements or contradictions
+before reporting; the label cannot mark a task complete or release a claim.

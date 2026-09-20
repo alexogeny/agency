@@ -12,6 +12,51 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/agency-decision-usage --client codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/agency-decision-usage --client codex",
+            "timeout": 3
+          }
+        ],
+        "matcher": "^(Bash|mcp__agency[-_]decide__classify(_batch)?)$"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/agency-decision-usage --client codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/agency-decision-usage --client codex",
+            "timeout": 3
+          }
+        ]
+      }
     ]
   }
 }

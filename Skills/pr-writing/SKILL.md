@@ -25,8 +25,9 @@ when several changes need grouping by audience. Supply one verified behaviour
 change per item. Use compatibility, user, operator, developer, and internal
 labels to organize the description. Verify compatibility candidates against
 supported interfaces; labels do not establish breakage or select versions.
-For uncertain draft claims, use `research` against relevant diff or check
-evidence before retaining them.
+For uncertain draft claims, use `claim-fit` against relevant diff or check
+evidence and its limits before retaining them. Inspect overstatements and
+contradictions; the label does not establish correctness or completion.
 
 ## Write for the reviewer
 

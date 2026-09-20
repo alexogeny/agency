@@ -6,6 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from agency_decisions import DecisionError, PROFILES, build_request, evaluate_batch, key_available
+from agency_decision_usage import with_report
 
 
 MAX_LINE_BYTES = 264192
@@ -145,9 +146,14 @@ def handle(message):
             return protocol_error(request_id, -32602, 'Unknown tool')
         try:
             value = call_tool(name, params.get('arguments', {}))
+            if name != 'profiles':
+                with_report(value)
             result = result_content(value, failed=bool(value.get('errors')))
         except DecisionError as error:
-            result = result_content({'error': str(error), 'advisory': True}, failed=True)
+            value = {'error': str(error), 'advisory': True}
+            if name != 'profiles':
+                with_report(value)
+            result = result_content(value, failed=True)
     else:
         return protocol_error(request_id, -32601, 'Method not found')
     return {'jsonrpc': '2.0', 'id': request_id, 'result': result}

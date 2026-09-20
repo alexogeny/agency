@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import tempfile
 import unittest
@@ -15,12 +16,21 @@ class DecisionInstallTests(unittest.TestCase):
             result = subprocess.run([ROOT / "install.sh", "--dry-run"], capture_output=True, text=True,
                                     env={**os.environ, "HOME": str(home)}, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
-            for name in ("agency-decide", "agency-decide-mcp"):
+            for name in ("agency-decide", "agency-decide-mcp", "agency-decision-usage"):
                 self.assertIn(str(home / ".local/bin" / name), result.stdout)
             self.assertIn("agency-decide MCP", result.stdout)
             self.assertIn("decision-routing", result.stdout)
+            self.assertIn("extensions/agency-decisions.ts", result.stdout)
             self.assertIn("OpenRouter local credential", result.stdout)
             self.assertEqual(list(home.iterdir()), [])
+
+    def test_clients_observe_decisions_and_report_at_turn_end(self):
+        for client in ('codex', 'claude'):
+            hooks = json.loads((ROOT / 'config' / client / 'hooks.json').read_text())['hooks']
+            for event in ('UserPromptSubmit', 'PostToolUse', 'Stop'):
+                handlers = [handler for group in hooks[event] for handler in group['hooks']]
+                self.assertTrue(any('agency-decision-usage' in h['command'] for h in handlers))
+            self.assertTrue(hooks['SessionStart'])
 
 
 if __name__ == "__main__":

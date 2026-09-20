@@ -280,6 +280,309 @@
         "change": "The supported public parse_v1 function is removed; existing callers must migrate to parse_v2."
       },
       "expected": "compatibility"
+    },
+    {
+      "id": "daily-test-direct",
+      "profile": "test-relevance",
+      "state": {
+        "change": "The upload endpoint now accepts multipart metadata up to 512 KiB; the total file limit remains 20 MiB.",
+        "test": "POST multipart upload with 90 KiB of metadata and a 2 MiB image; assert HTTP 200 and decoded preview dimensions."
+      },
+      "expected": "direct"
+    },
+    {
+      "id": "daily-test-adjacent",
+      "profile": "test-relevance",
+      "state": {
+        "change": "The upload endpoint now accepts multipart metadata up to 512 KiB; the total file limit remains 20 MiB.",
+        "test": "Upload a 21 MiB image with tiny metadata; assert HTTP 413 for the unchanged total file limit."
+      },
+      "expected": "adjacent"
+    },
+    {
+      "id": "daily-test-unrelated",
+      "profile": "test-relevance",
+      "state": {
+        "change": "The upload endpoint now accepts multipart metadata up to 512 KiB; the total file limit remains 20 MiB.",
+        "test": "Given an expired password-reset link, assert the authentication service refuses it. This service has no upload dependency."
+      },
+      "expected": "unrelated"
+    },
+    {
+      "id": "daily-test-unsure",
+      "profile": "test-relevance",
+      "state": {
+        "change": "The upload endpoint now accepts multipart metadata up to 512 KiB; the total file limit remains 20 MiB.",
+        "test": "test_upload_works; assertions, setup, and exercised route are not supplied."
+      },
+      "expected": "unsure"
+    },
+    {
+      "id": "daily-claim-supported",
+      "profile": "claim-fit",
+      "state": {
+        "claim": "For the supplied 4 MiB parsing workload, measured allocated bytes fell by 25%.",
+        "evidence": "Equivalent outputs; repeated same-workload runs report baseline 8 MiB allocated, candidate 6 MiB allocated, with identical values across all five paired runs."
+      },
+      "expected": "supported"
+    },
+    {
+      "id": "daily-claim-overstated",
+      "profile": "claim-fit",
+      "state": {
+        "claim": "The parser is 25% faster.",
+        "evidence": "On equivalent 4 MiB inputs allocated bytes fell 25%; elapsed time and throughput were not measured."
+      },
+      "expected": "overstated"
+    },
+    {
+      "id": "daily-claim-contradicted",
+      "profile": "claim-fit",
+      "state": {
+        "claim": "All required checks passed for head abc123.",
+        "evidence": "For head abc123, required lint passed and required upload regression failed with HTTP 413 instead of 200."
+      },
+      "expected": "contradicted"
+    },
+    {
+      "id": "daily-claim-unverifiable",
+      "profile": "claim-fit",
+      "state": {
+        "claim": "The deployed service accepts 90 KiB multipart metadata.",
+        "evidence": "Production access was unavailable. No deployment record, service probe, or production logs were inspected."
+      },
+      "expected": "unverifiable"
+    },
+    {
+      "id": "daily-claim-unsure",
+      "profile": "claim-fit",
+      "state": {
+        "claim": "The current build passes the upload regression.",
+        "evidence": "One log says upload regression passed and another says it failed. Neither log identifies its build, run time, or artifact."
+      },
+      "expected": "unsure"
+    },
+    {
+      "id": "daily-doc-aligned",
+      "profile": "docs-verification/drift",
+      "state": {
+        "documentation": "Start the server with app serve --port 8080. Requests require an Authorization header.",
+        "implementation": "The current CLI accepts app serve --port INTEGER, and middleware rejects requests without Authorization."
+      },
+      "expected": "aligned"
+    },
+    {
+      "id": "daily-doc-stale",
+      "profile": "docs-verification/drift",
+      "state": {
+        "documentation": "Start the server with app run --port 8080.",
+        "implementation": "Current help lists serve as the only server command. Running app run exits 2 with unknown command run."
+      },
+      "expected": "stale"
+    },
+    {
+      "id": "daily-doc-incomplete",
+      "profile": "docs-verification/drift",
+      "state": {
+        "documentation": "Connect using client.connect(url).",
+        "implementation": "client.connect(url) is still valid, but establishing a connection now requires APP_TOKEN in the environment. The supplied complete setup section does not mention credentials."
+      },
+      "expected": "incomplete"
+    },
+    {
+      "id": "daily-doc-unrelated",
+      "profile": "docs-verification/drift",
+      "state": {
+        "documentation": "The password-reset link expires after 15 minutes.",
+        "implementation": "The independently deployed image preview service resizes images to 800 pixels and has no authentication functionality."
+      },
+      "expected": "unrelated"
+    },
+    {
+      "id": "daily-doc-unsure",
+      "profile": "docs-verification/drift",
+      "state": {
+        "documentation": "The default cache duration is 60 seconds.",
+        "implementation": "Only a cache module filename is supplied; no defaults, implementation, configuration, or observed behavior was inspected."
+      },
+      "expected": "unsure"
+    },
+    {
+      "id": "daily-review-actionable",
+      "profile": "babysit-pr/review",
+      "state": {
+        "comment": "Please add a regression covering 90 KiB metadata; the current test only posts 1 KiB.",
+        "context": "The patch raises the metadata parser limit. Current tests show only a 1 KiB metadata upload and no boundary coverage."
+      },
+      "expected": "actionable"
+    },
+    {
+      "id": "daily-review-question",
+      "profile": "babysit-pr/review",
+      "state": {
+        "comment": "Why is the limit 512 KiB?",
+        "context": "The diff raises the metadata limit from 64 KiB to 512 KiB. The reviewer requests rationale and proposes no change."
+      },
+      "expected": "question"
+    },
+    {
+      "id": "daily-review-suggestion",
+      "profile": "babysit-pr/review",
+      "state": {
+        "comment": "Optional: consider a more descriptive test name when you next touch this file.",
+        "context": "The test behavior and assertions are correct; the reviewer explicitly calls this optional."
+      },
+      "expected": "suggestion"
+    },
+    {
+      "id": "daily-review-resolved",
+      "profile": "babysit-pr/review",
+      "state": {
+        "comment": "Please cover 90 KiB metadata uploads.",
+        "context": "The current diff adds a 90 KiB multipart regression asserting HTTP 200. The focused test passed on the current head, and the reviewer confirms this addresses the request."
+      },
+      "expected": "resolved"
+    },
+    {
+      "id": "daily-review-unsure",
+      "profile": "babysit-pr/review",
+      "state": {
+        "comment": "This still seems wrong.",
+        "context": "No referenced line, thread history, requested change, or reproduction is supplied."
+      },
+      "expected": "unsure"
+    },
+    {
+      "id": "daily-dependency-relevant",
+      "profile": "babysit-pr/dependency",
+      "state": {
+        "update": "Parser 2.1 fixes rejection of multipart metadata above 64 KiB when max_form_memory_size is configured larger.",
+        "usage": "This app runs parser 2.0 with max_form_memory_size=524288. Its upload route receives 90 KiB metadata and currently reproduces that rejection."
+      },
+      "expected": "relevant"
+    },
+    {
+      "id": "daily-dependency-conditional",
+      "profile": "babysit-pr/dependency",
+      "state": {
+        "update": "Client 4.2 changes retry behavior only when enable_retries is true.",
+        "usage": "The app uses client 4.1. The inspected wrapper passes configuration from an external deployment file; the value of enable_retries is not available."
+      },
+      "expected": "conditional"
+    },
+    {
+      "id": "daily-dependency-unrelated",
+      "profile": "babysit-pr/dependency",
+      "state": {
+        "update": "Library 3.4 changes only its optional PDF export module.",
+        "usage": "The complete usage inventory for this app imports only CSV export, does not install the PDF extra, and never enables PDF export."
+      },
+      "expected": "unrelated"
+    },
+    {
+      "id": "daily-dependency-unsure",
+      "profile": "babysit-pr/dependency",
+      "state": {
+        "update": "Library 3.4 has miscellaneous improvements; detailed release notes are unavailable.",
+        "usage": "The project declares Library 3.3 but no imported APIs, configuration, or affected behavior were inspected."
+      },
+      "expected": "unsure"
+    },
+    {
+      "id": "daily-coverage-met",
+      "profile": "assess/criterion",
+      "state": {
+        "criterion": "Reject uploads larger than 20 MiB.",
+        "evidence": "A 21 MiB request returns HTTP 413 in the focused endpoint test on the current head.",
+        "evidence_complete": true,
+        "bands": {
+          "met": "Observed endpoint behavior rejects uploads above 20 MiB.",
+          "unmet": "Observed endpoint behavior accepts an upload above 20 MiB."
+        }
+      },
+      "expected": "met"
+    },
+    {
+      "id": "daily-coverage-incomplete",
+      "profile": "assess/criterion",
+      "state": {
+        "criterion": "Reject uploads larger than 20 MiB.",
+        "evidence": "A 1 MiB request returns HTTP 200. No larger request or implementation evidence was inspected.",
+        "evidence_complete": false,
+        "bands": {
+          "met": "Observed endpoint behavior rejects uploads above 20 MiB.",
+          "unmet": "Observed endpoint behavior accepts an upload above 20 MiB."
+        }
+      },
+      "expected": "insufficient"
+    },
+    {
+      "id": "daily-duplicate-failure",
+      "profile": "novelty",
+      "state": {
+        "existing": "Head abc123 upload regression POST /upload with 90 KiB metadata fails HTTP 413 at multipart parsing before route execution.",
+        "candidate": "On abc123, sending 90 KiB metadata to /upload returns 413 in the multipart parser before entering the route."
+      },
+      "expected": "duplicate"
+    },
+    {
+      "id": "daily-failure-adds",
+      "profile": "novelty",
+      "state": {
+        "existing": "Head abc123 upload regression POST /upload with 90 KiB metadata fails HTTP 413 before route execution.",
+        "candidate": "The same abc123 request fails HTTP 413 before the route, and a minimized 65 KiB metadata request reproduces the failure too."
+      },
+      "expected": "adds"
+    },
+    {
+      "id": "daily-handoff-overstated",
+      "profile": "claim-fit",
+      "state": {
+        "claim": "The feature is verified on the actual device.",
+        "evidence": "Synthetic protocol fixtures passed. Device permissions prevented every hardware read, and no real-device check ran."
+      },
+      "expected": "overstated"
+    },
+    {
+      "id": "daily-handoff-supported",
+      "profile": "claim-fit",
+      "state": {
+        "claim": "The focused upload regression passed; full-suite and production behavior remain unverified.",
+        "evidence": "Current-head focused upload regression passed once. The full suite was not run and no production access was available."
+      },
+      "expected": "supported"
+    },
+    {
+      "id": "daily-review-no-confirmation",
+      "profile": "babysit-pr/review",
+      "expected": "actionable",
+      "state": {
+        "comment": "Please add the missing 90 KiB metadata regression.",
+        "context": "An agent says the new code should fix this. No regression test, check output, reviewer confirmation, or thread resolution is supplied; the change request remains open."
+      }
+    },
+    {
+      "id": "daily-different-failure-condition",
+      "profile": "novelty",
+      "expected": "unrelated",
+      "state": {
+        "existing": "Upload service returns HTTP 413 for 90 KiB metadata because its parser limit is 64 KiB.",
+        "candidate": "An independent authentication service returns HTTP 401 for an expired access token. It shares no parser or upload route."
+      }
+    },
+    {
+      "id": "daily-coverage-unmet",
+      "profile": "assess/criterion",
+      "expected": "unmet",
+      "state": {
+        "criterion": "Reject uploads larger than 20 MiB.",
+        "evidence": "The inspected current endpoint accepts a 21 MiB upload, returns HTTP 200, and saves all bytes; the focused boundary regression fails.",
+        "evidence_complete": true,
+        "bands": {
+          "met": "Observed endpoint behavior rejects uploads above 20 MiB.",
+          "unmet": "Observed endpoint behavior accepts an upload above 20 MiB."
+        }
+      }
     }
   ],
   "max_calls": 32,

@@ -130,5 +130,38 @@
       "question": "Asks for information without expressing one of the other feedback types.",
       "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
     }
+  },
+  "test-relevance": {
+    "title": "Test relevance to a behavior change",
+    "version": "1",
+    "required_fields": [
+      "change",
+      "test"
+    ],
+    "question": "Compare the stated behavior change with the candidate test setup and assertions. Judge exercised behavior, not filenames or test names. Classify one test at a time; missing setup or assertions mean unsure. This is an ordering aid, never permission to skip required checks or a claim that a test passes.",
+    "criteria": {
+      "direct": "The test exercises and asserts the changed behavior or its regression trigger.",
+      "adjacent": "The test covers a related boundary, caller, dependency, or preserved behavior but does not directly assert the changed behavior.",
+      "unrelated": "The supplied test behavior has no meaningful relationship to the change or its affected boundaries.",
+      "unsure": "The evidence is missing, ambiguous, mixed, or insufficient to establish what the test exercises."
+    },
+    "review_required": true
+  },
+  "claim-fit": {
+    "title": "Fit of a draft claim to inspected evidence",
+    "version": "1",
+    "required_fields": [
+      "claim",
+      "evidence"
+    ],
+    "question": "Compare one draft claim with the supplied inspected evidence and its limits. Match artifact, version, environment, workload, resource, and verification scope. A direct counterexample under matching conditions takes precedence over overstatement. Do not authenticate sources, infer unseen checks, or declare completion. Incompatible evidence whose conditions cannot be reconciled means unsure.",
+    "criteria": {
+      "supported": "The evidence supports the whole claim at the stated scope, including material qualifications.",
+      "overstated": "Related evidence supports only a narrower or different result; the claim extends beyond measured resources, inspected conditions, or verification scope.",
+      "contradicted": "The evidence directly counters the claim under matching conditions.",
+      "unverifiable": "No applicable observation is supplied to establish or refute the claim, including inaccessible or uninspected evidence.",
+      "unsure": "Ambiguity, mixed evidence, or unresolved conditions prevent a reliable relationship judgment."
+    },
+    "review_required": true
   }
 }

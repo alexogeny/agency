@@ -67,3 +67,9 @@ material and identify compatibility candidates for explicit verification.
 Keep version selection and release claims grounded in the repository's policy
 and actual interfaces. Compare repeated entries with `novelty` before combining
 them, preserving their source commits and distinct user-visible effects.
+
+Before retaining consequential release claims, use `claim-fit` from the same
+shared workflow against the verified diff, check results, and retained evidence.
+Include deployment or publication evidence only when actually inspected; code
+or CI results alone do not establish a deployed release. Narrow unsupported
+scope and preserve material verification limits.

@@ -1,0 +1,19 @@
+{
+  "drift": {
+    "title": "Documentation drift against current behavior",
+    "version": "1",
+    "required_fields": [
+      "documentation",
+      "implementation"
+    ],
+    "question": "Compare one documentation excerpt with the supplied current implementation or observed behavior for the same surface. Explicit mismatch takes precedence over omission. Incomplete means an evidenced reader requirement is missing, not a guessed prerequisite. This comparison does not execute or verify the documented procedure.",
+    "criteria": {
+      "aligned": "The documented behavior and supplied current behavior agree within the inspected scope.",
+      "stale": "The excerpt explicitly describes behavior contradicted by the supplied current implementation or observation.",
+      "incomplete": "The excerpt does not contradict current behavior but omits an evidenced requirement necessary for its stated procedure or result.",
+      "unrelated": "The supplied excerpt and implementation concern different surfaces with no meaningful relationship.",
+      "unsure": "Missing behavior, uncertain versions, ambiguous scope, or mixed evidence prevents comparison."
+    },
+    "review_required": true
+  }
+}
