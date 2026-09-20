@@ -1,0 +1,18 @@
+{
+  "impact": {
+    "title": "Audience of a verified change",
+    "version": "1",
+    "required_fields": [
+      "change"
+    ],
+    "question": "Classify the audience affected by the supplied verified behavior change. Explicit compatibility breaks take precedence. Do not infer a breaking change, release version, or unseen behavior from filenames alone.",
+    "criteria": {
+      "compatibility": "Explicitly removes or incompatibly changes a supported interface or behavior.",
+      "user": "Changes behavior directly experienced by a product user without an explicit compatibility break.",
+      "operator": "Changes deployment, configuration, installation, or operational behavior.",
+      "developer": "Changes development, testing, or contribution workflows.",
+      "internal": "Changes internal implementation with no stated external behavior change.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    }
+  }
+}

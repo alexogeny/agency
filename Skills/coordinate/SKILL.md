@@ -97,13 +97,10 @@ agent-work --json heartbeat --task TASK_ID --agent AGENT_NAME --status waiting \
   --note "waiting for the parent integration pass"
 ```
 
-The positional task ID and `--task TASK_ID` forms are equivalent. Heartbeats
-retain their actor and note in task history; use `agent-work --json history TASK_ID`
-when a resumed session needs the stage sequence. Read
-`seconds_remaining` each time. As the deadline approaches, stop expanding
-scope, preserve usable partial results, run the most consequential available
-checks, and prepare a handoff. A timebox is not permission to mark incomplete
-work complete or to discard another agent's changes.
+Read `seconds_remaining` with each heartbeat. Near the deadline, stop
+expanding scope, preserve usable results, run consequential checks, and prepare
+a handoff; never mark incomplete work complete merely because time expired.
+Use `agent-work --json history TASK_ID` to recover stage notes after resuming.
 
 Use `agent-work --json stale` to inspect overdue, silent, or dead tasks. This is
 read-only evidence. Inspect one record with `agent-work --json inspect TASK_ID`
@@ -112,6 +109,15 @@ suspicious records with repository state and the record's `process_alive` and
 `pid` fields when present. Do not invoke shell-specific process aliases. Never
 kill a process, release a claim, delete scratch data, or close another agent's
 task merely because it appears stale.
+
+## Classify attention and scope
+
+Use [decision-routing](../decision-routing/SKILL.md) for batches of worker
+updates: `update` prioritizes attention and `novelty` compares repetitions with
+the retained update. Preserve questions, failures, conflicts, and completion
+evidence; repeated status does not establish stalled work. Use `scope` for
+ambiguous remit changes and `steering` for new user messages. Apply the literal
+request; labels never alter claims or permissions.
 
 ## Close with evidence
 
@@ -130,3 +136,9 @@ all changed files, checks and outcomes, unresolved risks, active processes,
 external state, and the next executable step in the summary or user handoff.
 Do not commit, push, stage, clean, or otherwise dispose of work while closing a
 coordination record.
+
+At handoff, identify deterministic, machine-agnostic utilities with credible
+reuse for promotion into Agency's `Tools` with concise docs and tests; reusable
+judgement belongs in a skill. Tell Mara when promotion is warranted. Carry out
+promotion only within authorized scope; do not add Agency infrastructure to
+unrelated project repositories.

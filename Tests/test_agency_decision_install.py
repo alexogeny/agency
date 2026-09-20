@@ -19,7 +19,7 @@ class DecisionInstallTests(unittest.TestCase):
                 self.assertIn(str(home / ".local/bin" / name), result.stdout)
             self.assertIn("agency-decide MCP", result.stdout)
             self.assertIn("decision-routing", result.stdout)
-            self.assertIn("OpenRouter secret reference", result.stdout)
+            self.assertIn("OpenRouter local credential", result.stdout)
             self.assertEqual(list(home.iterdir()), [])
 
 

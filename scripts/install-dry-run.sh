@@ -157,7 +157,7 @@ agency_plan_user_links() {
   agency_plan_hook_merge "$AGENCY_DIR/config/claude/hooks.json" "$HOME/.claude/settings.json"
   printf '  [%-16s] agency-web MCP for Codex and Claude Code\n' "register tool"
   printf '  [%-16s] agency-decide MCP for Codex and Claude Code\n' "register tool"
-  printf '  [%-16s] discover OpenRouter secret reference after 1Password setup; missing keys are reported\n' "optional setup"
+  printf '  [%-16s] import OpenRouter local credential from 1Password once; preserve existing credentials\n' "optional setup"
 }
 
 agency_plan_power() {

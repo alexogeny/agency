@@ -1,0 +1,134 @@
+{
+  "skill": {
+    "title": "Skill recommendation",
+    "version": "1",
+    "question": "Which single listed skill best matches the immediate task requested in the state? Judge the requested work, not incidental keywords. If several are needed, choose the first necessary step only when its ordering is clear; otherwise choose unsure.",
+    "criteria": {
+      "docs-verification": "Execute documented commands or examples to verify that documentation works as written.",
+      "web-research": "Find and inspect external web sources to answer a source-sensitive or current factual question.",
+      "repo-map": "Locate entrypoints, modules, tests, or commands in an unfamiliar repository before deeper work.",
+      "perf-diagnosis": "Locate and explain a runtime bottleneck using profiling or supported performance counters.",
+      "benchmark": "Measure a before/after comparison or substantiate a performance claim with repeatable equivalent workloads.",
+      "report-writing": "Draft or revise substantial academic or professional report prose for a brief and audience.",
+      "none": "The task is clear and none of these skills applies; ordinary editing, coding, or a short answer alone is here.",
+      "unsure": "The task is underspecified or multiple equally plausible first skills cannot be distinguished."
+    }
+  },
+  "context": {
+    "title": "Context relevance",
+    "version": "1",
+    "question": "How does the candidate context relate to the stated current task? Compare the candidate against the task and supplied constraints only. If the task or candidate is missing, choose unsure.",
+    "criteria": {
+      "relevant": "Directly helps complete the current task and does not conflict with an explicit supplied current constraint.",
+      "conflicting": "Contradicts an explicit supplied current fact or constraint, even if it concerns the same task.",
+      "background": "Provides related context but no direct help for the current task and no explicit contradiction.",
+      "irrelevant": "Has no meaningful relationship to the current task.",
+      "unsure": "Missing, ambiguous, or insufficient evidence prevents deciding the relationship."
+    }
+  },
+  "update": {
+    "title": "Update status",
+    "version": "1",
+    "question": "Which current work status does the supplied update communicate? Classify the latest explicit status, not quoted or resolved historical events. Choose failure for an unresolved failed step, attention for a request for user input without failure, completed for explicit finished work, or progress for ongoing work.",
+    "criteria": {
+      "attention": "The current update asks the user for a decision or input, without reporting an unresolved failure.",
+      "progress": "Work is ongoing and the current update reports progress without failure or a request for user input.",
+      "completed": "The requested work is explicitly finished, without an unresolved failure or request for user input.",
+      "failure": "A current attempted step failed or remains blocked by an error, including when user help is also requested.",
+      "unsure": "The update lacks enough status information or contains irreconcilable current status claims."
+    }
+  },
+  "research": {
+    "title": "Evidence relationship",
+    "version": "1",
+    "question": "What relationship does the supplied evidence passage have to the supplied claim? Judge the passage content only, not whether its source is authoritative. Require a claim and passage; if either is missing, choose unsure. Mixed support and contradiction is unsure.",
+    "criteria": {
+      "support": "The passage directly supports the supplied claim, with matching conditions and scope.",
+      "conflict": "The passage directly contradicts the supplied claim under matching conditions and scope.",
+      "background": "The passage concerns the claim topic but neither directly supports nor contradicts it.",
+      "irrelevant": "The passage has no meaningful relationship to the supplied claim.",
+      "unsure": "The claim or passage is missing, ambiguous, mixed, or insufficient to determine the relationship."
+    }
+  },
+  "novelty": {
+    "title": "Novelty against an existing finding",
+    "version": "1",
+    "required_fields": [
+      "existing",
+      "candidate"
+    ],
+    "question": "Compare candidate with existing on the same subject and conditions. Judge semantic content, not wording. A contradiction takes precedence over additional detail. Do not infer that either statement is true.",
+    "criteria": {
+      "duplicate": "Conveys only information already in existing.",
+      "adds": "Adds relevant information without contradicting existing.",
+      "contradicts": "Contradicts existing under matching conditions.",
+      "unrelated": "Concerns a different subject or conditions and has no meaningful relationship.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    }
+  },
+  "failure": {
+    "title": "Observed failure family",
+    "version": "1",
+    "required_fields": [
+      "diagnostic"
+    ],
+    "question": "Classify the explicit failure in the diagnostic. Recognize the reported failure family; do not infer an unseen root cause or suggest commands. Access denials take precedence over generic service errors.",
+    "criteria": {
+      "code": "A syntax, type, assertion, or application-logic failure is explicitly reported.",
+      "environment": "A missing dependency, executable, configuration, or local resource is explicitly reported.",
+      "access": "Authentication, authorization, or permission was explicitly denied.",
+      "external": "An external service or transport explicitly failed or is unavailable.",
+      "no_failure": "The supplied diagnostic explicitly reports success without an unresolved failure.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    }
+  },
+  "scope": {
+    "title": "Relationship to the current task",
+    "version": "2",
+    "required_fields": [
+      "task",
+      "action"
+    ],
+    "question": "Compare the concrete proposed action with the current task and its explicit constraints. An explicit prohibition means outside. Distinguish the requested deliverable from implicit intermediate steps: a broad instruction to implement or fix something does not explicitly request every investigation needed to do it. Supporting means directly enabling the requested outcome, not merely desirable work. No label grants permission.",
+    "criteria": {
+      "requested": "The user explicitly names this concrete action or deliverable. Do not use for an unstated intermediate step merely because the overall task implies it.",
+      "supporting": "The action is an unstated intermediate step that directly enables the requested outcome and conflicts with no supplied constraint.",
+      "outside": "The action is unrelated, expands the requested outcome, or conflicts with an explicit constraint.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    },
+    "review_required": true
+  },
+  "steering": {
+    "title": "Relationship of a new message to active work",
+    "version": "1",
+    "required_fields": [
+      "task",
+      "message"
+    ],
+    "question": "Classify how the new user message relates to the active task. An explicit stop or replacement takes precedence. Correction changes existing requirements; addition preserves them. Mixed incompatible intents are unsure. This label never supersedes the actual message or grants authorization.",
+    "criteria": {
+      "correction": "Revises or rejects part of the current approach or requirement.",
+      "addition": "Adds a compatible requirement to the active task.",
+      "status": "Asks for status or an explanation about ongoing work without changing it.",
+      "replacement": "Explicitly cancels or replaces the active task.",
+      "separate": "Requests clearly separate work without explicitly canceling the active task.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    }
+  },
+  "feedback": {
+    "title": "Explicit feedback type",
+    "version": "1",
+    "required_fields": [
+      "message"
+    ],
+    "question": "Classify what is explicitly expressed in the message. Do not infer a personality trait or standing permission. Prefer task_instruction for one-off requests. Use preference only for an explicit general or repeated working preference. Mixed intents are unsure.",
+    "criteria": {
+      "correction": "Explicitly identifies a mistake or rejects an observed result.",
+      "preference": "Explicitly states a recurring working preference with a scope beyond this one action.",
+      "task_instruction": "Directs a particular action or sets a task-specific constraint.",
+      "acceptance": "Explicitly accepts the supplied result without adding a new instruction.",
+      "question": "Asks for information without expressing one of the other feedback types.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    }
+  }
+}

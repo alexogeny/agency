@@ -29,5 +29,13 @@ claim-bearing metric from the resource at issue: instructions for executed CPU
 work, RSS/PSS for resident footprint, or an instrumented direct metric for
 allocation, copying, I/O, transfers, latency, or throughput.
 
+For a collection of ambiguous observations, use
+[decision-routing](../decision-routing/SKILL.md) with `performance-design/pattern`
+to organize the next probes. Supply only the observed trace or bounded code
+excerpt; use the label as a hypothesis about repeated work, copying, boundaries,
+or waiting. Confirm it with the relevant counter, trace, or instrumented metric.
+Use `failure` for unfamiliar diagnostic failures; unsupported events remain
+limitations and are never converted into measurements.
+
 Report the command, CPU, events, unsupported counters, profile or JSON path,
 hot symbols or hypotheses, and the next discriminating check.

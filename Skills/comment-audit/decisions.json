@@ -1,0 +1,20 @@
+{
+  "purpose": {
+    "title": "Comment purpose",
+    "version": "1",
+    "required_fields": [
+      "comment",
+      "context"
+    ],
+    "question": "Classify the role of this comment in the supplied surrounding code. Prefer constraint when it contains a meaningful invariant or protocol requirement. Licences and tooling directives are protected. Classification does not authorize deletion.",
+    "criteria": {
+      "constraint": "Explains a non-obvious invariant, protocol requirement, mathematical fact, or other checkable constraint.",
+      "documentation": "Provides useful public-interface or usage documentation.",
+      "redundant": "Only restates behavior already obvious from the supplied code.",
+      "historical": "Only narrates previous edits or development history.",
+      "decorative": "Only separates or decorates code sections.",
+      "protected": "Is a licence, mandated notice, generated-file marker, or tooling directive.",
+      "unsure": "The evidence is ambiguous, mixed, or does not support a reliable choice."
+    }
+  }
+}

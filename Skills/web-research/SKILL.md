@@ -143,6 +143,20 @@ and refresh deadline. Opened records include the exact displayed line range;
 answer and use the line metadata to verify which extracted passage supports the
 claim.
 
+## Classify inspected evidence
+
+Use [decision-routing](../decision-routing/SKILL.md) after opening sources when
+several passages need semantic screening. Batch `research` judgments using one
+explicit claim and one opened passage per item. Use support/conflict/background
+labels to organize the evidence; inspect conflicts and uncertainties before
+synthesis. Keep the source ledger and line references attached locally.
+
+Compare plausible repeated findings with `novelty` using `existing` and
+`candidate`. Group duplicate findings, prioritize additions, and surface
+contradictions. Preserve distinct sources even when their claims repeat.
+Skip model calls for exact text or URL matches. Source authority, freshness,
+access status, and citation verification retain their existing checks.
+
 ## Handle interactive pages
 
 Automated search, scrape, map, crawl, snapshot, and download commands run

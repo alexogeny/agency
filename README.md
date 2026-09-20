@@ -105,6 +105,16 @@ variables are hidden, networking is off, and the process tree is private.
 sandbox -- python3 -m unittest -v Tests.test_install_helpers
 ```
 
+The full suite runs offline with fake provider and 1Password responses. Keep
+live `agency-decide evaluate` runs separate: they use OpenRouter credit. For an
+unattended full run, expose only the report fonts:
+
+```console title="sandbox-full-tests"
+sandbox --ro "$HOME/.local/share/fonts/cm-unicode" \
+  --set-env REPORT_BUILD_FONT_DIR="$HOME/.local/share/fonts/cm-unicode" \
+  -- python3 -m unittest discover -s Tests -v
+```
+
 Grant only what a workload needs:
 
 ```console
@@ -227,8 +237,17 @@ for the remaining semantic choice. Low-confidence or unclear decisions stay
 with the reasoning agent, and no universal automation threshold is assumed.
 
 The installer discovers the OpenRouter **API Key** field through 1Password and
-saves only its secret reference. See [`agency-decide`](Tools/README.md#agency-decide)
+imports it once into the private local `~/.config/agency/openrouter.json` file.
+Jev then works across restarts without accessing 1Password. See [`agency-decide`](Tools/README.md#agency-decide)
 for setup and the supported command interface.
+
+Skills use Jev at explicit decision points: assessment bands and evidence
+screening, research relationships and novelty, comment purpose, failure triage,
+change impact, and coordination signals. Skill-owned `decisions.json` files
+supply the contracts through the shared runtime. `classify_batch` handles bounded
+independent judgments with one credential lookup, per-item errors, and reuse
+within the batch. Labelled evaluation checks preserve mismatches and errors;
+no decision history or personal profile is uploaded automatically.
 
 ### Stamp out repository plumbing
 

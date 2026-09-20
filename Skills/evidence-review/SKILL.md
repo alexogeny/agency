@@ -29,6 +29,19 @@ record actually inspected. Record a specific reason for every exclusion. Keep
 Never invent bibliographic fields, screening decisions, or unavailable full
 text.
 
+Use [decision-routing](../decision-routing/SKILL.md) at the screening stage for
+repeated semantic eligibility questions. Read `evidence-review/eligibility` and
+batch one record/criterion pair per item, with the exact criterion, inspected
+evidence, and `evidence_complete`. Use include/exclude/pending as the provisional
+criterion status; combine criteria only according to the declared eligibility
+rules. Check exclusions against the cited evidence and write their specific
+reason yourself. Retain pending and unsure records for inspection. Do not let
+an abstract stand in for unavailable full text.
+
+After exact duplicate detection, use `novelty` on plausible duplicate findings
+when wording differs. Preserve source identities and provenance; a duplicate
+judgment groups records for review rather than silently deleting them.
+
 Audit before synthesis. Report databases and queries, dates, records found,
 duplicates, screened and pending counts, exclusions by reason, unresolved
 records, and retained ledger/audit paths.

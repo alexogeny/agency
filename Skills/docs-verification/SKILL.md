@@ -31,6 +31,14 @@ Each `files` entry maps an extracted path to the fence's `title=` value. Command
 are argument arrays, never shell fragments. `docs-exec` supplies
 `DOCS_EXEC_PROJECT_ROOT` and `DOCS_EXEC_CASE_DIR` to each case.
 
+When a documented command fails and its diagnostic family is unclear, use
+[decision-routing](../decision-routing/SKILL.md) with `failure` on the short,
+redacted diagnostic. Use the family to choose the next investigation: inspect
+code/assertions, check prerequisites, check access, or inspect service status.
+The label supplies neither a root cause nor a replacement command. Keep the
+original failure in the result and rerun the literal example after a justified
+repair. Explicit exit status and known error codes need no classification.
+
 For prose-only command sequences, rehearse the literal documented commands in
 the same sandbox and retain concise output. Falsify the check by altering one
 expected value or command so a skipped example, empty selection, or stale build

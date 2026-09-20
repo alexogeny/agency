@@ -53,14 +53,17 @@ Use the repository's established sections. If none exist, choose only the
 sections the release needs from: Breaking changes, Added, Changed, Fixed,
 Performance, Security, and Internals.
 
-Lead with the result. Use plain, specific, active language and one idea per
-dense sentence. Cut promotional language, generic conclusions, canned phrases,
-vague attribution, decorative formatting, and explanatory filler. Repeat the
-clearest term instead of cycling through synonyms. State uncertainty and
-tradeoffs directly. Before finishing, remove anything that sounds generated or
-could describe an arbitrary release.
-
 Verify links, version arithmetic, dates, headings, and any repository-specific
 navigation or release checks. Report the output path, comparison range, major
 omissions or uncertainties, and checks run. Do not publish, tag, commit, push,
 or create a release unless the user explicitly asks for that separate action.
+
+## Classify change impact before grouping
+
+Use [decision-routing](../decision-routing/SKILL.md) and `pr-writing/impact` when
+sorting several verified changes into release-note groups. Supply concise
+before/after behavior, not filenames alone. Use the audience labels to group
+material and identify compatibility candidates for explicit verification.
+Keep version selection and release claims grounded in the repository's policy
+and actual interfaces. Compare repeated entries with `novelty` before combining
+them, preserving their source commits and distinct user-visible effects.

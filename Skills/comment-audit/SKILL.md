@@ -23,5 +23,13 @@ documentation, and tooling directives. Remove or refactor a comment only when
 the user requested changes and the code can carry the meaning more clearly.
 Never turn the audit into an automatic deletion pass.
 
+For ambiguous scanner findings, use
+[decision-routing](../decision-routing/SKILL.md) with `comment-audit/purpose`.
+Batch the comment and only the surrounding code needed to interpret it. Use the
+result to distinguish likely constraints, documentation, redundancy, history,
+decoration, and protected notices. Preserve constraints and protected material;
+inspect unsure cases. A redundant or historical label becomes a candidate for
+an authorized edit, with the code and original comment still available for review.
+
 Report files scanned, findings by category, false positives or preserved
 constraints, edited paths when authorised, and focused tests for changed code.

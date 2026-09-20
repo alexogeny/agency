@@ -24,6 +24,15 @@ Before handoff, recheck new loops, allocations, and boundary calls for
 accidental repeated work. For routine changes, stop there: no profile or
 benchmark is required, and the preflight does not justify a performance claim.
 
+## Classify observed patterns when useful
+
+When several small observations need triage, use
+[decision-routing](../decision-routing/SKILL.md) with `performance-design/pattern`.
+Supply a measured observation or a bounded code excerpt. Use repeated-work,
+copying, boundary, or waiting labels to select a discriminating investigation.
+Skip obvious cases. A pattern label establishes no bottleneck, asymptotic bound,
+or improvement; measurements and equivalence checks still support those claims.
+
 ## Deepen performance work
 
 When performance is an objective or the visible costs could materially affect
