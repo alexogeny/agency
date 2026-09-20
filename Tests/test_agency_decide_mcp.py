@@ -35,11 +35,16 @@ class DecisionMCPTests(unittest.TestCase):
     def test_batch_reports_partial_failure_as_tool_error_without_losing_results(self):
         batch = {'items': [{'id': 'one', 'profile': 'context', 'state': 'x'}]}
         payload = {'advisory': True, 'errors': 1, 'items': [{'id': 'one', 'error': 'Unavailable'}]}
+        expected = json.loads(json.dumps(payload))
         with patch.object(mcp, 'evaluate_batch', return_value=payload) as run:
             result = mcp.handle(message('tools/call', {'name': 'classify_batch', 'arguments': batch}))['result']
         run.assert_called_once_with(batch)
         self.assertTrue(result['isError'])
-        self.assertEqual(result['structuredContent'], payload)
+        counted = dict(result['structuredContent'])
+        report = counted.pop('_agency_decisions')
+        self.assertEqual(counted, expected)
+        self.assertEqual(report['decisions'], 0)
+        self.assertEqual(report['errors'], 1)
 
     def test_initialize_list_and_profiles_offline(self):
         initialized = mcp.handle(message('initialize', {'protocolVersion': '2025-06-18'}))['result']
@@ -60,7 +65,11 @@ class DecisionMCPTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, json.dumps(payload), '')
         with patch.object(mcp, 'key_available', return_value=True), patch.object(mcp.subprocess, 'run', return_value=completed) as run:
             result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': {'task': 'hello'}}}))['result']
-        self.assertEqual(result['structuredContent'], payload)
+        counted = dict(result['structuredContent'])
+        report = counted.pop('_agency_decisions')
+        self.assertEqual(counted, payload)
+        self.assertEqual(report['decisions'], 1)
+        self.assertEqual(report['errors'], 0)
         self.assertEqual(run.call_args.kwargs['timeout'], 10)
         self.assertEqual(json.loads(run.call_args.kwargs['input']), {'task': 'hello'})
         self.assertEqual(run.call_args.args[0][-5:], ['classify', '--profile', 'skill', '--input', '-'])

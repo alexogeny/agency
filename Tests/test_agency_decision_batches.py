@@ -144,3 +144,11 @@ class BatchTests(unittest.TestCase):
                                   input=json.dumps({'items': [item('a')]}), text=True, capture_output=True, env=env, timeout=5)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertTrue(json.loads(done.stdout)['dry_run'])
+        self.assertEqual(json.loads(done.stdout)['_agency_decisions']['decisions'], 0)
+
+    def test_invalid_dry_run_does_not_count_as_live_usage(self):
+        done = subprocess.run([str(ROOT / 'Tools/agency-decide'), 'classify-batch', '--input', '-', '--dry-run'],
+                              input='{"items":[]}', text=True, capture_output=True, timeout=5)
+        self.assertEqual(done.returncode, 2)
+        receipt = json.loads(done.stderr)['_agency_decisions']
+        self.assertEqual((receipt['decisions'], receipt['errors'], receipt['reused']), (0, 0, 0))

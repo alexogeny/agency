@@ -571,6 +571,7 @@ def read_input(path, limit=MAX_INPUT_BYTES):
 
 
 def main(argv=None):
+    from agency_decision_usage import with_report
     parser = argparse.ArgumentParser(description='Advisory Jev classifications; no actions are executed.')
     commands = parser.add_subparsers(dest='command', required=True)
     profiles = commands.add_parser('profiles', help='Read versioned rubrics as JSON.')
@@ -607,6 +608,8 @@ def main(argv=None):
                           'request': build_request(state, args.profile)}
             else:
                 result = evaluate(state, args.profile)
+        if args.command in ('classify', 'classify-batch', 'evaluate'):
+            with_report(result)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         if args.command == 'evaluate':
             return 0 if result['evaluation']['correct'] == result['evaluation']['total'] else 1
@@ -614,5 +617,10 @@ def main(argv=None):
             return 0 if not result['errors'] else 1
         return 0
     except DecisionError as error:
-        print(json.dumps({'error': str(error), 'advisory': True}), file=sys.stderr)
+        result = {'error': str(error), 'advisory': True}
+        if getattr(args, 'dry_run', False):
+            result['dry_run'] = True
+        if args.command in ('classify', 'classify-batch', 'evaluate'):
+            with_report(result)
+        print(json.dumps(result), file=sys.stderr)
         return 2

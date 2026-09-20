@@ -1,0 +1,35 @@
+{
+  "review": {
+    "title": "Review comment triage",
+    "version": "1",
+    "required_fields": [
+      "comment",
+      "context"
+    ],
+    "question": "Classify the current intent of one review comment using its supplied thread and inspected code context. Resolved requires explicit confirmation in the supplied current context and no remaining request; an agent assertion that code looks fixed is insufficient. Otherwise explicit required changes take precedence over questions, and explicitly optional changes are suggestions. Do not decide correctness, send replies, resolve threads, or authorize edits.",
+    "criteria": {
+      "actionable": "Requests a concrete change or identifies a specific unresolved defect to investigate.",
+      "question": "Requests information or rationale without a concrete change request or explicit unresolved defect.",
+      "suggestion": "Explicitly proposes an optional improvement without a required change or defect claim.",
+      "resolved": "The supplied current thread explicitly confirms resolution of the comment with no outstanding request.",
+      "unsure": "The intent or current thread state is missing, ambiguous, mixed, or insufficient."
+    },
+    "review_required": true
+  },
+  "dependency": {
+    "title": "Dependency update relevance to inspected usage",
+    "version": "1",
+    "required_fields": [
+      "update",
+      "usage"
+    ],
+    "question": "Compare a bounded upstream change with the inspected local version, APIs, configuration, and execution paths. Judge applicability, not update safety, urgency, vulnerability severity, or permission to install. Conditional requires a known affected condition whose local activation is unresolved; otherwise missing change or usage detail means unsure. Unrelated requires evidence excluding the affected surface, not mere absence from an excerpt.",
+    "criteria": {
+      "relevant": "The described upstream change affects an API, configuration, or execution path established in the supplied local usage.",
+      "conditional": "The affected surface is known and local applicability depends on a stated configuration or execution condition not yet established.",
+      "unrelated": "The inspected usage explicitly excludes the described affected surface or conditions.",
+      "unsure": "Missing release detail, insufficient usage coverage, ambiguity, or mixed changes prevents a reliable applicability judgment."
+    },
+    "review_required": true
+  }
+}

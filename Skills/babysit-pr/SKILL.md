@@ -54,6 +54,11 @@ work without resetting, stashing, overwriting, or including it.
 
 ## Validate and commit
 
+For several plausible tests, use [decision-routing](../decision-routing/SKILL.md)
+with `test-relevance` on the changed behavior and actual test setup/assertions.
+Order focused regression checks from those results, preserving all mandatory
+checks and investigating uncertainty. A relevance label does not validate a test.
+
 Run documented checks and focused tests for changed behaviour, plus
 `git diff --check`. Inspect additions for secrets, personal identifiers,
 assistant attribution, and transient history without printing suspected secrets.
@@ -134,3 +139,25 @@ without inventing success or broadening scope.
 
 Report PR URL, branch, commit SHA, Git author, local checks, remote CI, warnings,
 and final worktree state, distinguishing unrelated work from PR content.
+
+## Triage review comments and dependency changes
+
+Use [decision-routing](../decision-routing/SKILL.md) with `babysit-pr/review`
+when several review comments need sorting. Supply each comment with its current
+thread and relevant inspected diff. Investigate actionable requests, prepare
+answers to questions, and keep optional suggestions distinct from requirements.
+Resolved requires explicit confirmation in the thread, not an inferred fix.
+Keep original comment IDs and unresolved requests; labels neither resolve
+threads nor authorize posting replies. Apply the user's communication scope.
+
+For dependency PRs, use `babysit-pr/dependency` for one upstream change at a time
+against the actual local version, imported APIs, configuration, and usage.
+Inspect applicable changes and establish missing conditional usage before
+choosing focused checks. An unrelated label applies only to that upstream item;
+it cannot approve the whole update, establish security, or skip required CI.
+Use `novelty` for repeated review findings or failure diagnostics, preserving
+source IDs, new triggers, and conflicting evidence instead of hiding them.
+
+Before the final PR handoff, compare consequential claims with their retained
+checks using `claim-fit`; include failed, skipped, and unavailable verification.
+The final report and completion decision remain the reasoning agent's work.

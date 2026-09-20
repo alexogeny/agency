@@ -44,3 +44,14 @@ the same sandbox and retain concise output. Falsify the check by altering one
 expected value or command so a skipped example, empty selection, or stale build
 cannot masquerade as success. Report each case, the exact failure point, any
 environment-specific adaptation, and the retained result path.
+
+## Compare documentation with the changed behavior
+
+When a behavior change touches several documentation candidates, use
+[decision-routing](../decision-routing/SKILL.md) with `docs-verification/drift`.
+Pair each excerpt with current API, CLI, configuration, or observed behavior;
+include version and prerequisites when they affect the comparison. Inspect
+stale and incomplete candidates first, then rehearse the literal reader path.
+Aligned only describes the supplied comparison: it does not establish that the
+commands run. Preserve failures and investigate unsure or conflicting evidence
+before changing the text.

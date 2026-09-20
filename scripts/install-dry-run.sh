@@ -111,6 +111,7 @@ agency_plan_user_links() {
     agency-ui
     agency-decide
     agency-decide-mcp
+    agency-decision-usage
     git-get
     long-processes
     sandbox
@@ -140,6 +141,8 @@ agency_plan_user_links() {
   agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.pi/agent/AGENTS.md"
   agency_plan_link "$AGENCY_DIR/Agents/pi/agency-web.ts" \
     "$HOME/.pi/agent/extensions/agency-web.ts"
+  agency_plan_link "$AGENCY_DIR/Agents/pi/agency-decisions.ts" \
+    "$HOME/.pi/agent/extensions/agency-decisions.ts"
   agency_plan_link "$AGENCY_DIR/Agents/codex/coordinated-worker.toml" \
     "$HOME/.codex/agents/coordinated-worker.toml"
   agency_plan_link "$AGENCY_DIR/Agents/claude/coordinated-worker.md" \

@@ -1,6 +1,6 @@
 ---
 name: decision-routing
-description: Run bounded System One judgments inside Agency skills using Jev through OpenRouter. Supports rubric bands, evidence screening, relevance, novelty, failure families, scope, steering, feedback, comment purpose, cost patterns, and change impact. Use for semantic decisions with inspectable evidence, not planning, authorization, or facts code can compute exactly.
+description: Run bounded System One judgments inside Agency skills using Jev through OpenRouter. Supports rubric bands, evidence screening, test relevance, documentation drift, review and dependency triage, claim fit, novelty, failure families, scope, steering, feedback, comment purpose, cost patterns, and change impact. Use for semantic decisions with inspectable evidence, not planning, authorization, or facts code can compute exactly.
 ---
 
 # Make small advisory decisions
@@ -37,6 +37,11 @@ Read the needed versioned definition with `profiles`'s `profile` argument or
 | `scope` | `task`, `action` | Flag requested, supporting, or outside work for review. |
 | `steering` | `task`, `message` | Recognize corrections, additions, status questions, replacements, or separate requests. Apply the actual message. |
 | `feedback` | `message` | Identify explicit corrections or preferences without creating standing instructions or writing memory. |
+| `test-relevance` | `change`, `test` | Order candidate tests by exercised behavior; retain required checks and inspect assertions. |
+| `claim-fit` | `claim`, `evidence` | Check whether draft PR, release, performance, or handoff claims match inspected evidence and its limits. |
+| `docs-verification/drift` | `documentation`, `implementation` | Identify alignment, stale behavior, or missing evidenced prerequisites before executing docs. |
+| `babysit-pr/review` | `comment`, `context` | Triage review requests; explicit thread confirmation is needed for resolved. No reply or thread mutation follows automatically. |
+| `babysit-pr/dependency` | `update`, `usage` | Triage upstream changes against inspected local use; no update-safety or installation authority. |
 | `assess/criterion` | `criterion`, `evidence`, `evidence_complete`, `bands` | Propose an exact rubric band, `insufficient`, or `unsure`. |
 | `evidence-review/eligibility` | `criterion`, `evidence`, `evidence_complete` | Judge one inclusion criterion: include, exclude, pending, or unsure. |
 | `comment-audit/purpose` | `comment`, `context` | Identify constraints, documentation, redundancy, history, decoration, or protected material. |
@@ -49,6 +54,29 @@ source band names and score ranges. IDs start with a letter and contain letters,
 digits, underscores, or hyphens, at most 64 characters; `insufficient` and
 `unsure` are reserved. Definitions live in each owning skill's `decisions.json`
 and use one shared runtime.
+
+## Apply daily decisions
+
+Use `test-relevance` when a change has several plausible candidate tests and the
+relationship is semantic. Supply the changed behavior and each test's actual
+setup and assertions. Run direct regression coverage first, inspect adjacent
+boundaries, and preserve repository-required checks. An unrelated label cannot
+justify skipping a required check; an unsure label calls for reading the test.
+Keep collection, exit status, and pass/fail results deterministic.
+
+Use `claim-fit` before retaining consequential draft claims in PRs, releases,
+benchmarks, or handoffs. Supply the claim plus inspected artifacts and check
+outcomes, including failures, skips, versions, workloads, and unavailable checks.
+Narrow overstatements, investigate contradictions, and mark unverified facts as
+unverified. A supported label neither proves correctness nor completes work.
+
+For requirement coverage, reuse `assess/criterion`: give one exact requirement,
+its inspected evidence, completeness, and explicit met/unmet descriptors (or
+the supplied rubric). Incomplete inspection is not proof of unmet requirements.
+For duplicate issues or failures, reuse `novelty` with matching artifact,
+version, trigger, and diagnostic context. Preserve source IDs and additions;
+similar symptoms alone do not establish a common root cause or justify closing
+an issue. These judgments organize evidence, never decide task completion.
 
 ## Run the owning skill's decision step
 
@@ -118,6 +146,16 @@ non-reused judgments, exclude dry runs, and report errors separately. Mention
 consequential disagreements or changed results and link an existing decision
 record when useful; do not create extra artifacts solely for this summary.
 
+Installed client hooks also show `Jev: N decisions` at turn end (Codex and
+Claude Code) or in Pi's footer. They count completed, non-reused CLI/MCP results,
+with errors and reused results separate. Dry runs and profile reads contribute
+zero. These counters cannot infer agent overrides or follow-ups; keep the
+semantic handoff above when those details matter. Preserve `_agency_decisions`
+metadata in tool output so the hooks can observe it. Missing or truncated
+receipts produce an incomplete count; redirected or filtered output can escape
+observation. Counts cover the current agent's observed results, not a guaranteed
+total across delegated workers.
+
 ## Learn from real corrections
 
 When personalizing, read compact rules, scope, exceptions, and review status in
@@ -139,7 +177,9 @@ report denominators and uncertainty. Increment versions when rubric meaning
 changes. Synthetic accuracy does not establish calibrated confidence or useful
 automation: measure accepted outcomes, elapsed time, reasoning cost, and repairs.
 
-No records are saved automatically. When requested, retain minimal results
+No decision evidence or labels are saved automatically. The usage hooks retain
+only bounded counts, timestamps, and opaque IDs in a private runtime directory
+outside repositories. When requested, retain minimal decision results
 outside the repository with IDs, model, profile version, rubric hash, and source
 references. Explicit corrections can label that decision; inferred preferences
 and successful commands cannot supply human labels.

@@ -24,6 +24,12 @@ Before handoff, recheck new loops, allocations, and boundary calls for
 accidental repeated work. For routine changes, stop there: no profile or
 benchmark is required, and the preflight does not justify a performance claim.
 
+When several tests plausibly cover the changed behavior, use
+[decision-routing](../decision-routing/SKILL.md) with `test-relevance` on the
+behavior and each candidate's actual setup and assertions. Use the labels to
+order focused checks, retain mandatory validation, and inspect uncertainty.
+Skip classification when the relevant regression test is already obvious.
+
 ## Classify observed patterns when useful
 
 When several small observations need triage, use

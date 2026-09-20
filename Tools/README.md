@@ -88,8 +88,9 @@ batches in the caller; the runtime stores no automatic history or cache.
 `expected` labels. It reports agreement, errors, and a confusion table; all
 cases remain in the denominator. Mismatches or provider failures exit 1, and
 invalid or empty sets exit 2. `Tests/fixtures/decisions.json` contains synthetic
-contract checks, not human-labelled calibration data. Running it uses hosted
-requests. Keep private examples and evaluation outputs outside the repository.
+contract checks, not human-labelled calibration data. Select at most 32 cases
+per evaluation manifest and budget calls across batches; running evaluation uses
+hosted requests. Keep private examples and evaluation outputs outside the repository.
 
 Shared contracts live in `Skills/decision-routing/decisions.json`; skill-owned
 contracts live beside the owning `SKILL.md` and use names such as
@@ -97,6 +98,57 @@ contracts live beside the owning `SKILL.md` and use names such as
 through the same installed symlink. It validates required evidence fields and
 preserves supplied band descriptors. See the routing skill for complete state
 shapes and skill-specific use.
+
+## `agency-decision-usage`
+
+Shows per-turn Jev usage from the local CLI/MCP result receipts:
+
+```text
+Jev: 5 decisions · 1 error · 2 reused
+```
+
+The installer adds `UserPromptSubmit`, `PostToolUse`, and `Stop` hooks to Codex
+and Claude Code while preserving other hooks. They display a short turn-end
+message through the supported `systemMessage` interface; they do not modify the
+native `Worked for …` line or replace a configured status line. Codex also reports
+on interruption. Claude observes failed tool calls through `PostToolUseFailure`.
+Review and trust updated Codex hooks when the client requests it; installation
+does not bypass hook trust. Restart clients to load updated configuration and
+MCP profile schemas.
+
+Pi's `agency-decisions.ts` extension shows the same counter in a footer status
+item. It observes CLI results from bash and resets at the next user run after
+`agent_settled`, so intermediate model turns and automatic retries keep their
+count. It does not add messages to the model conversation or record a transcript.
+
+A decision is a completed, non-reused classification result. `unsure` still
+counts as a completed decision. Errors are separate unique failed items or
+failed single requests, including validation/configuration failures; they are
+not necessarily provider calls. Dry runs, profile reads, and doctor checks
+contribute zero. Batch worker receipts are removed from aggregate output so
+inspecting an embedded result cannot count it again. Duplicate observations of
+the same receipt count once, and receipts older than the turn are ignored.
+
+Counters use session and turn identities rather than the working directory.
+Claude subagent events are excluded; Codex events for other turn IDs are ignored.
+The display covers results observed by this agent's hooks, not an aggregate of
+all delegated workers. Keep `_agency_decisions` metadata in CLI/MCP output.
+Redirecting or filtering output can hide results. Known missing or truncated
+receipts show `count incomplete`; missing turn starts show `usage unavailable`.
+An unreadable event conservatively marks active turns for that client incomplete.
+Disabled hooks or unsupported client transports cannot provide a complete count.
+
+Only counts, timestamps, hashed session/turn identities, and opaque receipt IDs
+are stored, under `$XDG_RUNTIME_DIR/agency-decision-usage` or a private
+`agency-decision-usage-UID` directory in the system temporary directory. Each
+session retains only its latest turn with at most 2,048 receipt IDs. Files are
+mode `0600` inside a mode `0700` directory, with locking and symlink refusal.
+No prompts, tool inputs, decisions, credentials, or transcripts are retained or
+uploaded by the counter. It makes no model calls and never blocks a turn.
+
+Client interfaces: [Codex hooks](https://developers.openai.com/codex/hooks),
+[Claude Code hooks](https://code.claude.com/docs/en/hooks), and Pi's installed
+`docs/extensions.md` (`agent_start`, `agent_settled`, `tool_result`, `setStatus`).
 
 ## `agency-decide-mcp`
 
