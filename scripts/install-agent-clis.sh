@@ -32,14 +32,14 @@ claude|Claude Code|@anthropic-ai/claude-code@2.1.251|standard
 pi|Pi|@earendil-works/pi-coding-agent@0.84.4|pi
 EOF
 
-if (( ${#standard_packages[@]} )); then
+if [[ -n ${standard_packages[*]:-} ]]; then
   bun add --global "${standard_packages[@]}"
 fi
-if (( ${#pi_packages[@]} )); then
+if [[ -n ${pi_packages[*]:-} ]]; then
   bun add --global --ignore-scripts "${pi_packages[@]}"
 fi
 
-if (( ${#retained[@]} )); then
+if [[ -n ${retained[*]:-} ]]; then
   printf '⚠ Already installed and left unchanged:\n'
   printf '  - %s\n' "${retained[@]}"
   printf 'To upgrade, update the reviewed version pins and run ./install.sh --update.\n'

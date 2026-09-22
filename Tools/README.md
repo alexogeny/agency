@@ -199,7 +199,7 @@ threshold. Fish also exposes the friendlier `oldtasks` abbreviation.
 
 ## `sandbox`
 
-Runs a command with Bubblewrap using a private process tree, scrubbed
+On Linux, runs a command with Bubblewrap using a private process tree, scrubbed
 environment, and an allowlisted filesystem. The current directory is the only
 writable host path by default, and networking starts disabled. `--internet`
 adds rootless outbound networking through Pasta; `--publish tcp:3000` or
@@ -211,9 +211,43 @@ exact launch command. Run `sandbox --help` for examples and the full interface.
 It shares the host kernel, so use a VM when genuinely hostile code needs a
 separate kernel boundary.
 
-Bubblewrap and Pasta deliberately cover this use case without Firejail. Keeping
-one isolation model makes profiles easier to inspect and avoids depending on
-Firejail's setuid mode.
+On macOS, the same command delegates to `sandbox-macos`, using the pinned
+Anthropic Sandbox Runtime and Apple's native Seatbelt. Default reads cover
+system/runtime paths and the declared workspace; other home files are denied.
+The environment is scrubbed and each run gets a temporary HOME and TMPDIR,
+removed on normal completion. Extra inherited descriptors are closed.
+`--workspace-ro`, `--ro`, `--rw`, `--env`, and `--set-env` retain their purpose.
+`--dry-run` prints the policy as JSON without executing a command or creating
+temporary state. Environment values are omitted from that preview.
+
+Use `--allow-domain HOST` (repeatable, optionally `HOST:PORT`) for macOS network
+access through HTTP/SOCKS proxies. `--internet` requires these explicit grants.
+`--publish` and `--name` need Linux namespaces and are rejected with a VM hint.
+Programs ignoring proxies cannot connect. Native isolation has no private PID,
+hostname, or mount namespace. SRT protects configuration filenames such as
+`.gitconfig` even inside a writable tree; glob-shaped paths are rejected to avoid
+turning a literal grant into a pattern. HOME and temporary-directory variables
+are managed by the adapter and cannot be overridden. Never fall back to running
+unsandboxed when this backend fails. Apple marks `sandbox-exec` deprecated.
+Forwarded variables are applied only to the payload after isolation, not to the
+Node or shell launchers. A sandboxed supervisor preserves signal termination as
+a nonzero exit status instead of relying on SRT's child-signal status mapping.
+
+`Tests/test_sandbox_macos.py` checks argument and policy handling on either OS.
+`python -m unittest discover -s Tests/macos -v` verifies actual Seatbelt read,
+write, environment, descriptor, and network enforcement on macOS. That suite
+requires Node, the pinned `srt`, and `sandbox-exec`; it is a separate macOS CI
+step and fails if run without its native prerequisites.
+`Tests/test_sandbox_linux.py` checks Linux launcher argv and exit propagation
+with fixtures on either host (Bash 4+ required). The separate Linux CI command
+`python -m unittest discover -s Tests/linux -v` exercises real Bubblewrap and
+Pasta, including preload environment isolation and signal statuses.
+Ubuntu CI loads `.github/ci/sandbox-userns.apparmor` to grant namespace creation
+to `/usr/bin/bwrap` and `/usr/bin/pasta`, following Ubuntu's
+[application-specific user namespace policy](https://discourse.ubuntu.com/t/ubuntu-24-04-lts-noble-numbat-release-notes/39890).
+The tests remain unprivileged; the workflow does not disable AppArmor or its
+system-wide user namespace restriction. These CI profiles are not installed on
+workstations.
 
 ## `agent-work`
 
@@ -334,13 +368,33 @@ other tooling, and `system-context --refresh` to bypass the accelerator cache.
 
 ## `sudo-gui`
 
-Gives an explicitly approved sudo operation a one-attempt KDE askpass helper.
+On Linux, gives an explicitly approved sudo operation a one-attempt KDE askpass helper.
 Direct sudo commands authenticate and execute in the same sudo invocation;
 script workflows receive a private PATH-scoped sudo proxy. Sudo reuses valid
 authorization or command-specific `NOPASSWD` rules without a dialog. The helper
 refuses to prompt during an active PAM lockout and blocks sudo password retries.
 Passwords remain in the dialog process memory only and are not written to
 files, arguments, environment variables, or captured output.
+
+On macOS, `sudo-gui --prompt "Reason" -- sudo COMMAND` requests authorization
+through the system administrator dialog. A fixed AppleScript receives the
+prompt and shell-quoted argv as data, never password arguments. Cancellation
+returns 130 with no retry; command failures retain their reported exit status.
+macOS may replace the custom prompt with generic system text.
+`--dry-run` prints a preview without authorizing anything.
+
+For `sudo-gui -- ./workflow.sh`, the script runs as the normal user and only
+PATH-resolved sudo commands are redirected. A failed or cancelled request
+blocks later proxy calls even if the workflow ignores the failure. Absolute
+sudo paths bypass the proxy. No reusable sudo timestamp is created, and later
+commands may need another OS authorization request. The native API buffers text
+output and supplies no interactive stdin or TTY. Sudo options are unsupported;
+use a visible terminal for interactive or identity-changing commands.
+
+This does not change PAM or guarantee Touch ID. The macOS authentication
+dialog owns password entry; Touch ID for ordinary sudo is a separate
+`pam_tid.so` configuration. The native adapter and argument/cancellation tests
+live in `sudo-gui-macos` and `Tests/test_sudo_gui_macos.py`.
 
 ## `web-research`
 

@@ -873,7 +873,10 @@ const numericTemplatePreferences = new Map<string, [number, number]>([
 function firefoxConfigurationRoot() {
   return (
     process.env.WEB_RESEARCH_FIREFOX_ROOT ||
-    join(homedir(), ".mozilla/firefox")
+    join(
+      homedir(),
+      process.platform === "darwin" ? "Library/Application Support/Firefox" : ".mozilla/firefox",
+    )
   );
 }
 

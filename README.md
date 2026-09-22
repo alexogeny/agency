@@ -1,6 +1,6 @@
 # 🎀 Agency
 
-Agency turns a fresh CachyOS/Arch workstation into a capable, evidence-minded
+Agency turns a fresh macOS or CachyOS/Arch workstation into a capable, evidence-minded
 home for Codex, Claude Code, and Pi. It combines a declarative bootstrap with an
 operating model for reliable agent work. A compact global policy handles shared
 rules. Specialised skills load when needed, and small tools leave useful
@@ -97,17 +97,18 @@ and atomic subtree yielding without forcing either task into another worktree.
 ### Give a workload a clean room
 
 The [`sandbox`](Skills/sandbox/SKILL.md) skill and `sandbox` command run tests,
-builds, experiments, and services inside Bubblewrap. The current workspace is
+builds and experiments inside Bubblewrap on Linux or native Seatbelt through
+Anthropic Sandbox Runtime on macOS. The current workspace is
 the only writable project path by default. Other home files and inherited
-variables are hidden, networking is off, and the process tree is private.
+variables are hidden and networking is off. Linux also has a private process tree.
 
 ```console title="sandbox-tests"
-sandbox -- python3 -m unittest -v Tests.test_install_helpers
+sandbox -- python3 -m unittest -v Tests.test_report_fonts
 ```
 
 The full suite runs offline with fake provider and 1Password responses. Keep
 live `agency-decide evaluate` runs separate: they use OpenRouter credit. For an
-unattended full run, expose only the report fonts:
+unattended full run on Linux, expose only the report fonts:
 
 ```console title="sandbox-full-tests"
 sandbox --ro "$HOME/.local/share/fonts/cm-unicode" \
@@ -122,6 +123,15 @@ sandbox --ro ./fixtures --rw ./results -- COMMAND...
 sandbox --internet -- COMMAND...
 sandbox --publish tcp:8080 -- COMMAND...
 ```
+
+On macOS, use `--allow-domain HOST` for each required network destination;
+`--internet` alone, `--publish`, and `--name` are not supported. HTTP/SOCKS
+proxies enforce the network grants. There is no private PID or mount namespace.
+Seatbelt also protects shell, Git, and agent configuration filenames even inside
+writable paths, so tests intentionally writing `.gitconfig` need a different
+approved environment. The macOS runtime is pinned in the installer; Apple marks
+its underlying `sandbox-exec` command deprecated. See the sandbox skill for
+the platform-specific limits.
 
 This is a strong boundary against accidental ambient state, not a separate
 kernel. Genuinely hostile code belongs in a VM. Credentials stay outside the
@@ -417,8 +427,8 @@ sees it, without borrowing a warm cache or a conveniently configured home.
 
 ## Supporting cast
 
-- `sudo-gui` runs one approved root operation through sudo's one-attempt KDE
-  askpass path without capturing the password or relying on a cached timestamp.
+- `sudo-gui` runs approved administrator operations through native macOS
+  authorization or Linux KDE askpass. macOS controls the authentication wording.
 - `comment-audit` finds empty, decorative, and historical comments without
   editing source or treating heuristic findings as verdicts.
 - [`assess`](Skills/assess/SKILL.md) evaluates writing, creative work, or
@@ -438,6 +448,101 @@ cd /path/to/agency
 ./install.sh
 ./install.sh --update
 ```
+
+The installer automatically selects macOS on a Mac and Arch/CachyOS on Linux.
+Use `./install.sh --platform macos --dry-run` or `--platform linux --dry-run`
+to preview either platform from any machine. Real installation refuses a
+platform that does not match the host; other Linux distributions are unsupported.
+
+### macOS setup
+
+Run `./install.sh` on your Mac. macOS is detected automatically and Homebrew is included in the bootstrap:
+
+```sh
+./install.sh --dry-run
+./install.sh
+```
+
+Agency reuses Homebrew from the current PATH or the standard Apple Silicon and
+Intel prefixes. If Homebrew is missing, it downloads the official installer at
+commit `d797f6b3d244abc548808fd75b879ca6860c653f`, verifies its recorded SHA-256,
+and runs it with its normal confirmation and sudo prompts. Download, checksum,
+or installation failures stop setup before package installation. The official
+installer handles missing Apple Command Line Tools, including any interactive
+macOS prompts; no separate Homebrew installation step is required. Current
+upstream bootstrapping supports Apple Silicon; existing Intel installations are
+reused. See [Homebrew's installation documentation](https://docs.brew.sh/Installation)
+for its current operating-system support.
+
+Agency then installs Homebrew Bash before continuing, so the initial command and dry run work with
+Apple's built-in Bash 3.2. Formulae live in `packages-macos.txt`; Firefox,
+1Password, 1Password CLI, and Fantasque Sans Mono Nerd Font use casks. Existing formulae and casks are retained
+unless `--update` is supplied; apps installed outside Homebrew keep their own
+update mechanism. Repository-pinned agent and Python tools keep the same update
+policy as Linux.
+
+Both modes install the shared agents, skills, hooks, Git configuration, report
+fonts, Fish configuration and Starship prompt. Mac mode backs up Terminal
+preferences and makes new Terminal windows open Homebrew Fish, with Agency's
+prompt and shortcuts. The account login shell stays unchanged. Open a new
+Terminal window after setup; restart Terminal if it retains the previous shell.
+Mac mode also adds tool paths to `~/.zprofile`, discovers Firefox profiles under
+`~/Library/Application Support/Firefox`, and installs the browser policy inside
+`/Applications/Firefox.app/Contents/Resources/distribution`. Re-run setup after
+replacing the Firefox app if that policy directory is lost. The context hook
+reads macOS memory and power state using `sysctl` and `pmset`.
+
+On both platforms, matching Firefox policy content needs no privileged write.
+Changed content is backed up, staged beside the destination, then renamed into
+place. Copy or rename failures leave the previous policy intact.
+
+The `firefox` command uses a launcher that executes the binary inside its app
+bundle. Symlinking the macOS binary directly can fail with "Couldn't load XPCOM."
+For the prompt's icons, select **FantasqueSansM Nerd Font Mono** in Terminal >
+Settings > Profiles > Text > Font. To return to the account's login shell,
+select **Default login shell** in Terminal > Settings > General.
+
+The macOS package list covers Agency's portable tools and common terminal
+utilities from [CachyOS's default package selection](https://github.com/CachyOS/cachyos-calamares/blob/cachyos/src/modules/netinstall/netinstall.yaml)
+and [Fish package dependencies](https://github.com/CachyOS/CachyOS-PKGBUILDS/blob/master/cachyos-fish-config/PKGBUILD).
+It does not reproduce the Linux desktop or every optional application.
+
+| CachyOS capability | macOS coverage |
+| --- | --- |
+| Fish, `eza`, `fzf`, `bat`, `fastfetch`, `tealdeer`, Nerd Font | Homebrew formulae and font cask; Agency supplies Starship and its own Fish configuration. |
+| `duf`, `pv`, `rsync`, `wget`, `ripgrep`, `nano` | Explicit Homebrew formulae. |
+| C/C++ compiler, `make`, SDK | Apple Command Line Tools, checked during Homebrew bootstrap; not the entire Arch `base-devel` group. |
+| SSH, archive extraction, DNS lookup | macOS supplies `ssh`, `tar`, `unzip`, and `dig`; their options can differ from Linux. |
+| English Tesseract OCR | Homebrew `tesseract` includes English data. |
+| `bubblewrap` / `bwrap` | [Requires Linux even in Homebrew](https://formulae.brew.sh/formula/bubblewrap); Agency's `sandbox` selects native Seatbelt through Sandbox Runtime on macOS. |
+| `perf`, `strace`, `sysstat`, `iotop-c`, `powertop` | Linux diagnostics are omitted; native tools include Instruments, `sample`, `fs_usage`, `iostat`, and `pmset`, with different capabilities and permissions. |
+| Podman, `passt`, `fuse-overlayfs` | Native Podman client; the container engine, networking, and storage run inside a Linux VM. |
+| `expac`, `pkgfile`, AUR, KDE, systemd | Linux package and desktop integration; no macOS installation. |
+
+Alternative terminals, editors, and monitors from CachyOS, such as Alacritty,
+Micro, Meld, and Glances, remain optional. CachyOS's Pure prompt and Fish plugins
+are not required by Agency's Fish configuration.
+
+On macOS, Podman runs in a Linux VM. Setup installs its tools; initialize and
+start a VM when needed with `podman machine init` and `podman machine start`.
+Existing Docker installations are preserved. Linux-only utilities
+(`long-processes`, `perf-diagnose`, `instruction-bench` and
+`resource-bench`) are not installed on Macs. Skills that require those tools
+need a Linux environment. Agent-work's process-liveness field is unavailable
+on macOS; its task ledger and claims still work. KDE power policy, system-wide
+DNS changes, scheduler configuration, AUR packages, and the trim timer apply
+only to Linux. Browser DNS policy applies on both platforms.
+
+`sudo-gui --prompt "Explain the approved operation" -- sudo COMMAND` uses
+macOS's native administrator dialog. It never handles the password. The account
+authentication policy is unchanged, and Touch ID is not guaranteed by this API.
+macOS may show generic system text instead of the requested custom prompt.
+Use `--dry-run` to inspect the command without opening a dialog. For workflows,
+`sudo-gui -- ./script.sh` runs the script as the normal user and redirects only
+PATH-resolved sudo calls. Native elevated commands have buffered text output and
+no interactive input; use a visible terminal for interactive installers.
+
+### Shared installation behavior
 
 Run the dry run first. It resolves hardware, existing files, backups, hook
 merges, Git migration, packages, services, tools, and skills without requesting
@@ -459,12 +564,13 @@ them. Combine `--dry-run --update` to inspect that plan first.
 migrates an older `~/scratch` without overwriting conflicts. Disposable outputs
 and caches may still use scoped temporary directories.
 
-The installer asks for `sudo` once and refreshes that authorisation while it
-runs. Agent CLIs install through Bun under `~/.bun`; Python tools use uv; and
+On Linux, the installer asks for `sudo` once and refreshes that authorisation
+while it runs. On macOS, Homebrew and application policy writes request elevated
+access only when needed. Agent CLIs install through Bun under `~/.bun`; Python tools use uv; and
 rootless Podman is the only container stack. Node remains only as a compatibility
 runtime for vendor launchers.
 
-## What the workstation receives
+## What the Linux workstation receives
 
 - **Terminal experience:** animated phased progress, compact results, quiet Git
   transport, failure detail on demand, and accessible plain or reduced-motion
@@ -509,10 +615,10 @@ install.sh    idempotent entry point
 Review the dry run and scripts before installing on another machine. Firefox
 must restart before its policy is visible in `about:policies`.
 
-System DNS uses strict Cloudflare Families DNS-over-TLS with no plaintext
+On Linux, system DNS uses strict Cloudflare Families DNS-over-TLS with no plaintext
 fallback. Networks that block TCP 853 need a temporary override or VPN.
 
-Desktop installations mask sleep, suspend, hibernate, and hybrid-sleep while
+Linux desktop installations mask sleep, suspend, hibernate, and hybrid-sleep while
 keeping display power saving active. Laptop installations leave those targets
 available and select a portable AC/battery policy. Both chassis type and system
 batteries inform the choice.

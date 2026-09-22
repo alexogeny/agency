@@ -1,4 +1,5 @@
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -23,7 +24,7 @@ class UserToolInstallTests(unittest.TestCase):
         self.bin = self.workspace / "bin"
         self.bin.mkdir()
         self.log = self.workspace / "commands.log"
-        (self.bin / "bash").symlink_to("/usr/bin/bash")
+        (self.bin / "bash").symlink_to(shutil.which("bash"))
 
     def tearDown(self):
         self.temporary.cleanup()

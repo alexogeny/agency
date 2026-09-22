@@ -31,7 +31,7 @@ thoreau|Thoreau|git+https://github.com/alexogeny/thoreau.git@cf2b9a65d5d5116a497
 podman-compose|podman-compose|podman-compose==1.6.0
 EOF
 
-if (( ${#retained[@]} )); then
+if [[ -n ${retained[*]:-} ]]; then
   printf '⚠ Already installed and left unchanged:\n'
   printf '  - %s\n' "${retained[@]}"
   printf 'To upgrade, update the reviewed version pins and run ./install.sh --update.\n'
