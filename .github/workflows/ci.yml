@@ -41,10 +41,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
+            bubblewrap \
             curl \
             fish \
             fontconfig \
             poppler-utils \
+            passt \
             xz-utils
 
       - name: Restore report fonts
@@ -71,9 +73,44 @@ jobs:
           done < <(git grep -l '^#!/usr/bin/env bash')
 
       - name: Exercise installer plan
-        run: ./install.sh --dry-run
+        run: ./install.sh --platform linux --dry-run
 
       - name: Run tests
         env:
           AGENCY_TEST_SCRATCH: ${{ runner.temp }}/agency-tests
         run: python -m unittest discover -s Tests -v
+
+      - name: Verify Linux sandbox enforcement
+        run: python -m unittest discover -s Tests/linux -v
+
+  macos:
+    name: macOS bootstrap
+    runs-on: macos-14
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Check stock Bash compatibility and preview both platforms
+        run: |
+          for script in install.sh scripts/*.sh; do /bin/bash -n "$script"; done
+          /bin/bash install.sh --platform macos --dry-run
+          /bin/bash install.sh --platform linux --dry-run
+      - name: Exercise platform setup without changing the workstation
+        run: >-
+          python -m unittest -v Tests.test_macos_install
+          Tests.test_install_helpers Tests.test_user_tool_install
+          Tests.test_firefox_config Tests.test_system_context
+          Tests.test_sandbox_macos Tests.test_sudo_gui_macos
+          Tests.test_policy_install
+      - name: Install native sandbox runtime
+        run: bun add --global --ignore-scripts @anthropic-ai/sandbox-runtime@0.0.77
+      - name: Verify macOS sandbox enforcement
+        run: python -m unittest discover -s Tests/macos -v

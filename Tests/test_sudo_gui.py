@@ -1,5 +1,7 @@
 import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +23,15 @@ class SudoGuiTests(unittest.TestCase):
         self.calls.mkdir()
         self.config = self.workspace / "faillock.conf"
         self.config.write_text("deny = 3\nunlock_time = 600\nfail_interval = 900\n")
+        self.write_executable("uname", 'printf "Linux\\n"')
+        if sys.platform == "darwin":
+            parse_date = "import datetime,sys; print(int(datetime.datetime.strptime(sys.argv[1], '%Y-%m-%d %H:%M:%S').timestamp()))"
+            self.write_executable(
+                "date",
+                'if [[ ${1:-} == -d ]]; then\n'
+                f'  exec {shlex.quote(sys.executable)} -c {shlex.quote(parse_date)} "$2"\n'
+                'fi\nexec /bin/date "$@"',
+            )
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -34,6 +45,7 @@ class SudoGuiTests(unittest.TestCase):
     def environment(self, **values):
         return {
             **os.environ,
+            "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
             "SUDO_GUI_KDIALOG": str(self.bin / "kdialog"),
             "SUDO_GUI_SUDO": str(self.bin / "sudo"),
             "SUDO_GUI_FAILLOCK": str(self.bin / "faillock"),

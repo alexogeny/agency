@@ -45,6 +45,27 @@ agency_backup_copy() {
   printf 'Backed up %s to %s\n' "$target" "$backup"
 }
 
+agency_install_policy() (
+  set -euo pipefail
+  policy_source=$1 policy_target=$2
+  if [[ -f $policy_target ]] && cmp -s -- "$policy_source" "$policy_target"; then
+    return
+  fi
+  policy_temporary=$(mktemp -d /tmp/agency-firefox-policy.XXXXXX) || return
+  trap 'rm -f -- "$policy_temporary/policies.json"; rmdir -- "$policy_temporary"' EXIT
+  install -m600 "$policy_source" "$policy_temporary/policies.json" || return
+  agency_backup_copy "$policy_target" || return
+  agency_as_root /bin/sh -c '
+    set -eu
+    target_directory=$(dirname -- "$2")
+    mkdir -p -- "$target_directory"
+    staging=$(mktemp -d "$target_directory/.agency-policy.XXXXXX")
+    trap '\''rm -f -- "$staging/policies.json"; rmdir -- "$staging"'\'' EXIT
+    install -m644 "$1" "$staging/policies.json"
+    mv -f -- "$staging/policies.json" "$2"
+  ' agency-install-policy "$policy_temporary/policies.json" "$policy_target"
+)
+
 agency_link() {
   local source=$1
   local target=$2
@@ -68,7 +89,7 @@ agency_link() {
     printf 'Backed up %s to %s\n' "$target" "$backup"
   fi
 
-  ln -sfnT -- "$source" "$target"
+  ln -sfn -- "$source" "$target"
 }
 
 agency_link_as_root() {
@@ -94,7 +115,7 @@ agency_link_as_root() {
     printf 'Backed up %s to %s\n' "$target" "$backup"
   fi
 
-  agency_as_root ln -sfnT -- "$source" "$target"
+  agency_as_root ln -sfn -- "$source" "$target"
 }
 
 agency_install_git_identity() {
@@ -148,6 +169,10 @@ agency_preserve_git_config() {
 agency_prepare_scratch() {
   local canonical="$HOME/Scratch"
   local legacy="$HOME/scratch"
+
+  if [[ -e $legacy && -e $canonical && $legacy -ef $canonical ]]; then
+    return
+  fi
 
   if [[ -d $legacy && ! -L $legacy && ! -e $canonical && ! -L $canonical ]]; then
     mv -- "$legacy" "$canonical"

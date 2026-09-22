@@ -1,6 +1,6 @@
 ---
 name: sudo-gui
-description: Obtain explicitly authorized sudo access through one KDE password dialog and run the approved local workflow in the same authorization context. Use when a Linux task needs sudo, the user has approved that root action, and a KDE graphical session is available.
+description: Run explicitly authorized administrator operations through a native macOS authorization dialog or Linux KDE sudo askpass, with an optional task-specific message and no automatic retry.
 ---
 
 # GUI sudo authorization
@@ -15,6 +15,37 @@ Run the approved workflow in the same invocation:
 sudo-gui -- ./install.sh
 sudo-gui -- sudo systemctl restart example.service
 ```
+
+Check `uname -s` before selecting platform-specific behavior.
+
+On macOS, use `sudo-gui --prompt "Reason for this operation" -- sudo COMMAND`
+for one elevated command. `--dry-run` previews it without requesting access.
+The tool passes the prompt and quoted command as arguments to a fixed
+AppleScript, using `do shell script ... with administrator privileges`.
+macOS owns the authentication dialog; the tool never receives a password.
+The OS may replace the requested prompt with generic system text. Do not
+promise the reason will appear inside the authentication dialog.
+One native authorization request is made; the OS controls attempts within its
+dialog. Cancellation returns 130 and is not automatically retried.
+
+For `sudo-gui -- ./approved-workflow.sh`, the workflow remains the normal user;
+only PATH-resolved `sudo` calls request native authorization. Absolute
+`/usr/bin/sudo` calls bypass this adapter. Stop the workflow on failure. After
+one failed or cancelled authorization, later proxy calls are refused. Each
+successful privileged command uses the OS authorization context; a later
+command may prompt again. Do not claim this creates a reusable sudo timestamp.
+Native commands use buffered text output and have no interactive stdin/TTY.
+Run interactive installers in a visible terminal instead. Sudo flags such as
+`-u`, `-S`, `-n`, or `-v` are deliberately unsupported by the macOS proxy.
+
+Do not promise Touch ID: native Authorization Services and sudo's PAM stack
+are different mechanisms. Touch ID for ordinary sudo requires the system's
+`pam_tid.so` configuration and an eligible session. Never change
+`/etc/pam.d/sudo` or `sudo_local` merely to run this helper; configuring that
+authentication policy requires a separate explicit user request. Do not collect
+a password in a custom dialog or use it as AppleScript's `password` argument.
+
+On Linux with KDE:
 
 The tool gives the exact requested sudo command a one-attempt KDE askpass
 helper. For a script or installer, it temporarily routes PATH-resolved `sudo`

@@ -47,6 +47,11 @@ agency_plan_scratch() {
   local canonical="$HOME/Scratch"
   local legacy="$HOME/scratch"
 
+  if [[ -e $legacy && -e $canonical && $legacy -ef $canonical ]]; then
+    printf '  [%-16s] %s (same directory on a case-insensitive filesystem)\n' "directory exists" "$canonical"
+    return
+  fi
+
   if [[ -d $legacy && ! -L $legacy && ! -e $canonical && ! -L $canonical ]]; then
     printf '  [%-16s] %s -> %s\n' "rename directory" "$legacy" "$canonical"
   elif [[ -d $legacy && ! -L $legacy && -d $canonical && ! -L $canonical ]]; then
@@ -134,6 +139,11 @@ agency_plan_user_links() {
   )
 
   for tool in "${tools[@]}"; do
+    if [[ ${AGENCY_PLATFORM:-linux} == macos ]]; then
+      case $tool in
+        long-processes|instruction-bench|resource-bench|perf-diagnose) continue ;;
+      esac
+    fi
     agency_plan_link "$AGENCY_DIR/Tools/$tool" "$HOME/.local/bin/$tool"
   done
   agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
@@ -183,8 +193,19 @@ agency_plan_power() {
 agency_print_install_plan() {
   local update=${1:-false}
   local -a packages competing
-  mapfile -t packages < <(sed -E '/^[[:space:]]*(#|$)/d' "$AGENCY_DIR/packages.txt")
-  mapfile -t competing < <(pacman -Qq docker docker-compose nerdctl 2>/dev/null || true)
+  if [[ ${AGENCY_PLATFORM:-linux} == macos ]]; then
+    source "$AGENCY_DIR/scripts/install-macos.sh"
+    agency_print_macos_plan "$update"
+    return
+  fi
+  packages=()
+  competing=()
+  while IFS= read -r package; do
+    packages+=("$package")
+  done < <(sed -E '/^[[:space:]]*(#|$)/d' "$AGENCY_DIR/packages.txt")
+  while IFS= read -r package; do
+    competing+=("$package")
+  done < <(pacman -Qq docker docker-compose nerdctl 2>/dev/null || true)
 
   printf '\033[1;35mAGENCY INSTALL — DRY RUN\033[0m\n'
   printf 'Checkout: %s\n' "$AGENCY_DIR"
@@ -195,7 +216,7 @@ agency_print_install_plan() {
   agency_plan_user_links
 
   printf '\n\033[1mPackages and developer runtimes\033[0m\n'
-  if (( ${#competing[@]} )); then
+  if [[ -n ${competing[*]:-} ]]; then
     printf '  [%-16s] pacman -Rns --noconfirm %s\n' \
       "remove frontend" "${competing[*]}"
   else
