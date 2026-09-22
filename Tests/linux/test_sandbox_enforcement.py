@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class BubblewrapEnforcementTests(unittest.TestCase):
     def setUp(self):
         self.assertEqual(sys.platform, "linux", "Run this enforcement suite on Linux")
+        self.assertNotEqual(os.geteuid(), 0, "Run these tests as an unprivileged user")
         self.assertIsNotNone(shutil.which("bwrap"))
         self.assertIsNotNone(shutil.which("pasta"))
         self.temporary = tempfile.TemporaryDirectory()

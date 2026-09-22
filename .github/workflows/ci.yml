@@ -75,13 +75,16 @@ jobs:
       - name: Exercise installer plan
         run: ./install.sh --platform linux --dry-run
 
+      - name: Allow sandbox launchers to create user namespaces on the CI runner
+        run: sudo apparmor_parser --replace .github/ci/sandbox-userns.apparmor
+
+      - name: Verify Linux sandbox enforcement
+        run: python -m unittest discover -s Tests/linux -v
+
       - name: Run tests
         env:
           AGENCY_TEST_SCRATCH: ${{ runner.temp }}/agency-tests
         run: python -m unittest discover -s Tests -v
-
-      - name: Verify Linux sandbox enforcement
-        run: python -m unittest discover -s Tests/linux -v
 
   macos:
     name: macOS bootstrap

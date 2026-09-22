@@ -242,6 +242,12 @@ step and fails if run without its native prerequisites.
 with fixtures on either host (Bash 4+ required). The separate Linux CI command
 `python -m unittest discover -s Tests/linux -v` exercises real Bubblewrap and
 Pasta, including preload environment isolation and signal statuses.
+Ubuntu CI loads `.github/ci/sandbox-userns.apparmor` to grant namespace creation
+to `/usr/bin/bwrap` and `/usr/bin/pasta`, following Ubuntu's
+[application-specific user namespace policy](https://discourse.ubuntu.com/t/ubuntu-24-04-lts-noble-numbat-release-notes/39890).
+The tests remain unprivileged; the workflow does not disable AppArmor or its
+system-wide user namespace restriction. These CI profiles are not installed on
+workstations.
 
 ## `agent-work`
 
