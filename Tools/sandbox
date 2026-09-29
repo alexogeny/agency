@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $(uname -s) == Darwin ]]; then
+  tool_path=$(realpath -- "${BASH_SOURCE[0]}")
+  exec python3 "$(dirname -- "$tool_path")/sandbox-macos" "$@"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: sandbox [OPTIONS] [--] [COMMAND [ARG...]]

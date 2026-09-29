@@ -3,8 +3,10 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -294,7 +296,43 @@ def resource_policy(device, power):
     )
 
 
+def macos_output(*command):
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def macos_context():
+    model = macos_output("sysctl", "-n", "hw.model")
+    battery = macos_output("pmset", "-g", "batt")
+    device = "laptop" if "MacBook" in model or "InternalBattery" in battery else "desktop"
+    if "Battery Power" in battery:
+        power = "battery"
+    elif "AC Power" in battery:
+        power = "ac"
+    else:
+        power = "unknown"
+    percent = re.search(r"(\d+)%;", battery)
+    memory = macos_output("sysctl", "-n", "hw.memsize")
+    return {
+        "device_class": device,
+        "power_source": power,
+        "battery_percent": int(percent.group(1)) if percent else None,
+        "logical_cpus": os.cpu_count(),
+        "memory_gib": round(int(memory) / 1024 ** 3, 1) if memory.isdigit() else None,
+        "compute_accelerator": "unknown (use Metal-aware tooling on macOS)",
+        "resource_policy": resource_policy(device, power),
+    }
+
+
 def collect_context(refresh=False):
+    if sys.platform == "darwin" and "AGENCY_SYSFS_ROOT" not in os.environ:
+        return macos_context()
     sysfs = Path(os.environ.get("AGENCY_SYSFS_ROOT", "/sys"))
     procfs = Path(os.environ.get("AGENCY_PROCFS_ROOT", "/proc"))
     dev_root = Path(os.environ.get("AGENCY_DEV_ROOT", "/dev"))

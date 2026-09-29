@@ -288,13 +288,20 @@ class InstallHelperTests(unittest.TestCase):
         self.run_bash('source "$1"; agency_prepare_scratch', LIB)
 
         canonical = self.home / "Scratch"
-        self.assertFalse(legacy.exists())
+        if legacy.exists():
+            self.assertTrue(legacy.samefile(canonical))
         self.assertEqual((canonical / "probe.sh").read_text(), "reusable\n")
 
     def test_existing_scratch_directories_merge_without_overwriting_conflicts(self):
         legacy = self.home / "scratch"
         canonical = self.home / "Scratch"
         legacy.mkdir()
+        if canonical.exists():
+            self.assertTrue(canonical.samefile(legacy))
+            (legacy / "preserved.txt").write_text("preserved\n")
+            self.run_bash('source "$1"; agency_prepare_scratch', LIB)
+            self.assertEqual((canonical / "preserved.txt").read_text(), "preserved\n")
+            return
         canonical.mkdir()
         (legacy / "legacy.txt").write_text("legacy\n")
         (canonical / "canonical.txt").write_text("canonical\n")
@@ -464,7 +471,7 @@ class DryRunTests(unittest.TestCase):
     def test_dry_run_describes_actions_without_mutating_home(self):
         before = self.snapshot()
         result = subprocess.run(
-            [INSTALLER, "--dry-run"],
+            [INSTALLER, "--platform", "linux", "--dry-run"],
             check=False,
             text=True,
             capture_output=True,
@@ -522,7 +529,7 @@ class DryRunTests(unittest.TestCase):
     def test_update_can_be_combined_with_dry_run(self):
         before = self.snapshot()
         result = subprocess.run(
-            [INSTALLER, "--dry-run", "--update"],
+            [INSTALLER, "--platform", "linux", "--dry-run", "--update"],
             check=False,
             text=True,
             capture_output=True,

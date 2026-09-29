@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+SYSTEM_READ_PATHS = (
+    "/System", "/usr", "/bin", "/sbin", "/dev", "/etc", "/private/etc",
+    "/Applications", "/Library/Apple", "/Library/Developer",
+    "/Library/Frameworks", "/Library/Fonts",
+)
+RUNTIME_PATHS = (
+    "bin", "sbin", "lib", "opt", "Cellar", "share", "Frameworks",
+    "etc/openssl@3/openssl.cnf",
+)
+DEFAULT_PATH = (
+    "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:"
+    "/usr/bin:/bin:/usr/sbin:/sbin"
+)
+PRIVATE_ENV = {"HOME", "TMPDIR", "CLAUDE_CODE_TMPDIR", "CLAUDE_TMPDIR"}
+
+
+def literal_path(value):
+    path = str(Path(value).expanduser().resolve(strict=True))
+    if any(character in path for character in "*?[]{}\\\n\r"):
+        raise ValueError(f"Paths containing glob syntax or line breaks are unsupported: {path}")
+    return path
+
+
+def parse_arguments(argv):
+    parser = argparse.ArgumentParser(
+        description="Run a native macOS command using Seatbelt through Anthropic Sandbox Runtime."
+    )
+    parser.add_argument("-w", "--workspace", default=os.getcwd())
+    parser.add_argument("--workspace-ro", action="store_true")
+    parser.add_argument("--ro", action="append", default=[])
+    parser.add_argument("--rw", action="append", default=[])
+    parser.add_argument(
+        "--internet", action="store_true",
+        help="Enable proxy networking; requires --allow-domain on macOS",
+    )
+    parser.add_argument(
+        "--allow-domain", action="append", default=[],
+        help="Allow a domain or domain:port through the proxies",
+    )
+    parser.add_argument("--no-internet", action="store_true")
+    parser.add_argument("-e", "--env", action="append", default=[])
+    parser.add_argument("--set-env", action="append", default=[])
+    parser.add_argument("--publish", action="append", default=[])
+    parser.add_argument("--name")
+    parser.add_argument("--dry-run", action="store_true", help="Print the policy as JSON without launching anything")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.publish or args.name:
+        parser.error("Hostname isolation and port publishing require a Linux VM; macOS has no equivalent namespace.")
+    if args.no_internet and (args.internet or args.allow_domain):
+        parser.error("--no-internet cannot be combined with network grants")
+    if args.internet and not args.allow_domain:
+        parser.error(
+            "macOS proxy networking requires --allow-domain HOST (repeatable); "
+            "unrestricted networking is not enabled"
+        )
+    args.workspace = literal_path(args.workspace)
+    if not Path(args.workspace).is_dir():
+        parser.error("The workspace must be a directory")
+    if args.workspace in ("/", str(Path.home().resolve())):
+        parser.error("Choose a project directory, not the filesystem root or your home directory")
+    args.ro = [literal_path(path) for path in args.ro]
+    args.rw = [literal_path(path) for path in args.rw]
+    args.forwarded = {}
+    for name in args.env:
+        if name not in os.environ:
+            parser.error(f"Host environment variable is unset: {name}")
+        args.forwarded[name] = os.environ[name]
+    for assignment in args.set_env:
+        name, separator, value = assignment.partition("=")
+        if not separator:
+            parser.error("--set-env expects NAME=VALUE")
+        args.forwarded[name] = value
+    for name in args.forwarded:
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", name):
+            parser.error(f"Invalid environment name: {name}")
+        if name in PRIVATE_ENV:
+            parser.error(f"{name} is managed by the sandbox to keep temporary data private")
+    if args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    if not args.command:
+        args.command = ["/bin/bash", "--noprofile", "--norc"]
+    return args
+
+
+def settings_for(args, run_root):
+    system_paths = [path for path in SYSTEM_READ_PATHS if Path(path).exists()]
+    for prefix in ("/opt/homebrew", "/usr/local"):
+        for name in RUNTIME_PATHS:
+            path = Path(prefix, name)
+            if path.exists():
+                system_paths.append(str(path))
+    return {
+        "network": {
+            "allowedDomains": args.allow_domain,
+            "deniedDomains": [],
+            "allowLocalBinding": False,
+            "allowAllUnixSockets": False,
+        },
+        "filesystem": {
+            "denyRead": ["/"],
+            "allowRead": list(dict.fromkeys([*system_paths, args.workspace, *args.ro, *args.rw, run_root])),
+            "allowWrite": [*([] if args.workspace_ro else [args.workspace]), *args.rw, run_root],
+            "denyWrite": ["/tmp/claude", "/private/tmp/claude", *args.ro],
+        },
+        "allowAppleEvents": False,
+        "enableWeakerNetworkIsolation": False,
+        "enableWeakerNestedSandbox": False,
+    }
+
+
+def main(argv=None):
+    try:
+        args = parse_arguments(argv)
+        if args.dry_run:
+            print(json.dumps({
+                "backend": "macos-seatbelt-srt",
+                "workspace": args.workspace,
+                "command": args.command,
+                "environment_names": sorted(args.forwarded),
+                "settings": settings_for(args, "<private-run-directory>"),
+            }, indent=2))
+            return 0
+        if sys.platform != "darwin":
+            raise ValueError("This backend requires macOS; use sandbox on Linux for Bubblewrap")
+        runtime = shutil.which("srt")
+        node = shutil.which("node")
+        if not runtime or not node or not Path("/usr/bin/sandbox-exec").is_file():
+            raise ValueError(
+                "macOS sandbox dependencies are missing; rerun Agency's installer "
+                "(srt, Node, sandbox-exec required). No command ran."
+            )
+        with tempfile.TemporaryDirectory(prefix="agency-sandbox-", dir="/private/tmp") as temporary:
+            run_root = Path(temporary).resolve()
+            home = run_root / "home"
+            temp = run_root / "tmp"
+            home.mkdir()
+            temp.mkdir()
+            settings = run_root / "settings.json"
+            settings.write_text(json.dumps(settings_for(args, str(run_root))))
+            environment = {
+                "HOME": str(home), "TMPDIR": str(temp), "CLAUDE_CODE_TMPDIR": str(temp),
+                "USER": "sandbox", "LOGNAME": "sandbox", "SHELL": "/bin/bash",
+                "PATH": DEFAULT_PATH, "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+                "TERM": os.environ.get("TERM", "xterm-256color"),
+            }
+            payload = [
+                "/usr/bin/env",
+                *(f"{name}={value}" for name, value in args.forwarded.items()),
+                *args.command,
+            ]
+            # SRT maps child signals to success; reap the payload inside Seatbelt.
+            supervisor = [
+                "/bin/bash", "--noprofile", "--norc", "-c",
+                '"$@"; result=$?; exit "$result"', "agency-sandbox", *payload,
+            ]
+            command = [
+                node, str(Path(runtime).resolve()), "--settings", str(settings),
+                "--", *supervisor,
+            ]
+            network = "proxy network" if args.allow_domain else "offline"
+            print(f"sandbox: macOS Seatbelt · {network} · {args.workspace}", file=sys.stderr)
+            result = subprocess.run(command, cwd=args.workspace, env=environment, close_fds=True)
+            return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    except (OSError, ValueError) as error:
+        print(f"sandbox: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

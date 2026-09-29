@@ -3,11 +3,15 @@ set -euo pipefail
 
 AGENCY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$AGENCY_DIR/scripts/lib.sh"
+source "$AGENCY_DIR/scripts/platform.sh"
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--dry-run] [--update]
+Usage: ./install.sh [--dry-run] [--update] [--platform auto|macos|linux]
 
+Run ./install.sh to set up this machine; macOS or Linux is detected automatically.
+
+  --platform Select macOS or Arch/CachyOS Linux (default: auto-detect).
   --dry-run  Inspect the resolved install plan without changing the system.
   --update   Reinstall repository-pinned tools and update stable Rust.
   --help     Show this help.
@@ -17,10 +21,17 @@ Code, Pi, Gantry, Thoreau, and podman-compose are retained and reported instead.
 EOF
 }
 
+original_arguments=("$@")
+platform=auto
 dry_run=false
 update=false
 while (( $# )); do
   case $1 in
+    --platform)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      platform=$2
+      shift
+      ;;
     --dry-run) dry_run=true ;;
     --update) update=true ;;
     --help|-h)
@@ -35,10 +46,40 @@ while (( $# )); do
   shift
 done
 
+case $platform in
+  auto) platform=$(agency_detect_platform) ;;
+  macos|linux) ;;
+  *) printf 'Unknown platform: %s\n' "$platform" >&2; exit 2 ;;
+esac
+export AGENCY_PLATFORM="$platform"
+
 if $dry_run; then
+  export PYTHONDONTWRITEBYTECODE=1
   source "$AGENCY_DIR/scripts/install-dry-run.sh"
   agency_print_install_plan "$update"
   exit
+fi
+
+if [[ $platform != "$(agency_detect_platform)" ]]; then
+  printf 'Platform %s does not match this machine; use --dry-run to preview it.\n' "$platform" >&2
+  exit 2
+fi
+
+if [[ $platform == macos ]]; then
+  (( EUID != 0 )) || { printf 'Run macOS setup as your normal user, not root.\n' >&2; exit 1; }
+  agency_ensure_homebrew
+  brew=$AGENCY_BREW
+  brew_prefix=$("$brew" --prefix)
+  export PATH="$brew_prefix/bin:$brew_prefix/sbin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
+  if (( BASH_VERSINFO[0] < 4 )); then
+    "$brew" list --formula bash >/dev/null 2>&1 || "$brew" install --formula bash
+    exec "$brew_prefix/bin/bash" "$AGENCY_DIR/install.sh" ${original_arguments[@]+"${original_arguments[@]}"}
+  fi
+  source "$AGENCY_DIR/scripts/install-macos.sh"
+  agency_install_macos_packages "$update"
+elif ! command -v pacman >/dev/null 2>&1; then
+  printf 'Linux setup supports Arch/CachyOS and requires pacman.\n' >&2
+  exit 1
 fi
 
 update_arguments=()
@@ -56,7 +97,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Ask once, then refresh sudo's timestamp while the bootstrap is running.
-if (( EUID != 0 )); then
+if [[ $platform == linux ]] && (( EUID != 0 )); then
   sudo -v
   while sleep 50; do
     sudo -n true || exit
@@ -75,24 +116,26 @@ agency_link "$AGENCY_DIR/Tools/agency-decide" "$HOME/.local/bin/agency-decide"
 agency_link "$AGENCY_DIR/Tools/agency-decide-mcp" "$HOME/.local/bin/agency-decide-mcp"
 agency_link "$AGENCY_DIR/Tools/agency-decision-usage" "$HOME/.local/bin/agency-decision-usage"
 agency_link "$AGENCY_DIR/Tools/git-get" "$HOME/.local/bin/git-get"
-agency_link "$AGENCY_DIR/Tools/long-processes" "$HOME/.local/bin/long-processes"
-agency_link "$AGENCY_DIR/Tools/sandbox" "$HOME/.local/bin/sandbox"
 agency_link "$AGENCY_DIR/Tools/agent-work" "$HOME/.local/bin/agent-work"
 agency_link "$AGENCY_DIR/Tools/agent-context" "$HOME/.local/bin/agent-context"
 agency_link "$AGENCY_DIR/Tools/comment-audit" "$HOME/.local/bin/comment-audit"
 agency_link "$AGENCY_DIR/Tools/docs-exec" "$HOME/.local/bin/docs-exec"
 agency_link "$AGENCY_DIR/Tools/document-inspect" "$HOME/.local/bin/document-inspect"
 agency_link "$AGENCY_DIR/Tools/evidence-review" "$HOME/.local/bin/evidence-review"
-agency_link "$AGENCY_DIR/Tools/instruction-bench" "$HOME/.local/bin/instruction-bench"
-agency_link "$AGENCY_DIR/Tools/resource-bench" "$HOME/.local/bin/resource-bench"
-agency_link "$AGENCY_DIR/Tools/perf-diagnose" "$HOME/.local/bin/perf-diagnose"
 agency_link "$AGENCY_DIR/Tools/repo-map" "$HOME/.local/bin/repo-map"
 agency_link "$AGENCY_DIR/Tools/repository-setup" "$HOME/.local/bin/repository-setup"
 agency_link "$AGENCY_DIR/Tools/report-build" "$HOME/.local/bin/report-build"
 agency_link "$AGENCY_DIR/Tools/system-context" "$HOME/.local/bin/system-context"
-agency_link "$AGENCY_DIR/Tools/sudo-gui" "$HOME/.local/bin/sudo-gui"
 agency_link "$AGENCY_DIR/Tools/web-research" "$HOME/.local/bin/web-research"
 agency_link "$AGENCY_DIR/Tools/web-research-mcp" "$HOME/.local/bin/web-research-mcp"
+agency_link "$AGENCY_DIR/Tools/sandbox" "$HOME/.local/bin/sandbox"
+agency_link "$AGENCY_DIR/Tools/sudo-gui" "$HOME/.local/bin/sudo-gui"
+if [[ $platform == linux ]]; then
+  agency_link "$AGENCY_DIR/Tools/long-processes" "$HOME/.local/bin/long-processes"
+  agency_link "$AGENCY_DIR/Tools/instruction-bench" "$HOME/.local/bin/instruction-bench"
+  agency_link "$AGENCY_DIR/Tools/resource-bench" "$HOME/.local/bin/resource-bench"
+  agency_link "$AGENCY_DIR/Tools/perf-diagnose" "$HOME/.local/bin/perf-diagnose"
+fi
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.claude/CLAUDE.md"
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.pi/agent/AGENTS.md"
@@ -116,19 +159,21 @@ for skill_dir in "$AGENCY_DIR"/Skills/*; do
   agency_link "$skill_dir" "$HOME/.pi/agent/skills/$skill_name"
 done
 
-mapfile -t packages < <(sed -E '/^[[:space:]]*(#|$)/d' "$AGENCY_DIR/packages.txt")
+if [[ $platform == linux ]]; then
+  mapfile -t packages < <(sed -E '/^[[:space:]]*(#|$)/d' "$AGENCY_DIR/packages.txt")
 
-# Podman is the one container stack. Remove only explicit competing frontends;
-# shared runtimes such as containerd are left alone in case another package uses them.
-mapfile -t competing_container_packages < <(
-  pacman -Qq docker docker-compose nerdctl 2>/dev/null || true
-)
-if (( ${#competing_container_packages[@]} )); then
-  agency_as_root pacman -Rns --noconfirm "${competing_container_packages[@]}"
+  # Podman is the one container stack. Remove only explicit competing frontends;
+  # shared runtimes such as containerd are left alone in case another package uses them.
+  mapfile -t competing_container_packages < <(
+    pacman -Qq docker docker-compose nerdctl 2>/dev/null || true
+  )
+  if (( ${#competing_container_packages[@]} )); then
+    agency_as_root pacman -Rns --noconfirm "${competing_container_packages[@]}"
+  fi
+
+  agency_as_root pacman -Syu --needed --noconfirm "${packages[@]}"
+  "$AGENCY_DIR/scripts/install-yay-h2load.sh" "${update_arguments[@]}"
 fi
-
-agency_as_root pacman -Syu --needed --noconfirm "${packages[@]}"
-"$AGENCY_DIR/scripts/install-yay-h2load.sh" "${update_arguments[@]}"
 "$AGENCY_DIR/scripts/install-report-fonts.sh"
 
 mkdir -p "$HOME/.config/git"
@@ -144,36 +189,45 @@ agency_link "$AGENCY_DIR/config/git/hooks" "$HOME/.config/git/hooks"
 
 "$AGENCY_DIR/scripts/install-rust.sh" "${update_arguments[@]}"
 "$AGENCY_DIR/scripts/install-agent-clis.sh" "${update_arguments[@]}"
+if [[ $platform == macos ]]; then
+  agency_install_macos_sandbox_runtime "$update"
+fi
 "$AGENCY_DIR/scripts/configure-agent-tools.sh"
 "$AGENCY_DIR/scripts/install-python-tools.sh" "${update_arguments[@]}"
 
-mkdir -p "$HOME/.config/containers"
-agency_link "$AGENCY_DIR/config/containers/containers.conf" \
-  "$HOME/.config/containers/containers.conf"
+if [[ $platform == linux ]]; then
+  mkdir -p "$HOME/.config/containers"
+  agency_link "$AGENCY_DIR/config/containers/containers.conf" \
+    "$HOME/.config/containers/containers.conf"
 
-agency_as_root install -Dm644 "$AGENCY_DIR/firefox/policies.json" /usr/lib/firefox/distribution/policies.json
+  agency_install_policy "$AGENCY_DIR/firefox/policies.json" /usr/lib/firefox/distribution/policies.json
+
+  agency_as_root install -Dm644 "$AGENCY_DIR/system/resolved-cloudflare-family.conf" \
+    /etc/systemd/resolved.conf.d/60-cloudflare-family.conf
+  agency_as_root install -Dm644 "$AGENCY_DIR/system/networkmanager-resolved.conf" \
+    /etc/NetworkManager/conf.d/60-systemd-resolved.conf
+  agency_link_as_root /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+  agency_as_root systemctl enable --now systemd-resolved.service NetworkManager.service
+  agency_as_root systemctl reload-or-restart systemd-resolved.service
+  agency_as_root systemctl reload NetworkManager.service
+else
+  agency_configure_macos
+fi
 "$AGENCY_DIR/scripts/install-firefox.sh"
-
-agency_as_root install -Dm644 "$AGENCY_DIR/system/resolved-cloudflare-family.conf" \
-  /etc/systemd/resolved.conf.d/60-cloudflare-family.conf
-agency_as_root install -Dm644 "$AGENCY_DIR/system/networkmanager-resolved.conf" \
-  /etc/NetworkManager/conf.d/60-systemd-resolved.conf
-agency_link_as_root /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-agency_as_root systemctl enable --now systemd-resolved.service NetworkManager.service
-agency_as_root systemctl reload-or-restart systemd-resolved.service
-agency_as_root systemctl reload NetworkManager.service
 
 mkdir -p "$HOME/.config/fish"
 agency_link "$AGENCY_DIR/config/fish/config.fish" "$HOME/.config/fish/config.fish"
 agency_link "$AGENCY_DIR/config/starship.toml" "$HOME/.config/starship.toml"
-"$AGENCY_DIR/scripts/configure-power.sh"
+if [[ $platform == linux ]]; then
+  "$AGENCY_DIR/scripts/configure-power.sh"
 
-agency_as_root install -Dm644 "$AGENCY_DIR/system/scx_loader.toml" /etc/scx_loader.toml
-agency_as_root systemctl enable --now scx_loader.service
-agency_as_root systemctl restart scx_loader.service
-agency_as_root systemctl enable --now fstrim.timer
+  agency_as_root install -Dm644 "$AGENCY_DIR/system/scx_loader.toml" /etc/scx_loader.toml
+  agency_as_root systemctl enable --now scx_loader.service
+  agency_as_root systemctl restart scx_loader.service
+  agency_as_root systemctl enable --now fstrim.timer
 
-"$AGENCY_DIR/scripts/install-1password.sh" "${update_arguments[@]}"
+  "$AGENCY_DIR/scripts/install-1password.sh" "${update_arguments[@]}"
+fi
 "$AGENCY_DIR/scripts/configure-openrouter.sh" --interactive
 
 printf '\n\033[1;35m✨ Workstation bootstrap complete. Restart Firefox to apply policy.\033[0m\n'

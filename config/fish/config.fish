@@ -1,5 +1,13 @@
 # Keep CachyOS's useful defaults, then layer our portable preferences on top.
-source /usr/share/cachyos-fish-config/cachyos-config.fish
+if test -f /usr/share/cachyos-fish-config/cachyos-config.fish
+    source /usr/share/cachyos-fish-config/cachyos-config.fish
+end
+
+if test -x /opt/homebrew/bin/brew
+    fish_add_path /opt/homebrew/bin /opt/homebrew/sbin /opt/homebrew/opt/rustup/bin
+else if test -x /usr/local/bin/brew
+    fish_add_path /usr/local/bin /usr/local/sbin /usr/local/opt/rustup/bin
+end
 
 set -gx EDITOR nano
 set -gx VISUAL $EDITOR
@@ -27,7 +35,9 @@ if status is-interactive
     abbr --add --position command ls 'eza --group-directories-first'
     abbr --add --position command ll 'eza --long --all --group-directories-first --git'
     abbr --add --position command tree 'eza --tree --group-directories-first'
-    abbr --add --position command oldtasks 'long-processes'
+    if type -q long-processes
+        abbr --add --position command oldtasks 'long-processes'
+    end
 
     # `gcl owner/repo` clones or updates ~/Code/repo, then enters it.
     function gcl --description 'Clone or update a repository under ~/Code'
