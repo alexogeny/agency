@@ -19,6 +19,13 @@ condition and `succeeded` as the outcome. Use `seconds_remaining`,
 needed. Check `gantry telemetry LEASE_ID --json` when utilisation matters and
 `gantry logs LEASE_ID -n 200 --json` when progress stalls or the run fails.
 
+For an unfamiliar diagnostic, use `failure` through
+[decision-routing](../../decision-routing/SKILL.md) with the workload step,
+exit status, and necessary redacted log excerpt. For repeated findings, use
+`novelty` only after matching the lease, workload version, step, and trigger;
+retain source references and new or contradictory evidence. Skip classification
+for explicit exit codes, deadlines, costs, and ordinary progress updates.
+
 Keep supervising until the run reaches a terminal state or the user directs a
 different action. Poll at a sensible interval for the workload; do not create a
 tight loop. If the agent session must stop, leave the user the lease ID,
@@ -40,6 +47,11 @@ release unless continued billing makes immediate release the safer choice.
 State that tradeoff. Never claim a machine was released unless `finish`
 confirmed it. Reconcile with `gantry ps --json` afterwards and report any open
 or unconfirmed lease prominently.
+
+Before retaining consequential result claims, use `claim-fit` against collected
+artifacts and the actual check outcomes, including failures, missing outputs,
+workload limits, and unconfirmed release. A label cannot establish success,
+authorize another lease, or replace the deterministic teardown checks.
 
 Use `gantry reap --all --dry-run` only to inspect possible cleanup. Releasing
 unrelated leases or installing a recurring reaper changes external state and

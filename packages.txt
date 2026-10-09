@@ -36,3 +36,4 @@ plasma-browser-integration
 podman
 passt
 fuse-overlayfs
+rsync

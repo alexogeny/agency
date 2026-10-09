@@ -259,13 +259,28 @@ independent judgments with one credential lookup, per-item errors, and reuse
 within the batch. Labelled evaluation checks preserve mismatches and errors;
 no decision history or personal profile is uploaded automatically.
 
-Daily hooks also cover candidate-test relevance, documentation drift, review
+Daily skill triggers also cover candidate-test relevance, documentation drift, review
 comments, dependency changes, requirement coverage, and whether draft claims
 match their evidence. New contracts remain advisory and require review.
+The shared working agreements make these opportunities visible in routine work;
+[daily evidence packets](Skills/decision-routing/references/daily-use.md) show
+what to supply and how to review the result. Obvious or deterministic choices
+need no classification, and there is no decision quota.
+
+`agency-decide evaluate --input FILE --dry-run` plans larger labelled sets
+offline; live evaluations share one budget and deadline across bounded chunks.
+`agency-decide trial-report --input FILE` compares supplied paired outcomes by
+profile, including preparation, latency, repairs, acceptance, and missing cost
+data. Optional provenance separates model/rubric/workload cohorts, and nullable
+reasoning-token counts preserve missing measurements. The synthetic fixture
+covers all 19 profiles; this is contract coverage, not evidence of productivity
+gains. The report does not collect evidence or enable automation. See the
+[evaluation and trial interface](Tools/README.md#agency-decide).
+
 The installed clients show `Jev: N decisions`, with errors and reused results
 separate: a turn-end hook message in Codex and Claude Code, and a footer item in
 Pi. Counts exclude dry runs and use only observed result receipts; they do not
-change the clients' native elapsed-time line. See
+change the clients' native elapsed-time line or initiate classifications. See
 [`agency-decision-usage`](Tools/README.md#agency-decision-usage) for setup,
 counting boundaries, and private runtime storage.
 
@@ -427,6 +442,11 @@ sees it, without borrowing a warm cache or a conveniently configured home.
 
 ## Supporting cast
 
+- `housekeeping` (also `cleanup`, or `cc` in interactive Fish) scans disk usage
+  with animated folder bars and proposes native cache cleanups and larger
+  directories to review. `--dry-run` lists cache actions, environments and
+  dependencies; `--apply` offers explicit project-folder selection and asks for
+  final confirmation before cleanup.
 - `sudo-gui` runs approved administrator operations through native macOS
   authorization or Linux KDE askpass. macOS controls the authentication wording.
 - `comment-audit` finds empty, decorative, and historical comments without
@@ -564,6 +584,23 @@ them. Combine `--dry-run --update` to inspect that plan first.
 migrates an older `~/scratch` without overwriting conflicts. Disposable outputs
 and caches may still use scoped temporary directories.
 
+On a machine with a larger secondary drive, the installer offers optional
+storage setup before installing tools. `agency-storage` can move `~/.cache`,
+`~/Scratch`, and rootless Podman's `~/.local/share/containers` onto that drive
+and retain their paths through symbolic links. Select `--folders containers`
+to move Podman images and volumes and route image downloads to the same drive.
+It mounts the existing filesystem by UUID at `/mnt/storage`; no relabeling or
+formatting is needed. The choice is stored locally, outside this checkout.
+Unattended installs without a saved choice skip the offer.
+
+Reruns check saved storage first: healthy mounts and links are unchanged, and
+`./install.sh --dry-run` reports their current plan without making changes.
+Drift or an unfinished migration stops installation before it writes to those
+paths. Migration checks for active users and retains original directories as
+backups; reclaiming their space requires separate cleanup after verification.
+See [`agency-storage`](Tools/README.md#agency-storage) for inspection, setup,
+and recovery commands.
+
 On Linux, the installer asks for `sudo` once and refreshes that authorisation
 while it runs. On macOS, Homebrew and application policy writes request elevated
 access only when needed. Agent CLIs install through Bun under `~/.bun`; Python tools use uv; and
@@ -571,6 +608,19 @@ rootless Podman is the only container stack. Node remains only as a compatibilit
 runtime for vendor launchers.
 
 ## What the Linux workstation receives
+
+Package-change snapshots are disabled by the managed
+[`system/snap-pac.ini`](system/snap-pac.ini) policy. The Linux installer merges
+its `[root] snapshot` value into `/etc/snap-pac.ini` before its first package
+transaction, preserving other sections and settings and backing up an existing
+file before changing it. Reruns leave an already matching file untouched.
+Set `snapshot = True` in the managed file to enable these snapshots again.
+
+To apply only this policy on an existing machine, run
+`bash scripts/configure-snapshots.sh` from the checkout. This does not install
+packages, delete existing snapshots, or alter hourly/boot snapshot timers.
+`./install.sh --dry-run` reports the policy without applying it. macOS setup
+does not apply this Linux policy.
 
 - **Terminal experience:** animated phased progress, compact results, quiet Git
   transport, failure detail on demand, and accessible plain or reduced-motion

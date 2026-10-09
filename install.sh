@@ -105,12 +105,22 @@ if [[ $platform == linux ]] && (( EUID != 0 )); then
   sudo_keepalive_pid=$!
 fi
 
+if [[ $platform == linux ]]; then
+  source "$AGENCY_DIR/scripts/configure-storage.sh"
+  agency_configure_storage
+fi
+
 agency_prepare_scratch
 mkdir -p \
   "$HOME/.codex/agents" \
   "$HOME/.claude/agents" \
   "$HOME/.pi/agent/extensions"
 mkdir -p "$HOME/.local/bin"
+if [[ $platform == linux ]]; then
+  agency_link "$AGENCY_DIR/Tools/agency-storage" "$HOME/.local/bin/agency-storage"
+  agency_link "$AGENCY_DIR/Tools/housekeeping" "$HOME/.local/bin/housekeeping"
+  agency_link "$AGENCY_DIR/Tools/housekeeping" "$HOME/.local/bin/cleanup"
+fi
 agency_link "$AGENCY_DIR/Tools/agency-ui" "$HOME/.local/bin/agency-ui"
 agency_link "$AGENCY_DIR/Tools/agency-decide" "$HOME/.local/bin/agency-decide"
 agency_link "$AGENCY_DIR/Tools/agency-decide-mcp" "$HOME/.local/bin/agency-decide-mcp"
@@ -161,6 +171,9 @@ done
 
 if [[ $platform == linux ]]; then
   mapfile -t packages < <(sed -E '/^[[:space:]]*(#|$)/d' "$AGENCY_DIR/packages.txt")
+
+  source "$AGENCY_DIR/scripts/configure-snapshots.sh"
+  agency_configure_snapshots
 
   # Podman is the one container stack. Remove only explicit competing frontends;
   # shared runtimes such as containerd are left alone in case another package uses them.

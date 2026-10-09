@@ -16,7 +16,7 @@ SPEC.loader.exec_module(d)
 
 
 def item(identifier, state='hello'):
-    return {'id': identifier, 'profile': 'context', 'state': state}
+    return {'id': identifier, 'profile': 'context', 'state': {'query': 'Find relevant context.', 'passage': state}}
 
 
 def result():

@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""Single-pass disk inventory with confirmed cache and selected project cleanup."""
+import argparse
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+
+MAX_GROUPS = 4096
+MAX_HARDLINKS = 200000
+MAX_DEPTH = 128
+CATEGORY_LABELS = {
+    'python_environments': 'Python environments',
+    'node_dependencies': 'Node dependencies',
+    'rust_build': 'Rust build output',
+    'build_output': 'Recognized build output',
+    'bytecode': 'Python bytecode',
+    'cache': 'Recognized caches',
+    'git_metadata': 'Git history & metadata',
+    'possible_generated': 'Possible generated folders',
+    'other': 'Source & other files',
+}
+BREAKDOWN_NOTE = ('Categories describe observed structure, not deletion permission. '
+                  'Source & other files includes unclassified data; it is not a verified list of canonical source. '
+                  'Path sizes count each file once; recognized nested environments are split out of uncertain output folders.')
+SIZE_NOTE = ('Observed allocated file bytes and apparent file sizes, not guaranteed reclaimed space. '
+             'Btrfs compression, reflinks, snapshots and hardlinks outside this scan affect recovery. '
+             'Directory metadata is excluded; hardlinks belong to the first encountered path.')
+
+
+def safe(value):
+    return ''.join(f'\\x{ord(c):02x}' if ord(c) < 32 or ord(c) == 127 else
+                   f'\\u{ord(c):04x}' if unicodedata.category(c) in {'Cf', 'Cs'} else c
+                   for c in str(value)).replace('\\x0a', '\\n').replace('\\x0d', '\\r')
+
+
+def preferences(tty=None):
+    if tty is None:
+        tty = sys.stderr.isatty()
+    terminal = tty and os.environ.get('TERM') != 'dumb'
+    mode = os.environ.get('AGENCY_UI', 'auto').lower()
+    colour = terminal and mode not in {'plain', 'quiet'} and 'NO_COLOR' not in os.environ
+    motion = (colour and mode == 'auto' and os.environ.get('AGENCY_MOTION') != 'reduce'
+              and 'CI' not in os.environ)
+    return colour, motion
+
+
+def mount_paths():
+    with open('/proc/self/mountinfo', encoding='utf-8', errors='surrogateescape') as stream:
+        return {re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), line.split()[4])
+                for line in stream if len(line.split()) > 4}
+
+
+def proposal(path, home):
+    path = Path(path)
+    try:
+        relative = path.relative_to(home).as_posix()
+    except ValueError:
+        relative = ''
+    kind, title, tradeoff, command = None, None, None, None
+    action = None
+    quote = shlex.quote(str(path))
+    if relative == '.cache/uv' or str(path) == os.environ.get('UV_CACHE_DIR'):
+        kind, title = 'cache', 'Prune unused uv cache entries'
+        tradeoff = 'Pruning retains useful entries; later installs may download or rebuild. This size is the whole cache, not the prune yield.'
+        command = f'UV_CACHE_DIR={quote} uv cache prune'
+        action = 'uv' if relative == '.cache/uv' else None
+    elif relative == '.bun/install/cache' or str(path) == os.environ.get('BUN_INSTALL_CACHE_DIR'):
+        kind, title = 'cache', 'Clear the Bun package cache'
+        tradeoff = 'Future installs download packages again; installed project dependencies remain.'
+        command = f'BUN_INSTALL_CACHE_DIR={quote} bun pm cache rm'
+        action = 'bun' if relative == '.bun/install/cache' else None
+    elif relative == '.cache/pip' or str(path) == os.environ.get('PIP_CACHE_DIR'):
+        kind, title = 'cache', 'Purge pip download and wheel caches'
+        tradeoff = 'Future installs download or build again; use the pip belonging to your Python installation.'
+        command = f'PIP_CACHE_DIR={quote} python -m pip cache purge'
+        action = 'pip' if relative == '.cache/pip' else None
+    elif relative == '.cache/thumbnails':
+        kind, title = 'cache', 'Review generated thumbnails'
+        tradeoff = 'Previews regenerate. Close file managers and use desktop cache controls before removing selected files.'
+    elif relative.startswith(('.cache/mozilla/', '.cache/chromium/', '.cache/google-chrome/')) and path.name in {'cache2', 'Cache', 'Code Cache', 'GPUCache'}:
+        kind, title = 'cache', 'Clear browser cached files in browser settings'
+        tradeoff = 'Pages load more slowly initially. Select cached files only; preserve passwords, cookies and site data.'
+    elif relative == '.cache/diamond/venv':
+        kind, title = 'review', 'Review the Diamond Python environment'
+        tradeoff = 'This is an application environment, not disposable download cache. Verify a rebuild path and stop the application first.'
+    elif relative in {'.codex', '.mozilla', '.config', '.local/share'}:
+        kind, title = 'review', 'Review application data with its owning application'
+        tradeoff = 'May contain sessions, profiles, databases, credentials or user content. Back up and inspect; no generic cleanup command is appropriate.'
+    elif relative.startswith('Scratch/') and len(Path(relative).parts) == 2:
+        kind, title = 'review', 'Review completed Scratch task artifacts'
+        tradeoff = 'Confirm task ownership, active agent claims and running processes; preserve evidence or outputs still needed.'
+    elif path.name in {'node_modules', '.venv', 'venv', 'target', 'dist', 'build', '.next', '__pycache__'}:
+        kind, title = 'rebuild', 'Review a possible generated project directory'
+        tradeoff = 'Directory names are only a hint. Confirm generated contents, lockfiles and a reproducible rebuild; stop active work first.'
+    if kind is None:
+        return None
+    if safe(str(path)) != str(path):
+        command = None
+    return {'path': str(path), 'kind': kind, 'title': title, 'tradeoff': tradeoff,
+            'command': command, 'action': action, 'scan_complete': True, 'allocated_bytes': 0, 'apparent_bytes': 0, 'files': 0}
+
+
+def counter():
+    return {'allocated_bytes': 0, 'apparent_bytes': 0, 'files': 0}
+
+
+def marker_exists(fd, name):
+    if fd is None:
+        return False
+    try:
+        return stat.S_ISREG(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
+    except (FileNotFoundError, PermissionError):
+        return False
+
+
+def directory_category(path, fd, parent_fd, home):
+    name = path.name
+    if name in {'.venv', 'venv', 'env', '.env'}:
+        if marker_exists(fd, 'pyvenv.cfg'):
+            return 'python_environments', 'pyvenv.cfg found inside this environment'
+        return 'possible_generated', 'Environment-like name; no regular pyvenv.cfg found'
+    if name == 'node_modules':
+        return 'node_dependencies', 'Conventional node_modules dependency tree; verify project manifest and lockfile before rebuilding'
+    if name == 'target':
+        if marker_exists(parent_fd, 'Cargo.toml'):
+            return 'rust_build', 'target beside a regular Cargo.toml'
+        return 'possible_generated', 'target name without a neighboring Cargo.toml'
+    if name in {'build', 'dist'}:
+        if marker_exists(fd, 'CMakeCache.txt') or marker_exists(fd, 'build.ninja'):
+            return 'build_output', 'CMakeCache.txt or build.ninja found inside the directory'
+        return 'possible_generated', 'Directory name alone; may contain authored or committed files'
+    if name in {'.next', '.nuxt', '.svelte-kit', '.turbo'}:
+        if marker_exists(parent_fd, 'package.json'):
+            return 'build_output', 'Framework output directory beside a regular package.json'
+        return 'possible_generated', 'Framework-like directory name without a neighboring package.json'
+    if name == '__pycache__':
+        return 'bytecode', 'Conventional Python bytecode directory; inspect unusual contents before removal'
+    if name == '.git':
+        return 'git_metadata', 'Git history and metadata; preserve this directory'
+    if name in {'uv', 'cache', 'pip', 'thumbnails', 'cache2', 'Cache', 'Code Cache', 'GPUCache'} or str(path) in {
+            os.environ.get('UV_CACHE_DIR'), os.environ.get('BUN_INSTALL_CACHE_DIR'), os.environ.get('PIP_CACHE_DIR')}:
+        candidate = proposal(path, home)
+        if candidate and candidate['kind'] == 'cache':
+            return 'cache', 'Recognized cache location'
+    return 'other', ''
+
+
+def open_root(root, flags):
+    fd = os.open('/', flags)
+    try:
+        for part in root.parts[1:]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def scan(root, home=None, mount_points=None, progress=None):
+    root = Path(os.path.abspath(os.path.expanduser(str(root))))
+    home = Path(home) if home is not None else Path.home()
+    result = {'schema_version': 2, 'root': str(root), 'partial': False, 'warnings': [],
+              'warning_count': 0, 'symlinks_skipped': 0, 'mounts_skipped': 0,
+              'hardlinks_deduplicated': 0, 'entries_seen': 0, 'size_note': SIZE_NOTE,
+              'totals': {**counter(), 'breakdown': {}}, 'breakdown_note': BREAKDOWN_NOTE,
+              'folders': [], 'proposals': []}
+    def warn(message):
+        result['partial'] = True
+        result['warning_count'] += 1
+        if stack and stack[-1][4] is not None:
+            stack[-1][4]['scan_complete'] = False
+        if stack and stack[-1][6] is not None:
+            stack[-1][6]['scan_complete'] = False
+        if len(result['warnings']) < 30:
+            result['warnings'].append(message)
+    if mount_points is None:
+        try:
+            mount_points = mount_paths()
+        except OSError as error:
+            # Without mountinfo same-device bind mounts cannot be excluded safely.
+            raise OSError('Cannot read mount boundaries from /proc/self/mountinfo') from error
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    root_fd = open_root(root, flags)
+    stack = []
+    groups = {}
+    links = set()
+    candidates = []
+    capped_groups = False
+    capped_candidates = False
+    detail_count = 0
+    capped_details = False
+    try:
+        root_stat = os.fstat(root_fd)
+        usage = os.fstatvfs(root_fd)
+        result['filesystem'] = {'total_bytes': usage.f_blocks * usage.f_frsize,
+                                'used_bytes': (usage.f_blocks - usage.f_bfree) * usage.f_frsize,
+                                'available_bytes': usage.f_bavail * usage.f_frsize}
+        initial = proposal(root, home)
+        if initial:
+            initial['identity'] = {'device': root_stat.st_dev, 'inode': root_stat.st_ino}
+            candidates.append(initial)
+        parent_fd = (open_root(root.parent, flags)
+                     if root.name in {'target', '.next', '.nuxt', '.svelte-kit', '.turbo'} else None)
+        try:
+            if parent_fd is not None:
+                named = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+                if (named.st_dev, named.st_ino) != (root_stat.st_dev, root_stat.st_ino):
+                    raise OSError('Scan root changed while checking its parent directory')
+            root_category, root_evidence = directory_category(root, root_fd, parent_fd, home)
+            result['root_category'] = root_category
+            result['root_evidence'] = root_evidence
+            result['root_identity'] = {'device': root_stat.st_dev, 'inode': root_stat.st_ino}
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+        stack.append((root_fd, os.scandir(root_fd), root, None, initial, root_category, None))
+        root_fd = None
+        while stack:
+            fd, iterator, directory, group, candidate, category, detail = stack[-1]
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                iterator.close()
+                os.close(fd)
+                stack.pop()
+                continue
+            except OSError as error:
+                warn(f'{directory}: {error}')
+                iterator.close()
+                os.close(fd)
+                stack.pop()
+                continue
+            result['entries_seen'] += 1
+            path = directory / entry.name
+            if progress:
+                progress(result)
+            try:
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    result['symlinks_skipped'] += 1
+                    continue
+                if info.st_dev != root_stat.st_dev or str(path) in mount_points:
+                    result['mounts_skipped'] += 1
+                    if detail or (candidate and candidate['kind'] == 'cache') or root_category in {'python_environments', 'node_dependencies'}:
+                        warn(f'{path}: mount boundary inside cleanup candidate; excluded from automatic cleanup')
+                    continue
+                child_group = group
+                if child_group is None:
+                    key = entry.name if stat.S_ISDIR(info.st_mode) else '[files in scan root]'
+                    if key not in groups:
+                        if len(groups) >= MAX_GROUPS:
+                            key = '[additional entries]'
+                            if not capped_groups:
+                                warn('Top-level detail limit reached; additional entries are grouped together.')
+                                capped_groups = True
+                        groups.setdefault(key, {'name': key, **counter(), 'breakdown': {}, 'generated_directories': []})
+                    child_group = groups[key]
+                if stat.S_ISDIR(info.st_mode):
+                    if len(stack) >= MAX_DEPTH:
+                        warn(f'{path}: depth limit reached; subtree omitted')
+                        continue
+                    child_candidate = candidate
+                    if child_candidate is None:
+                        child_candidate = proposal(path, home)
+                        if child_candidate is not None:
+                            if len(candidates) < MAX_GROUPS:
+                                candidates.append(child_candidate)
+                            else:
+                                child_candidate = None
+                                if not capped_candidates:
+                                    warn('Proposal detail limit reached; further proposals omitted.')
+                                    capped_candidates = True
+                    child_fd = os.open(entry.name, flags, dir_fd=fd)
+                    try:
+                        opened = os.fstat(child_fd)
+                        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                            warn(f'{path}: directory changed during scan; subtree omitted')
+                            os.close(child_fd)
+                            continue
+                        if child_candidate is not None and child_candidate['path'] == str(path):
+                            child_candidate['identity'] = {'device': opened.st_dev, 'inode': opened.st_ino}
+                        child_category, child_detail = category, detail
+                        if category in {'other', 'possible_generated'}:
+                            detected, evidence = directory_category(path, child_fd, fd, home)
+                            if detected != 'other' and (category == 'other' or detected != 'possible_generated'):
+                                child_category, child_detail = detected, None
+                            if child_category != category and child_category not in {'other', 'cache', 'git_metadata'}:
+                                if detail_count < MAX_GROUPS:
+                                    child_detail = {'path': str(path), 'category': child_category,
+                                                    'identity': {'device': opened.st_dev, 'inode': opened.st_ino},
+                                                    'scan_complete': True, 'evidence': evidence, **counter()}
+                                    child_group['generated_directories'].append(child_detail)
+                                    detail_count += 1
+                                elif not capped_details:
+                                    warn('Generated-directory detail limit reached; category totals still include further entries.')
+                                    capped_details = True
+                        child_iterator = os.scandir(child_fd)
+                    except BaseException:
+                        os.close(child_fd)
+                        raise
+                    stack.append((child_fd, child_iterator, path, child_group, child_candidate, child_category, child_detail))
+                elif stat.S_ISREG(info.st_mode):
+                    if info.st_nlink > 1:
+                        identity = (info.st_dev, info.st_ino)
+                        if identity in links:
+                            result['hardlinks_deduplicated'] += 1
+                            continue
+                        if len(links) >= MAX_HARDLINKS:
+                            warn('Hardlink tracking limit reached; remaining scan omitted to avoid double counting.')
+                            break
+                        links.add(identity)
+                    for owner in (result['totals'], child_group):
+                        if category not in owner['breakdown']:
+                            owner['breakdown'][category] = counter()
+                    for target in (result['totals'], child_group, candidate, detail,
+                                   result['totals']['breakdown'][category], child_group['breakdown'][category]):
+                        if target is not None:
+                            target['apparent_bytes'] += info.st_size
+                            target['allocated_bytes'] += info.st_blocks * 512
+                            target['files'] += 1
+            except OSError as error:
+                warn(f'{path}: {error}')
+        for group in groups.values():
+            group['generated_directories'] = sorted(
+                (item for item in group['generated_directories'] if item['files']),
+                key=lambda item: item['allocated_bytes'], reverse=True)
+        result['folders'] = sorted(groups.values(), key=lambda x: x['allocated_bytes'], reverse=True)
+        result['proposals'] = sorted((c for c in candidates if c['allocated_bytes'] or c['apparent_bytes']),
+                                     key=lambda x: x['allocated_bytes'], reverse=True)
+        return result
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        for fd, iterator, *_ in reversed(stack):
+            iterator.close()
+            os.close(fd)
+
+
+def size(value):
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
+        if value < 1024 or unit == 'PiB':
+            return f'{value:.1f} {unit}' if unit != 'B' else f'{value} B'
+        value /= 1024
+
+
+def render_detailed(result, limit=10, colour=False):
+    def tint(text, code='183'):
+        return f'\033[38;5;{code}m{text}\033[0m' if colour else text
+    total = result['totals']
+    disk = result['filesystem']
+    lines = [tint('◇ HOUSEKEEPING  /  a little room to breathe'), safe(result['root']), '',
+             f"Filesystem  {size(disk['used_bytes'])} used · {size(disk['available_bytes'])} available · {size(disk['total_bytes'])} total",
+             f"Scanned     {size(total['allocated_bytes'])} allocated · {size(total['apparent_bytes'])} apparent · {total['files']:,} files",
+             'Status      ' + ('PARTIAL — see warnings below' if result['partial'] else 'Scan complete within the boundaries below'),
+             f"Boundaries  {result['symlinks_skipped']:,} symlinks skipped · {result['mounts_skipped']:,} mounts skipped · {result['hardlinks_deduplicated']:,} hardlinks counted once", '',
+             tint('WHERE THE SPACE IS', '141')]
+    maximum = max((x['allocated_bytes'] for x in result['folders']), default=1) or 1
+    for folder in result['folders'][:limit]:
+        bars = round(20 * folder['allocated_bytes'] / maximum)
+        bar = '━' * bars + '·' * (20 - bars) if colour else '#' * bars + '.' * (20 - bars)
+        lines.append(f"  {tint(bar)}  {size(folder['allocated_bytes']):>11}  {safe(folder['name'])}")
+        parts = sorted(folder['breakdown'].items(), key=lambda pair: pair[1]['allocated_bytes'], reverse=True)
+        for category, counts in parts:
+            if counts['files']:
+                percent = counts['allocated_bytes'] / folder['allocated_bytes'] * 100 if folder['allocated_bytes'] else 0
+                lines.append(f"      {tint('│', '141')} {size(counts['allocated_bytes']):>11}  {percent:5.1f}%  {CATEGORY_LABELS[category]}")
+        for item in folder['generated_directories'][:3]:
+            relative = os.path.relpath(item['path'], result['root'])
+            lines.append(f"      {tint('↳', '212')} {size(item['allocated_bytes']):>11}  {safe(relative)}  ({CATEGORY_LABELS[item['category']]})")
+        remaining = len(folder['generated_directories']) - 3
+        if remaining > 0:
+            lines.append(f"        + {remaining} more generated directories; scan this folder or use --json for detail")
+    lines.extend(['', BREAKDOWN_NOTE])
+    actionable = [item for item in result['proposals'] if item['command']]
+    review = [item for item in result['proposals'] if not item['command']]
+    for heading, items, empty in (
+        ('ACTIONABLE CACHE CLEANUP', actionable, 'No recognized native-tool cache cleanup proposals.'),
+        ('REVIEW BEFORE CLEANUP', review, 'No additional review candidates.'),
+    ):
+        lines.extend(['', tint(f'{heading}  /  nothing has been changed', '141')])
+        if not items:
+            lines.append(f'  {empty}')
+        for index, item in enumerate(items[:limit], 1):
+            lines.extend([f"  {index}. {item['title']}  [{item['kind']}]",
+                          f"     {size(item['allocated_bytes'])} allocated · {size(item['apparent_bytes'])} apparent",
+                          f"     {safe(item['path'])}", f"     {item['tradeoff']}"])
+            if item['command']:
+                lines.append(f"     After review: {safe(item['command'])}")
+            lines.append('')
+        if len(items) > limit:
+            lines.append(f"  {len(items) - limit} more in this section; increase --limit or use --json.")
+    if result['warnings']:
+        lines.extend(['', 'Warnings:'] + [f'  ! {safe(w)}' for w in result['warnings']])
+        if result['warning_count'] > len(result['warnings']):
+            lines.append(f"  + {result['warning_count'] - len(result['warnings'])} further warnings")
+    lines.extend(['', SIZE_NOTE, 'This is a live inventory, not a filesystem snapshot. Review each proposal before acting.'])
+    return '\n'.join(lines)
+
+
+NATIVE_CLEANUPS = {
+    'uv': ('UV_CACHE_DIR', ['uv', 'cache', 'prune']),
+    'bun': ('BUN_INSTALL_CACHE_DIR', ['bun', 'pm', 'cache', 'rm']),
+    'pip': ('PIP_CACHE_DIR', [sys.executable, '-I', '-B', '-m', 'pip', 'cache', 'purge']),
+}
+
+
+def pip_available(executable):
+    try:
+        result = subprocess.run([executable, '-I', '-B', '-c',
+                                 "import importlib.util; raise SystemExit(importlib.util.find_spec('pip') is None)"],
+                                cwd='/', text=True, capture_output=True, timeout=5)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def cleanup_plan(result):
+    actions, blocked = [], []
+    for candidate in result['proposals']:
+        if not candidate['command']:
+            continue
+        item = dict(candidate)
+        action = item.get('action')
+        reason = None
+        if action not in NATIVE_CLEANUPS:
+            reason = 'Custom cache location requires manual review'
+        elif not item.get('scan_complete') or not item.get('identity'):
+            reason = 'Cache scan incomplete; inspect it before cleanup'
+        else:
+            executable = shutil.which(NATIVE_CLEANUPS[action][1][0])
+            if not executable or (action == 'pip' and not pip_available(executable)):
+                reason = f'{action} cleanup tool unavailable'
+            else:
+                item['executable'] = str(Path(executable).resolve())
+        if reason:
+            item['reason'] = reason
+            blocked.append(item)
+        else:
+            actions.append(item)
+    projects = [dict(item) for folder in result['folders'] for item in folder['generated_directories']]
+    if result.get('root_category') in {'python_environments', 'node_dependencies'}:
+        projects = [{'path': result['root'], 'category': result['root_category'],
+                     'identity': result['root_identity'], 'scan_complete': not result['partial'],
+                     'evidence': result['root_evidence'],
+                     **{key: result['totals'][key] for key in ('allocated_bytes', 'apparent_bytes', 'files')}}]
+    for item in projects:
+        item['selectable'] = (item['category'] in {'python_environments', 'node_dependencies'}
+                              and bool(item.get('identity')) and item.get('scan_complete', False))
+        if item['selectable']:
+            item['reason'] = 'Choose explicitly; deletion removes local edits and requires reinstalling dependencies.'
+        elif not item.get('identity') or not item.get('scan_complete'):
+            item['reason'] = 'Review only: scan incomplete; inspect this folder before cleanup.'
+        else:
+            item['reason'] = f"Review only: {CATEGORY_LABELS[item['category']]} removal is not supported."
+    projects.sort(key=lambda item: item['allocated_bytes'], reverse=True)
+    return {'root': result['root'], 'executes_commands': False, 'actions': actions, 'blocked_actions': blocked,
+            'project_candidates': projects,
+            'review_only_count': sum(not item['command'] for item in result['proposals']),
+            'reclaimable_bytes_note': 'Sizes are observed, not guaranteed recovery. Cache recovery is unknown; uv prunes unused entries only.'}
+
+
+def native_arguments(item):
+    variable, arguments = NATIVE_CLEANUPS[item['action']]
+    return [item['executable'], *arguments[1:]], {variable: item['path']}
+
+
+def verify_cache(item):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = open_root(Path(item['path']), flags)
+        try:
+            info = os.fstat(fd)
+            if {'device': info.st_dev, 'inode': info.st_ino} != item['identity']:
+                raise RuntimeError('Cache directory changed since the scan; rerun before applying')
+        finally:
+            os.close(fd)
+    except OSError as error:
+        raise RuntimeError(f'Cache path changed or is inaccessible: {safe(item["path"])}') from error
+    prefix = item['path'].rstrip('/') + '/'
+    if any(path.startswith(prefix) or path == item['path'] for path in mount_paths()):
+        raise RuntimeError(f'Cache contains a mount boundary; refusing cleanup: {safe(item["path"])}')
+
+
+def run_cleanup_command(item, arguments, environment):
+    if item['action'] != 'bun':
+        return subprocess.run(arguments, env=environment, cwd=str(Path.home()), text=True, capture_output=True)
+    # Bun requires a package manifest even for its cache utilities.
+    with tempfile.TemporaryDirectory(prefix='housekeeping-bun-') as project:
+        Path(project, 'package.json').write_text('{"private": true}\n')
+        query = subprocess.run(arguments[:-1], env=environment, cwd=project,
+                               text=True, capture_output=True, timeout=10)
+        if query.returncode:
+            return query
+        if Path(query.stdout.strip()).resolve() != Path(item['path']).resolve():
+            raise RuntimeError('Bun reported a different cache location; no Bun cleanup performed')
+        verify_cache(item)
+        return subprocess.run(arguments, env=environment, cwd=project, text=True, capture_output=True)
+
+
+def load_helper(name):
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().with_name(name + '.py'))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        previous = sys.dont_write_bytecode
+        try:
+            sys.dont_write_bytecode = True
+            spec.loader.exec_module(module)
+        finally:
+            sys.dont_write_bytecode = previous
+    return sys.modules[name]
+
+
+def project_helpers():
+    return load_helper('housekeeping_projects')
+
+
+def choose_projects(candidates, *, colour=True, initial_selected=(), refresh=None, notice=''):
+    return load_helper('housekeeping_picker').pick_projects(
+        candidates, colour=colour, initial_selected=initial_selected, refresh=refresh, notice=notice)
+
+
+def apply_cleanup(plan, *, colour=True):
+    actions = list(plan['actions'])
+    candidates = [dict(item, label=os.path.relpath(item['path'], plan.get('root', str(Path.home()))))
+                  for item in plan.get('project_candidates', [])]
+    eligible = [item for item in candidates if item['selectable']]
+    helper = project_helpers() if eligible else None
+    readiness = {'blocked': {}, 'uninspected_processes': 0}
+    completed = removed = 0
+    mutation_started = False
+    selected_paths = ()
+    notice = ''
+
+    def inspect(items):
+        try:
+            report = helper.report_projects(items)
+        except (OSError, RuntimeError) as error:
+            if completed:
+                raise RuntimeError(f'Availability check stopped; {completed} cache commands completed. No project folders removed: {error}') from error
+            raise
+        for item in items:
+            readiness['blocked'].pop(item['path'], None)
+        readiness['blocked'].update(report['blocked'])
+        readiness['uninspected_processes'] = report['uninspected_processes']
+        return report
+
+    def available():
+        return [dict(item, selectable=False, reason=readiness['blocked'][item['path']])
+                if item['path'] in readiness['blocked'] else dict(item) for item in candidates]
+
+    def refresh():
+        inspect(eligible)
+        return available()
+
+    def cancel_message():
+        if completed:
+            print(f'Cancelled. {completed} cache commands already completed; no further cleanup performed.')
+        else:
+            print('Cancelled. Nothing changed.')
+
+    try:
+        if helper:
+            print('Checking project availability...', flush=True)
+            refresh()
+        while True:
+            selected = (choose_projects(available(), colour=colour, initial_selected=selected_paths,
+                                        refresh=refresh, notice=notice) if helper else [])
+            selected_paths = tuple(item['path'] for item in selected)
+            if not actions and not selected:
+                print(f'Completed {completed} cache cleanup commands. No project folders removed.' if completed
+                      else 'No cleanup selected. Nothing changed.')
+                return 0
+            if selected:
+                print('Checking selected folders...', flush=True)
+                inspection = inspect(selected)
+                if inspection['blocked']:
+                    selected_paths = tuple(path for path in selected_paths if path not in inspection['blocked'])
+                    notice = 'Some folders became unavailable; other choices kept. R refreshes availability.'
+                    continue
+                if inspection['uninspected_processes']:
+                    print(f'Could not inspect {inspection["uninspected_processes"]} processes. Close apps using the selected folders before continuing.')
+            for item in actions:
+                verify_cache(item)
+            if selected:
+                print('\nPROJECT FOLDERS TO DELETE PERMANENTLY')
+                for item in selected:
+                    print(f'  {size(item["allocated_bytes"]):>10}  {safe(item["path"])}')
+                print('Entire selected folders, including local edits, will be removed. Reinstall dependencies before using these projects.')
+            confirmed = input(f'Run {len(actions)} cache cleanup commands and delete {len(selected)} selected project folders? [y/N] ').strip().lower() in {'y', 'yes'}
+            if not confirmed:
+                cancel_message()
+                return 0
+            for item in actions:
+                verify_cache(item)
+            if selected:
+                current = inspect(selected)
+                if current['blocked'] or current['uninspected_processes'] > inspection['uninspected_processes']:
+                    selected_paths = tuple(path for path in selected_paths if path not in current['blocked'])
+                    notice = ('Some folders became unavailable; other choices kept. R refreshes availability.'
+                              if current['blocked'] else 'Process inspection changed; choices kept. Review and confirm again.')
+                    continue
+            had_actions = bool(actions)
+            for item in actions:
+                verify_cache(item)
+                arguments, overrides = native_arguments(item)
+                print(f'Cleaning: {safe(item["title"])}', flush=True)
+                try:
+                    mutation_started = True
+                    process = run_cleanup_command(item, arguments, {**os.environ, **overrides})
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    raise RuntimeError(f'{item["action"]} cleanup could not start; {completed} prior commands completed: {error}') from error
+                for output in (process.stdout, process.stderr):
+                    if output.strip():
+                        print('\n'.join(safe(line) for line in output.rstrip().splitlines()))
+                if process.returncode:
+                    raise RuntimeError(f'{item["action"]} cleanup failed ({process.returncode}); {completed} prior commands completed. Remaining actions were not run.')
+                completed += 1
+            actions = []
+            if selected and had_actions:
+                current = inspect(selected)
+                if current['blocked'] or current['uninspected_processes'] > inspection['uninspected_processes']:
+                    selected_paths = tuple(path for path in selected_paths if path not in current['blocked'])
+                    notice = f'{completed} cache commands completed; availability changed. Other choices kept; review again.'
+                    continue
+            try:
+                for item in selected:
+                    print(f'Removing: {safe(item["path"])}', flush=True)
+                    mutation_started = True
+                    helper.remove_project(item)
+                    removed += 1
+            except (OSError, RuntimeError) as error:
+                raise RuntimeError(f'Project cleanup stopped; {completed} cache commands and {removed} folder removals completed: {error}') from error
+            print(f'Completed {completed} cache cleanup commands and {removed} project folder removals. Run housekeeping again to refresh usage.')
+            return 0
+    except (EOFError, KeyboardInterrupt):
+        if mutation_started:
+            print(f'\nCleanup interrupted; {completed} cache commands and {removed} folder removals completed; an interrupted action may have made changes.')
+        else:
+            print('\nCancelled. Nothing changed.')
+        return 130
+
+
+def render(result, limit=5, colour=False, verbose=False, dry_run=False, applying=False):
+    if verbose and not (dry_run or applying):
+        return render_detailed(result, limit, colour)
+    def tint(text):
+        return f'\033[38;5;183m{text}\033[0m' if colour else text
+    plan = result.get('cleanup_plan') or cleanup_plan(result)
+    heading = 'CLEANUP PLAN' if applying else 'DRY RUN' if dry_run else 'HOUSEKEEPING'
+    lines = [tint(f'◇ {heading}') + '  ' + safe(result['root'])]
+    if dry_run or applying:
+        lines.append('Confirmation required before execution.' if applying else 'Preview only. No commands executed.')
+        actions = plan['actions']
+        if not actions:
+            lines.append('No native cache actions in this scan.')
+        shown = actions if applying else actions[:limit]
+        for item in shown:
+            lines.extend([f'  • {item["title"]}  ({size(item["allocated_bytes"])} cache)',
+                          f'    {safe(item["path"])}'])
+            if verbose or applying:
+                arguments, overrides = native_arguments(item)
+                command = ' '.join(f'{key}={shlex.quote(value)}' for key, value in overrides.items()) + ' ' + shlex.join(arguments)
+                lines.extend([f'    {item["tradeoff"]}', f'    Command: {safe(command)}'])
+        if len(actions) > len(shown):
+            lines.append(f'  + {len(actions) - len(shown)} more cache actions; increase --limit or use --json.')
+        for item in plan['blocked_actions']:
+            lines.append(f'  Excluded: {safe(item["path"])} — {item["reason"]}')
+        projects = plan['project_candidates']
+        if projects and applying:
+            lines.extend(['', f'{len(projects)} project candidates · availability checked before selection',
+                          'Choose folders in the checkbox picker. Unavailable rows explain why.'])
+        elif projects:
+            lines.extend(['', tint('PROJECT CLEANUP CANDIDATES · unselected')])
+            for number, item in enumerate(projects[:limit], 1):
+                relative = os.path.relpath(item['path'], result['root'])
+                label = CATEGORY_LABELS[item['category']]
+                status = 'selectable' if item['selectable'] else 'review only'
+                lines.append(f'  {number}. {size(item["allocated_bytes"]):>10}  {safe(relative)}  [{label}; {status}]')
+                if verbose:
+                    lines.append(f'     {item["evidence"]}. {item["reason"]}')
+            if len(projects) > limit:
+                lines.append(f'  + {len(projects) - limit} more project candidates; increase --limit or use --json.')
+            lines.append('Use --apply to select folders with arrow keys and Space, then review and confirm.')
+        lines.extend(['', plan['reclaimable_bytes_note'],
+                      'Source files, whole Scratch tasks and uncertain build folders are not selected.'])
+        if not applying:
+            lines.append('Use --apply to review the full plan and confirm execution.')
+    else:
+        lines.extend([f'{size(result["filesystem"]["available_bytes"])} available · {size(result["totals"]["allocated_bytes"])} scanned · read-only',
+                      '', tint('WHERE THE SPACE IS')])
+        maximum = max((item['allocated_bytes'] for item in result['folders']), default=1) or 1
+        for folder in result['folders'][:limit]:
+            bars = round(10 * folder['allocated_bytes'] / maximum)
+            bar = ('━' * bars + '·' * (10 - bars)) if colour else ('#' * bars + '.' * (10 - bars))
+            parts = sorted(folder['breakdown'].items(), key=lambda pair: pair[1]['allocated_bytes'], reverse=True)
+            summary = ' · '.join(f'{size(value["allocated_bytes"])} {CATEGORY_LABELS[key]}' for key, value in parts[:2])
+            lines.extend([f'  {tint(bar)} {size(folder["allocated_bytes"]):>10}  {safe(folder["name"])}', f'    {summary}'])
+        lines.extend(['', tint('CACHE CLEANUP CANDIDATES')])
+        if not plan['actions']:
+            lines.append('  No supported cache cleanup available.')
+        for item in plan['actions'][:limit]:
+            lines.append(f'  {size(item["allocated_bytes"]):>10}  {item["title"]}')
+        if plan['blocked_actions']:
+            lines.append(f'  {len(plan["blocked_actions"])} excluded cache action(s); --dry-run explains why.')
+        generated = sorted((item for folder in result['folders'] for item in folder['generated_directories']),
+                           key=lambda item: item['allocated_bytes'], reverse=True)
+        if generated:
+            lines.extend(['', tint('LARGEST GENERATED DIRECTORIES')])
+            for item in generated[:min(limit, 3)]:
+                lines.append(f'  {size(item["allocated_bytes"]):>10}  {safe(os.path.relpath(item["path"], result["root"]))}')
+        lines.extend(['', 'Sizes are observed, not guaranteed recovery. Source & other includes unclassified data.',
+                      '--dry-run previews cleanup · --apply asks before cleaning · --verbose shows full detail'])
+    if result['partial']:
+        lines.append(f'Partial scan: {result["warning_count"]} warning(s). ' + ('' if verbose else 'Use --verbose for details.'))
+        if verbose:
+            lines.extend(f'  ! {safe(warning)}' for warning in result['warnings'])
+    return '\n'.join(lines)
+
+
+class Progress:
+    def __init__(self, enabled, colour):
+        self.enabled = enabled
+        self.colour = colour
+        self.started = time.monotonic()
+        self.last = 0
+        self.frame = 0
+        self.drawn = False
+
+    def __call__(self, result):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if now - self.last < 0.1:
+            return
+        self.last = now
+        spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[self.frame % 10]
+        pulse = ('▁▂▃▅▃▂', '▂▃▅▇▅▃', '▃▅▇█▇▅', '▂▃▅▇▅▃')[self.frame % 4]
+        self.frame += 1
+        text = f"{spinner} {pulse}  Mapping your space · {result['entries_seen']:,} entries · {size(result['totals']['allocated_bytes'])} · {now - self.started:.0f}s"
+        columns = shutil.get_terminal_size((80, 24)).columns
+        text = text[:max(1, columns - 1)]
+        sys.stderr.write(f'\r\033[2K\033[38;5;183m{text}\033[0m')
+        sys.stderr.flush()
+        self.drawn = True
+
+    def close(self):
+        if self.drawn:
+            sys.stderr.write('\r\033[2K')
+            sys.stderr.flush()
+            self.drawn = False
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Scan disk usage; preview with --dry-run or select cleanup with --apply and confirmation.')
+    parser.add_argument('directory', nargs='?', default=str(Path.home()))
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--dry-run', action='store_true', help='preview cache actions and project folders without cleaning')
+    mode.add_argument('--apply', action='store_true', help='review cache actions, select project folders, then confirm in a terminal')
+    parser.add_argument('--verbose', '-v', action='store_true', help='show full breakdowns, paths, trade-offs and diagnostics')
+    parser.add_argument('--json', action='store_true', help='emit the complete structured inventory, without animation')
+    parser.add_argument('--plain', action='store_true', help='disable colour and animation')
+    parser.add_argument('--no-animation', action='store_true', help='disable animated scan progress')
+    parser.add_argument('--limit', type=int, default=5, help='preview rows per section (default: 5; interactive picker and JSON include all)')
+    args = parser.parse_args(argv)
+    if args.apply and args.json:
+        parser.error('--apply cannot be combined with --json; use --dry-run --json')
+    if args.apply and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        parser.error('--apply requires an interactive terminal for both the visible plan and confirmation')
+    if args.limit < 1:
+        parser.error('--limit must be positive')
+    colour, motion = preferences()
+    colour = colour and not args.plain and not args.json
+    progress = Progress(motion and not (args.plain or args.no_animation or args.json), colour)
+    try:
+        result = scan(args.directory, progress=progress if progress.enabled else None)
+    except KeyboardInterrupt:
+        progress.close()
+        print('housekeeping: scan cancelled; nothing changed.', file=sys.stderr)
+        return 130
+    except OSError as error:
+        progress.close()
+        print(f'housekeeping: {safe(error)}', file=sys.stderr)
+        return 2
+    finally:
+        progress.close()
+    if args.dry_run or args.apply:
+        result['cleanup_plan'] = cleanup_plan(result)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+    else:
+        print(render(result, args.limit, colour and sys.stdout.isatty(), args.verbose, args.dry_run, args.apply))
+    if args.apply:
+        try:
+            code = apply_cleanup(result['cleanup_plan'], colour=colour)
+        except (OSError, RuntimeError) as error:
+            print(f'housekeeping: {safe(error)}', file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            print('\nCleanup interrupted; the running command may have made changes.', file=sys.stderr)
+            return 130
+        if code:
+            return code
+    return 1 if result['partial'] else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

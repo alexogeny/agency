@@ -48,7 +48,7 @@ class DecisionsTests(unittest.TestCase):
     def test_valid_response_and_fixed_request(self):
         mock, opener = self.network(response())
         with mock:
-            result = decisions.evaluate({'task': 'fix bug', 'candidate': 'trace'}, 'context', api_key='test-key')
+            result = decisions.evaluate({'query': 'fix bug', 'passage': 'trace'}, 'context', api_key='test-key')
         request = opener.open.call_args.args[0]
         self.assertEqual(request.full_url, 'https://openrouter.ai/api/alpha/decisions')
         self.assertEqual(request.get_method(), 'POST')
@@ -58,7 +58,7 @@ class DecisionsTests(unittest.TestCase):
         self.assertEqual(result['decision'], 'relevant')
         self.assertEqual(result['confidence'], 0.75)
         self.assertTrue(result['advisory'])
-        self.assertEqual(result['profile_version'], '1')
+        self.assertEqual(result['profile_version'], '2')
         self.assertGreaterEqual(result['latency_ms'], 0)
         self.assertEqual(result['usage'], response()['usage'])
         self.assertEqual(opener.open.call_count, 1)
@@ -68,7 +68,7 @@ class DecisionsTests(unittest.TestCase):
         del payload['answers']['decision']['confidence']
         mock, _ = self.network(payload)
         with mock:
-            self.assertIsNone(decisions.evaluate('x', 'context', api_key='test-key')['confidence'])
+            self.assertIsNone(decisions.evaluate({'query': 'fix bug', 'passage': 'trace'}, 'context', api_key='test-key')['confidence'])
 
     def test_adversarial_responses_rejected(self):
         mutations = [
@@ -97,7 +97,7 @@ class DecisionsTests(unittest.TestCase):
                 mutate(payload)
                 mock, _ = self.network(payload)
                 with mock, self.assertRaises(decisions.DecisionError):
-                    decisions.evaluate('x', 'context', api_key='test-key')
+                    decisions.evaluate({'query': 'fix bug', 'passage': 'trace'}, 'context', api_key='test-key')
 
     def test_invalid_state_and_timeout_never_connect(self):
         for state in ['', {}, [], None, True, 1, {'x': float('nan')}, {'x': object()}, {1: 'x'}, 'x' * 100000]:
@@ -107,7 +107,7 @@ class DecisionsTests(unittest.TestCase):
                 opener.assert_not_called()
         for timeout in [0, -1, 31, True, float('nan'), '10']:
             with self.subTest(timeout=timeout), self.assertRaises(decisions.DecisionError):
-                decisions.evaluate('x', 'context', api_key='test-key', timeout=timeout)
+                decisions.evaluate({'query': 'fix bug', 'passage': 'trace'}, 'context', api_key='test-key', timeout=timeout)
         with self.assertRaises(decisions.DecisionError):
             decisions.evaluate('x', 'unknown', api_key='test-key')
 
@@ -116,14 +116,14 @@ class DecisionsTests(unittest.TestCase):
             self.assertFalse(decisions.key_available())
             with patch.object(decisions.urllib.request, 'build_opener') as opener:
                 with self.assertRaises(decisions.DecisionError):
-                    decisions.evaluate('x', 'context')
+                    decisions.evaluate({'query': 'fix bug', 'passage': 'trace'}, 'context')
                 opener.assert_not_called()
 
     def test_environment_key_precedence(self):
         with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'env-key'}):
             mock, opener = self.network(response())
             with mock:
-                decisions.evaluate('x', 'context')
+                decisions.evaluate({'query': 'fix bug', 'passage': 'trace'}, 'context')
             self.assertEqual(opener.open.call_args.args[0].get_header('Authorization'), 'Bearer env-key')
 
     def test_secret_safe_network_errors_and_no_retries(self):
@@ -133,7 +133,7 @@ class DecisionsTests(unittest.TestCase):
             opener.open.side_effect = error
             with patch.object(decisions.urllib.request, 'build_opener', return_value=opener):
                 with self.assertRaises(decisions.DecisionError) as caught:
-                    decisions.evaluate('x', 'context', api_key='test-secret')
+                    decisions.evaluate({'query': 'fix bug', 'passage': 'trace'}, 'context', api_key='test-secret')
                 self.assertNotIn('test-secret', str(caught.exception))
                 self.assertEqual(opener.open.call_count, 1)
 
@@ -149,7 +149,7 @@ class DecisionsTests(unittest.TestCase):
             opener.open.return_value = stream
             with patch.object(decisions.urllib.request, 'build_opener', return_value=opener):
                 with self.assertRaises(decisions.DecisionError):
-                    decisions.evaluate('x', 'context', api_key='test-key')
+                    decisions.evaluate({'query': 'fix bug', 'passage': 'trace'}, 'context', api_key='test-key')
 
     def test_json_input_rejects_nonfinite_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -169,7 +169,7 @@ class DecisionsTests(unittest.TestCase):
                                          text=True, capture_output=True, env=env, check=True)
             self.assertNotIn('--json', help_result.stdout)
             for args, input_text in [(['profiles'], ''), (['doctor'], ''),
-                                     (['classify', '--profile', 'skill', '--input', '-', '--dry-run'], 'Verify README examples')]:
+                                     (['classify', '--profile', 'skill', '--input', '-', '--dry-run'], '{"task":"Verify README examples"}')]:
                 done = subprocess.run([str(executable), *args], input=input_text, text=True, capture_output=True, env=env)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 data = json.loads(done.stdout)
@@ -177,11 +177,13 @@ class DecisionsTests(unittest.TestCase):
                     self.assertFalse(data['configured'])
                 if args[0] == 'classify':
                     self.assertTrue(data['dry_run'])
-                    self.assertEqual(data['request']['state'], input_text)
+                    self.assertEqual(data['request']['state'], json.loads(input_text))
             done = subprocess.run([str(executable), 'classify', '--profile', 'context', '--input', '-'],
-                                  input='input text', text=True, capture_output=True, env=env)
+                                  input='{"query":"Find the handler","passage":"The handler is in app.py"}',
+                                  text=True, capture_output=True, env=env)
             self.assertNotEqual(done.returncode, 0)
             self.assertIn('error', json.loads(done.stderr))
+            self.assertIn('credential', json.loads(done.stderr)['error'])
             self.assertEqual(done.stdout, '')
 
 

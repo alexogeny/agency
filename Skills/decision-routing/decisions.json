@@ -1,7 +1,7 @@
 {
   "skill": {
     "title": "Skill recommendation",
-    "version": "1",
+    "version": "2",
     "question": "Which single listed skill best matches the immediate task requested in the state? Judge the requested work, not incidental keywords. If several are needed, choose the first necessary step only when its ordering is clear; otherwise choose unsure.",
     "criteria": {
       "docs-verification": "Execute documented commands or examples to verify that documentation works as written.",
@@ -12,11 +12,14 @@
       "report-writing": "Draft or revise substantial academic or professional report prose for a brief and audience.",
       "none": "The task is clear and none of these skills applies; ordinary editing, coding, or a short answer alone is here.",
       "unsure": "The task is underspecified or multiple equally plausible first skills cannot be distinguished."
-    }
+    },
+    "required_fields": [
+      "task"
+    ]
   },
   "context": {
     "title": "Context relevance",
-    "version": "1",
+    "version": "2",
     "question": "How does the candidate context relate to the stated current task? Compare the candidate against the task and supplied constraints only. If the task or candidate is missing, choose unsure.",
     "criteria": {
       "relevant": "Directly helps complete the current task and does not conflict with an explicit supplied current constraint.",
@@ -24,11 +27,15 @@
       "background": "Provides related context but no direct help for the current task and no explicit contradiction.",
       "irrelevant": "Has no meaningful relationship to the current task.",
       "unsure": "Missing, ambiguous, or insufficient evidence prevents deciding the relationship."
-    }
+    },
+    "required_fields": [
+      "query",
+      "passage"
+    ]
   },
   "update": {
     "title": "Update status",
-    "version": "1",
+    "version": "2",
     "question": "Which current work status does the supplied update communicate? Classify the latest explicit status, not quoted or resolved historical events. Choose failure for an unresolved failed step, attention for a request for user input without failure, completed for explicit finished work, or progress for ongoing work.",
     "criteria": {
       "attention": "The current update asks the user for a decision or input, without reporting an unresolved failure.",
@@ -36,11 +43,15 @@
       "completed": "The requested work is explicitly finished, without an unresolved failure or request for user input.",
       "failure": "A current attempted step failed or remains blocked by an error, including when user help is also requested.",
       "unsure": "The update lacks enough status information or contains irreconcilable current status claims."
-    }
+    },
+    "required_fields": [
+      "update",
+      "task_status"
+    ]
   },
   "research": {
     "title": "Evidence relationship",
-    "version": "1",
+    "version": "2",
     "question": "What relationship does the supplied evidence passage have to the supplied claim? Judge the passage content only, not whether its source is authoritative. Require a claim and passage; if either is missing, choose unsure. Mixed support and contradiction is unsure.",
     "criteria": {
       "support": "The passage directly supports the supplied claim, with matching conditions and scope.",
@@ -48,7 +59,11 @@
       "background": "The passage concerns the claim topic but neither directly supports nor contradicts it.",
       "irrelevant": "The passage has no meaningful relationship to the supplied claim.",
       "unsure": "The claim or passage is missing, ambiguous, mixed, or insufficient to determine the relationship."
-    }
+    },
+    "required_fields": [
+      "claim",
+      "passage"
+    ]
   },
   "novelty": {
     "title": "Novelty against an existing finding",

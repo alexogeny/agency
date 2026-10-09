@@ -583,9 +583,213 @@
           "unmet": "Observed endpoint behavior accepts an upload above 20 MiB."
         }
       }
+    },
+    {
+      "id": "skill-docs",
+      "profile": "skill",
+      "state": {
+        "task": "Execute the README installation commands and check their documented output."
+      },
+      "expected": "docs-verification"
+    },
+    {
+      "id": "skill-benchmark",
+      "profile": "skill",
+      "state": {
+        "task": "Measure before and after peak memory on equivalent inputs, with repeated samples."
+      },
+      "expected": "benchmark"
+    },
+    {
+      "id": "skill-none",
+      "profile": "skill",
+      "state": {
+        "task": "Change the spelling of one word in this sentence."
+      },
+      "expected": "none"
+    },
+    {
+      "id": "skill-ambiguous",
+      "profile": "skill",
+      "state": {
+        "task": "Help with the project."
+      },
+      "expected": "unsure"
+    },
+    {
+      "id": "context-relevant",
+      "profile": "context",
+      "state": {
+        "query": "Locate the upload route that rejects large multipart forms.",
+        "passage": "The /upload route configures MAX_FORM_MEMORY_SIZE before parsing multipart fields."
+      },
+      "expected": "relevant"
+    },
+    {
+      "id": "context-conflict",
+      "profile": "context",
+      "state": {
+        "query": "Audit the repository read-only. Do not edit files.",
+        "passage": "The current task requires editing every failing module before reporting."
+      },
+      "expected": "conflicting"
+    },
+    {
+      "id": "context-unrelated",
+      "profile": "context",
+      "state": {
+        "query": "Find the HTTP upload handler.",
+        "passage": "The garden contains three apple trees."
+      },
+      "expected": "irrelevant"
+    },
+    {
+      "id": "context-background",
+      "profile": "context",
+      "state": {
+        "query": "Locate the exact configured form-memory limit in this Flask app.",
+        "passage": "Flask is a Python web framework used to build web applications."
+      },
+      "expected": "background"
+    },
+    {
+      "id": "update-failed",
+      "profile": "update",
+      "state": {
+        "update": "The focused test exited 1 with an assertion failure. Please help investigate.",
+        "task_status": "The failed check has not been repaired."
+      },
+      "expected": "failure"
+    },
+    {
+      "id": "update-done",
+      "profile": "update",
+      "state": {
+        "update": "The requested patch is finished and its required checks passed.",
+        "task_status": "All requested work is complete."
+      },
+      "expected": "completed"
+    },
+    {
+      "id": "update-progress",
+      "profile": "update",
+      "state": {
+        "update": "The parser change is implemented; validation is running.",
+        "task_status": "Work is ongoing."
+      },
+      "expected": "progress"
+    },
+    {
+      "id": "update-attention",
+      "profile": "update",
+      "state": {
+        "update": "Which of the two proposed interface layouts do you prefer?",
+        "task_status": "No errors; awaiting the layout decision."
+      },
+      "expected": "attention"
+    },
+    {
+      "id": "research-support",
+      "profile": "research",
+      "state": {
+        "claim": "On workload A, median latency decreased from 40 ms to 30 ms.",
+        "passage": "For workload A we measured a median of 40 ms before the change and 30 ms afterwards."
+      },
+      "expected": "support"
+    },
+    {
+      "id": "research-conflict",
+      "profile": "research",
+      "state": {
+        "claim": "On workload A, median latency decreased after the change.",
+        "passage": "For workload A the median increased from 40 ms to 55 ms after the change."
+      },
+      "expected": "conflict"
+    },
+    {
+      "id": "research-background",
+      "profile": "research",
+      "state": {
+        "claim": "The latency benefit persists at batch size 64.",
+        "passage": "Latency improved at batch size 8. No batches above size 16 were evaluated."
+      },
+      "expected": "background"
+    },
+    {
+      "id": "research-mixed",
+      "profile": "research",
+      "state": {
+        "claim": "The new parser always accepts this input.",
+        "passage": "With identical configuration and input, one test reports acceptance and another reports rejection; the discrepancy is unresolved."
+      },
+      "expected": "unsure"
+    },
+    {
+      "id": "cost-copying",
+      "profile": "performance-design/pattern",
+      "state": {
+        "observation": "The function allocates a second byte buffer and copies the entire input into it once."
+      },
+      "expected": "copying"
+    },
+    {
+      "id": "cost-boundary",
+      "profile": "performance-design/pattern",
+      "state": {
+        "observation": "Each of the 100 records is sent in its own HTTP request; no request contains more than one record."
+      },
+      "expected": "boundary"
+    },
+    {
+      "id": "cost-waiting",
+      "profile": "performance-design/pattern",
+      "state": {
+        "observation": "The trace shows the worker blocked on the same mutex for 200 ms while another worker owns it."
+      },
+      "expected": "waiting"
+    },
+    {
+      "id": "cost-unclear",
+      "profile": "performance-design/pattern",
+      "state": {
+        "observation": "The user says the application feels slow. No trace, code, or measurements are available."
+      },
+      "expected": "unsure"
+    },
+    {
+      "id": "impact-operator",
+      "profile": "pr-writing/impact",
+      "state": {
+        "change": "The installer now checks whether its required executable is available and prints a recovery command if missing."
+      },
+      "expected": "operator"
+    },
+    {
+      "id": "impact-user",
+      "profile": "pr-writing/impact",
+      "state": {
+        "change": "Users can now retry a failed upload from the error panel without reselecting their file. Existing behavior is preserved."
+      },
+      "expected": "user"
+    },
+    {
+      "id": "impact-internal",
+      "profile": "pr-writing/impact",
+      "state": {
+        "change": "Renames a private local variable; inputs, outputs, public interfaces, configuration and user behavior are unchanged."
+      },
+      "expected": "internal"
+    },
+    {
+      "id": "impact-unclear",
+      "profile": "pr-writing/impact",
+      "state": {
+        "change": "The only available observation is that client.py was modified. The diff and behavior have not been inspected."
+      },
+      "expected": "unsure"
     }
   ],
-  "max_calls": 32,
+  "max_calls": 84,
   "concurrency": 4,
   "deadline_seconds": 60
 }

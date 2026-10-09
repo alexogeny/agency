@@ -62,7 +62,7 @@ def receipts(value):
                         and type(report.get('id')) is str
                         and re.fullmatch(r'[0-9a-f]{32}', report['id'])
                         and type(report.get('created_ns')) is int
-                        and all(type(report.get(key)) is int and 0 <= report[key] <= 32
+                        and all(type(report.get(key)) is int and 0 <= report[key] <= 1024
                                 for key in ('decisions', 'errors', 'reused'))):
                     found[report['id']] = report
                 else:

@@ -49,8 +49,11 @@ authentication. Keep the credential file private; never put its contents in
 arguments, prompts, repository files, or troubleshooting output.
 
 Remove `--dry-run` to send the displayed request to OpenRouter's dedicated
-`POST /api/alpha/decisions` endpoint using `typesafe/jev-1.13`. Input may be UTF-8
-text or a JSON object/array/string, from a file or standard input. The result
+`POST /api/alpha/decisions` endpoint using `typesafe/jev-1.13`. Supply a UTF-8
+JSON object with the selected contract's required fields, from a file or standard
+input. Version 2 of `skill`, `context`, `update`, and `research` requires structured
+evidence too: migrate legacy text/array callers to their documented field names.
+Missing or blank fields fail before credential or provider access. The result
 contains a label, full probability distribution, optional confidence, actual
 model ID, rubric version and hash, usage, and request latency. Missing confidence stays
 null. See [`decision-routing`](../Skills/decision-routing/SKILL.md) for the state
@@ -84,13 +87,36 @@ on dry runs, or when any successful call omits cost. Cost remains null when a
 complete amount is unavailable; a known zero cost is complete. Budget across
 batches in the caller; the runtime stores no automatic history or cache.
 
-`agency-decide evaluate --input FILE` runs a batch whose items also contain
-`expected` labels. It reports agreement, errors, and a confusion table; all
-cases remain in the denominator. Mismatches or provider failures exit 1, and
-invalid or empty sets exit 2. `Tests/fixtures/decisions.json` contains synthetic
-contract checks, not human-labelled calibration data. Select at most 32 cases
-per evaluation manifest and budget calls across batches; running evaluation uses
-hosted requests. Keep private examples and evaluation outputs outside the repository.
+`agency-decide evaluate --input FILE` runs cases whose items also contain
+`expected` labels. An evaluation accepts 1–1024 cases in up to 4 MiB and splits
+them deterministically into batches of at most 32 distinct requests and 256 KiB.
+Defaults remain 10 calls, four workers, and 30 seconds, now shared across the
+whole evaluation. Set `max_calls` up to 1024 and `deadline_seconds` up to 600
+explicitly for a larger run; concurrency remains at most four. Each chunk is
+also bounded to 60 seconds and individual workers to ten seconds. Validate all
+cases before credential access; credentials resolve once for the evaluation.
+Identical requests reuse their result across chunks without extra calls, while
+each case retains its own expected label and place in the input order.
+
+The result reports overall and per-profile agreement, errors, a confusion table,
+usage, elapsed time, and `planned_batches`. Failed and undispatched cases stay
+in every applicable denominator. Mismatches, provider failures, or exhausted
+budgets exit 1; invalid or empty input exits 2. Partial/missing cost remains null.
+`--dry-run` validates the complete set and shows planned requests without
+credentials or hosted calls. Its accuracy/correct fields are null and it counts
+zero decisions; insufficient planned call budget still exits 1.
+
+From the repository root, validate the supplied 84-case synthetic fixture:
+
+```console title="decision-evaluation-dry-run"
+agency-decide evaluate --input Tests/fixtures/decisions.json --dry-run
+```
+
+Remove `--dry-run` to spend OpenRouter credit on the fixture's explicitly
+configured budget of up to 84 unique calls, spanning every profile and multiple
+labels per profile. These are synthetic contract checks,
+not human-labelled calibration data. Keep private examples and evaluation
+outputs outside the repository; do not mix tuning and held-out examples.
 
 Shared contracts live in `Skills/decision-routing/decisions.json`; skill-owned
 contracts live beside the owning `SKILL.md` and use names such as
@@ -98,6 +124,92 @@ contracts live beside the owning `SKILL.md` and use names such as
 through the same installed symlink. It validates required evidence fields and
 preserves supplied band descriptors. See the routing skill for complete state
 shapes and skill-specific use.
+
+### Paired usefulness trials
+
+`agency-decide trial-report --input FILE` summarizes supplied baseline and
+Jev-assisted task outcomes offline. It performs no provider or credential calls,
+starts no logging, writes no files, and emits no decision receipt. It accepts
+1–1024 unique pairs in up to 4 MiB. Supply one profile per pair so the report can
+compare that profile's contribution; evaluate multi-profile workflows separately
+rather than attributing one outcome to several profiles. The report retains all
+pairs, including unaccepted outcomes, in overall and per-profile summaries.
+
+Save this fictional format example as `trial-pairs.json` in a task directory
+under `~/Scratch`; replace its values with observed paired outcomes before
+drawing conclusions:
+
+```json title="trial-pairs.json"
+{
+  "items": [{
+    "id": "claim-review-1",
+    "profile": "claim-fit",
+    "provenance": {
+      "model": "jev-revision-from-result",
+      "profile_version": "1",
+      "rubric_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workload": "claim-review-v1",
+      "baseline_model": "reasoner-revision",
+      "assisted_model": "reasoner-revision"
+    },
+    "baseline": {
+      "accepted": true, "elapsed_ms": 120000, "cost": null, "repairs": 1,
+      "reasoning_tokens": null
+    },
+    "jev": {
+      "accepted": true, "elapsed_ms": 125000, "cost": null, "repairs": 0,
+      "preparation_ms": 3000, "decision_ms": 650,
+      "overrides": 0, "useful_corrections": 1, "reasoning_tokens": null
+    }
+  }]
+}
+```
+
+Run from the directory containing that file:
+
+```console title="decision-trial-report"
+agency-decide trial-report --input trial-pairs.json
+```
+
+Outcome fields are required; `provenance` and each arm's `reasoning_tokens`
+are optional for compatibility with earlier trial files. Other fields are
+rejected. When supplied, provenance must contain all six shown nonempty fields,
+each at most 256 characters, with a 64-character lowercase hexadecimal rubric
+hash. Use the actual result's model, version, and hash, not the example values.
+The workload ID identifies a fixed task family, acceptance criteria, and harness
+configuration; change it when any of those change. Record the reasoning-model
+revision and effort/configuration in `baseline_model` and `assisted_model`.
+IDs contain 1–128 letters, digits, underscores, or hyphens. `accepted` is a boolean based on
+the task's agreed checks, never a Jev label. `repairs`, `overrides`, and
+`useful_corrections` are nonnegative integer counts from inspected outcomes.
+`elapsed_ms` is the full task duration, including preparation, review, and repair.
+Preparation and decision durations are diagnostic components that may overlap;
+the report does not add them to elapsed time. Use the same monetary unit for
+all `cost` values, including reasoning, Jev, failed attempts, and repair costs
+where measurable. Missing costs must be null, not zero. `reasoning_tokens`
+counts the full arm's reasoning tokens across attempts and repairs; use null
+when unmeasured, including when the provider does not expose them. Known counts
+must be nonnegative integers no greater than 2^53 - 1. Keep source pointers,
+case ordering, and acceptance evidence keyed by pair ID in an existing
+authorized local record, outside the repository. Neither provenance nor tokens
+are inferred or collected automatically.
+
+The report shows acceptance rates; total and mean time, repairs, and measured
+cost; preparation/decision time; overrides; useful corrections; and mean paired
+deltas (Jev minus baseline). Time and cost per accepted outcome include all
+attempts and become null when none is accepted. Incomplete cost coverage makes
+cost totals and comparisons null, with known/missing counts retained. A valid
+report exits 0 even when Jev outcomes are worse; invalid input exits 2.
+Reasoning tokens have the same known/missing counts and null-total behavior as
+cost. `by_cohort` separates profile, Jev revision, profile version, rubric hash,
+workload, and both reasoning-model configurations; it preserves pair IDs and
+provenance. Overall and per-profile summaries are descriptive aggregates:
+`mixed_provenance` flags combined cohorts and `provenance_complete` plus
+known/missing counts expose legacy records. Unattributed records have a null
+cohort provenance and must not establish a version-specific rollout result.
+It does not assess statistical significance, calibrate confidence, or promote
+a profile to automation. Follow the [staged advisory workflow](../Skills/decision-routing/references/daily-use.md#staged-advisory-rollout)
+to judge quality, overhead, and repairs together before changing routine use.
 
 ## `agency-decision-usage`
 
@@ -137,6 +249,10 @@ Redirecting or filtering output can hide results. Known missing or truncated
 receipts show `count incomplete`; missing turn starts show `usage unavailable`.
 An unreadable event conservatively marks active turns for that client incomplete.
 Disabled hooks or unsupported client transports cannot provide a complete count.
+Use the [client acceptance matrix](../Skills/decision-routing/references/client-acceptance.md)
+to verify real client delivery after wiring or version changes. The offline
+installation tests execute configured hook commands against actual CLI/MCP
+receipts, but simulated event dispatch does not verify the client's display.
 
 Only counts, timestamps, hashed session/turn identities, and opaque receipt IDs
 are stored, under `$XDG_RUNTIME_DIR/agency-decision-usage` or a private
@@ -166,6 +282,261 @@ killed and reaped. Read one contract with the optional `profile` argument to
 that deadline. Provider failures are tool errors, never manufactured predictions.
 Only the supplied state and selected rubric are sent to OpenRouter; private
 profiles and transcript history are not automatically included.
+## `agency-storage`
+
+Moves selected large directories onto an existing Linux filesystem and keeps
+`~/.cache`, `~/Scratch`, and rootless Podman's `~/.local/share/containers` at
+their familiar paths through symbolic links.
+The filesystem mounts by UUID at `/mnt/storage` through a managed `fstab`
+entry; its label does not need to change. Existing files on the drive remain
+in place. Machine-specific selections live in
+`${XDG_CONFIG_HOME:-~/.config}/agency/storage.json`, outside the repository.
+
+```sh
+agency-storage inspect --json
+agency-storage setup --interactive
+agency-storage status
+agency-storage setup --dry-run
+```
+
+For an explicitly selected filesystem:
+
+```sh
+agency-storage setup --uuid YOUR-FILESYSTEM-UUID --mount /mnt/storage \
+  --folders cache scratch --apply
+```
+
+Migration needs `rsync` and root authorization for mount configuration and
+read-only process inspection across users. This also inspects non-dumpable
+processes that an ordinary desktop user cannot check.
+Install `rsync` first if it is absent: storage setup runs before the installer's
+package and tool installation. Stop processes using a selected directory
+before migrating it. The tool checks active users and refuses to switch a
+busy directory. Original directories remain as backups; remove those only
+through a separate, explicit cleanup after verification. Until cleanup, they
+continue to consume space on the boot filesystem.
+
+Installer reruns check saved configuration before writing to Scratch or
+installing tools. Healthy storage is unchanged. Missing mounts, changed links,
+and unfinished migrations stop the installation with diagnostics. Inspect
+with `status` and `setup --dry-run`, resolve the reported condition, then use
+`setup --apply` to resume the saved plan. Dry runs never prompt or change storage configuration or copy files. For an
+already mounted container store, status queries Podman's effective configuration;
+Podman may update its own runtime lock metadata during that query.
+An unattended installation with no saved configuration skips storage setup.
+
+For rootless Podman alone:
+
+```sh
+agency-storage setup --uuid YOUR-FILESYSTEM-UUID --folders containers --dry-run
+# Review auto-remove settings, then stop containers and the Podman API service.
+sudo-gui --message 'Move Podman images and volumes to secondary storage.' -- \
+  agency-storage setup --uuid YOUR-FILESYSTEM-UUID --folders containers --apply
+podman info --format '{{.Store.GraphRoot}} {{.Store.ImageCopyTmpDir}}'
+```
+
+Restart the containers that were running after setup succeeds. Existing container
+IDs and volume paths are retained: changing Podman's configured graphRoot would
+conflict with paths stored in its database. The data behind those paths moves
+to `/mnt/storage/agency/<uid>/containers`. A managed `containers.conf.d` snippet
+sets `image_copy_tmp_dir = "storage"`, so image downloads also use that drive.
+The UUID automount works on access after reboot. `TMPDIR` or explicit Podman
+storage/config overrides can override these defaults; setup rejects them and
+custom graphRoots instead of silently migrating the wrong directory. Once mounted,
+status and setup check Podman's effective `imageCopyTmpDir`, including configuration
+precedence; a later snippet overriding the download location is reported for
+manual correction, not overwritten.
+
+Check each running container's `HostConfig.AutoRemove` with `podman inspect`
+before stopping it. Containers created with `--rm` delete themselves and can
+delete anonymous volumes on exit; preserve or clone those containers and their
+data first if they must survive. The migration copies the store after shutdown.
+
+Container migration uses a privileged copy to preserve subordinate UIDs/GIDs
+and inspect open files across users. Only Podman's verified overlay self-bind is
+released in its user namespace; mounted containers and other nested mounts block
+the move. Keep other Podman operations stopped until migration completes. Source
+data remains at `~/.local/share/containers.agency-storage-backup` for recovery;
+cleanup refuses backups whose contents have since diverged from the active store.
+Container backup checks and removal use sudo directly, avoiding fresh Podman
+initialization during the comparison. Only `storage/storage.lock` is excluded
+from checksums because Podman rewrites this runtime coordination file; database
+and volume contents are still compared.
+
+For separate migration sessions, select Scratch first:
+
+```sh
+agency-storage setup --folders scratch --interactive
+```
+
+After all work using Scratch has finished, this copies and verifies its contents,
+then atomically exchanges the directory with a link. It retains the original as
+`~/Scratch.agency-storage-backup`. Cache uses the equivalent
+`~/.cache.agency-storage-backup` name. The per-user destination is a private
+`agency/<uid>/` directory on the selected filesystem.
+
+To add cache later, sign out of the desktop, switch to a text console with
+Ctrl+Alt+F3, and log in there. Preview and then apply the expanded selection:
+
+```sh
+agency-storage setup --folders scratch cache --dry-run
+agency-storage setup --folders scratch cache --apply
+agency-storage status
+agency-storage cleanup --dry-run
+agency-storage cleanup --apply
+```
+
+Existing Scratch storage is left in place. Applications and agents must remain
+stopped during migration; process checks are snapshots, not locks against future
+writers. Nested mounts and conflicting destinations block migration. Cleanup
+checks the recorded backup identity and compares its contents with the copy;
+if either changed, it retains the backup for review. Prefer checking and cleaning
+up while applications are still stopped, then return to the desktop. Do not run
+migration from a working directory inside a folder being moved.
+
+An armed systemd automount is reported as `mount on access` without activating
+it during a dry run. Its destination is checked once mounted. Container status
+reports verification pending while the automount is armed; access `/mnt/storage`
+and rerun status to verify the effective Podman configuration. The underlying
+mountpoint is protected against ordinary user writes when the disk is absent;
+applications using redirected paths will be unavailable until storage returns.
+Cleanup previews require the filesystem to be mounted already. A desktop mount
+of the same filesystem can coexist with `/mnt/storage`; existing conflicting
+`fstab` entries or use of the chosen target require manual review.
+
+The tool uses systemd, util-linux, GNU coreutils, rsync, and Linux's atomic
+`renameat2` exchange. It neither reformats nor relabels disks and does not schedule
+logout or reboot tasks. Before Agency has installed its command link, invoke
+`./Tools/agency-storage` from the checkout.
+
+## `housekeeping` / `cleanup`
+
+Scans your home directory and presents an animated pink/purple terminal report:
+filesystem capacity, ranked folder bars, native cache cleanup proposals, and
+larger directories that need review. The interactive Fish alias `cc` opens the
+same tool; `command cc` and non-interactive build processes retain the C compiler.
+The Fish `cleanup` function overrides the distribution's orphan-package removal
+alias, so all three names open the same scanner. Scanning and previews are
+read-only; cleanup requires `--apply` and interactive confirmation.
+New shells load the alias automatically. In an existing Fish shell, run
+`source ~/.config/fish/config.fish` once.
+
+```sh
+housekeeping
+cleanup ~/Code
+cc ~/Code --dry-run   # Preview environments and dependencies, without removal
+cc ~/Code --apply     # Select project folders, then confirm or cancel
+cc --apply            # Review native caches and optional project folders
+cc --verbose          # Full breakdowns, paths and trade-offs
+cc --limit 15
+housekeeping --plain
+housekeeping --json > /tmp/housekeeping.json
+```
+
+The default view shows five folders with their two largest categories, compact
+cache candidates, and the three largest generated directories. Use `--verbose`
+for the expanded report.
+
+The expanded view includes a size/percentage breakdown for Python environments,
+Node dependencies, Rust and recognized framework build output, bytecode, known
+caches, Git metadata, possible generated folders, and source/other files. The
+three largest generated directories appear beneath their containing folder;
+scan that folder directly to explore its projects. Python environments use a
+regular `pyvenv.cfg`; Rust output checks the neighboring `Cargo.toml`. Ambiguous
+`build`/`dist` names remain possible generated folders. Node dependency and
+bytecode categories use their conventional directory names. These observations
+do not establish that files are unmodified, disposable or reproducibly rebuildable.
+“Source & other files” includes unclassified data, not just canonical source.
+
+The breakdown is computed during the same scan and partitions the measured
+folder total. Nested dependency trees and hardlinks are counted once. JSON schema
+version 2 adds `breakdown` to totals and folders, `generated_directories` with
+classification evidence to folders, and `breakdown_note` to the result. Generated
+detail is bounded; if its limit is reached, category totals continue and the
+report marks the omitted detail.
+
+`--dry-run` lists native cache actions and project candidates, including
+recognized Python environments and `node_modules`. With `--apply`, a scrollable
+checkbox picker starts with every project folder unselected. Use Up/Down to move,
+Space to toggle `[ ]` / `[x]`, and Enter to review the chosen folders. Review-only
+rows display `[-]` and cannot be selected; toggling one keeps your other choices.
+Before the picker opens, eligible folders are checked for active use, changed
+paths, mounts and Git ownership. Blocked rows show the reason; active-use reasons
+name the process, PID and kind of use. Press `R` after closing an app to refresh
+availability. Refresh preserves eligible checked folders; a newly unblocked
+folder stays unchecked until you choose it.
+
+The picker includes all candidates regardless of `--limit`. Esc, `q` or Ctrl+C
+cancels the entire cleanup, including native cache actions. Enter with no checked
+folders keeps all project folders; native cache actions still require their
+final confirmation. Uncertain build folders and incomplete scans remain
+review-only.
+
+Folders are checked again when you press Enter and after final confirmation.
+If a folder becomes unavailable, the picker reopens with that row disabled and
+other choices still checked. Review the updated selection and confirm again.
+Completed cache commands are reported and are not repeated if a later project
+availability change returns you to the picker. A removal failure after work has
+started still stops and reports any completed actions.
+
+After selection, the tool shows the exact project paths to delete permanently,
+alongside the native cache plan, and asks `[y/N]`. Enter or `no` at this final
+prompt cancels the entire plan; Ctrl+C or EOF also cancels before execution.
+There is no unattended confirmation switch. Entire selected project folders are removed, including local edits within them; reinstall their
+dependencies before using those projects again. A real interactive terminal
+is required for both input and output, and `--apply` cannot be combined with `--json` or `--dry-run`.
+Default scans, verbose reports and dry runs never execute cleanup commands.
+
+Supported cleanup uses native `uv cache prune`, `bun pm cache rm`, and the
+scanner's isolated Python interpreter with `-I -B -m pip cache purge`. Only the standard home
+cache locations are eligible for automatic execution. Custom configured cache
+locations, unavailable tools, and incompletely scanned cache trees are explicitly
+excluded. Each cache root is checked for changed identity, symlink traversal and
+mount boundaries before execution. Commands use fixed argument arrays with the
+observed cache path set in the tool's environment; displayed text is never
+executed as a shell command. A failure stops subsequent actions and reports
+prior completed commands. The tool never requests sudo. Bun runs from a temporary empty project and its
+reported cache location must match the scanned target before removal. Pip
+availability is checked with the same isolated interpreter used for cleanup.
+
+Cache sizes describe the complete observed cache, not predicted recovery;
+uv pruning removes unused entries only. Re-run the scan after cleanup to inspect
+the result. `--dry-run --json` includes a structured `cleanup_plan` with eligible
+actions, excluded actions and their reasons, and all bounded `project_candidates`
+with classification, size, selection eligibility and reasons. Browser caches and thumbnails include guidance.
+Scratch tasks, application data and possible build outputs require ownership
+and rebuild checks. A directory named `cache`, `venv` or `build` alone does not
+make its contents disposable.
+
+The scan stays on the selected filesystem, skips links and nested mounts, and
+counts hardlinks once. A linked scan root is rejected: provide its real directory
+explicitly if you intend to inspect another drive. Allocated and apparent sizes
+are observations, not promised recovery on Btrfs with compression, reflinks or
+snapshots. Directory metadata is excluded. A live filesystem can change while
+being scanned; inaccessible subtrees and bounded detail limits produce visible
+partial-scan warnings.
+
+`--no-animation` retains colour without motion. `--plain`, `NO_COLOR`,
+`AGENCY_UI=plain`, `AGENCY_UI=quiet`, non-terminal output, and
+`AGENCY_MOTION=reduce` respect terminal preferences. `--limit` controls displayed
+folders and proposals in previews (default five); the interactive picker and
+JSON include all bounded detail, and apply confirmation always shows all selected commands. Exit codes are 0 for a
+complete scan or declined confirmation after a complete scan, 1 for partial scan results (including
+a successful cleanup following an unrelated partial scan), 2 for usage, scan-root
+or cleanup errors, and 130 for interruption. Whole Scratch tasks, project source
+roots and uncertain build folders have no removal action.
+
+Before deleting selected environments or dependencies, the tool rechecks scanned
+directory identity, symlink ancestors, mount boundaries, Git tracked files and
+nested Git repositories. Detectable use by same-user processes blocks removal;
+checks include working directories, open files, mapped files, command paths and
+`VIRTUAL_ENV`. Inaccessible processes are reported before confirmation. These
+checks are snapshots, not a lock against an application starting later: close
+applications using the chosen folders first. Selections are checked again after
+confirmation. The removal helper moves each folder into a private sibling
+holding directory, verifies its identity, and uses descriptor-based recursive
+removal. Failures stop the plan and identify any holding directory left for
+inspection; prior completed removals cannot be undone.
 
 ## `agency-ui`
 
@@ -375,6 +746,18 @@ authorization or command-specific `NOPASSWD` rules without a dialog. The helper
 refuses to prompt during an active PAM lockout and blocks sudo password retries.
 Passwords remain in the dialog process memory only and are not written to
 files, arguments, environment variables, or captured output.
+
+```sh
+sudo-gui --message 'Restart the service to apply the new configuration.' -- \
+  sudo systemctl restart example.service
+```
+
+The password dialog displays the summary followed by the exact shell-quoted
+sudo command. Script workflows show the nested privileged command, rather than
+only the outer script name. Absolute-path sudo calls that bypass the PATH proxy
+recover their requesting process arguments through `/proc`; if those arguments
+are inaccessible, the helper refuses authentication with a clear diagnostic.
+`--prompt` remains an alias for `--message`.
 
 On macOS, `sudo-gui --prompt "Reason" -- sudo COMMAND` requests authorization
 through the system administrator dialog. A fixed AppleScript receives the

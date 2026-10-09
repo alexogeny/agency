@@ -27,6 +27,14 @@ def message(method, params=None, request_id=1):
 
 
 class DecisionMCPTests(unittest.TestCase):
+    def test_advertised_state_schema_requires_objects(self):
+        tools = {tool['name']: tool for tool in mcp.TOOLS}
+        single = tools['classify']['inputSchema']['properties']['state']
+        batch = tools['classify_batch']['inputSchema']['properties']['items']['items']['properties']['state']
+        for schema in (single, batch):
+            self.assertEqual(schema.get('type'), 'object')
+            self.assertEqual(schema.get('minProperties'), 1)
+
     def test_profile_lookup_loads_only_the_requested_contract(self):
         result = mcp.handle(message('tools/call', {'name': 'profiles',
                             'arguments': {'profile': 'assess/criterion'}}))['result']
@@ -77,8 +85,8 @@ class DecisionMCPTests(unittest.TestCase):
 
     def test_invalid_args_and_missing_credential_are_tool_errors(self):
         arguments = [{}, {'profile': 'unknown', 'state': 'x'}, {'profile': 'skill', 'state': ''},
-                     {'profile': 'skill', 'state': 'x', 'api_key': 'secret'},
-                     {'profile': 'skill', 'state': True}, {'profile': 'skill', 'state': 'x'}]
+                     {'profile': 'skill', 'state': {'task': 'x'}, 'api_key': 'secret'},
+                     {'profile': 'skill', 'state': True}, {'profile': 'skill', 'state': {'task': 'x'}}]
         with patch.object(mcp, 'key_available', return_value=False), patch.object(mcp.subprocess, 'run') as run:
             for args in arguments:
                 with self.subTest(args=args):
@@ -95,7 +103,7 @@ class DecisionMCPTests(unittest.TestCase):
             with self.subTest(outcome=type(outcome)):
                 kwargs = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
                 with patch.object(mcp, 'key_available', return_value=True), patch.object(mcp.subprocess, 'run', **kwargs):
-                    result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': 'x'}}))['result']
+                    result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': {'task': 'x'}}}))['result']
                 self.assertTrue(result['isError'])
                 self.assertNotIn('secret-value', json.dumps(result))
 
@@ -105,7 +113,7 @@ class DecisionMCPTests(unittest.TestCase):
             worker.write_text('import time\ntime.sleep(20)\n')
             started = time.monotonic()
             with patch.object(mcp, 'CLI', worker), patch.object(mcp, 'CLASSIFY_TIMEOUT', 0.1), patch.object(mcp, 'key_available', return_value=True):
-                result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': 'x'}}))
+                result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': {'task': 'x'}}}))
             self.assertTrue(result['result']['isError'])
             self.assertLess(time.monotonic() - started, 2)
             self.assertEqual(mcp.handle(message('ping'))['result'], {})
@@ -140,7 +148,7 @@ class DecisionMCPTests(unittest.TestCase):
             env = dict(os.environ, XDG_CONFIG_HOME=directory)
             env.pop('OPENROUTER_API_KEY', None)
             requests = [message('initialize'), message('tools/list', request_id=2),
-                        message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': 'hello'}}, 3)]
+                        message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': {'task': 'hello'}}}, 3)]
             done = subprocess.run([str(link)], input=''.join(json.dumps(request) + '\n' for request in requests),
                                   text=True, capture_output=True, env=env, timeout=5)
             self.assertEqual(done.returncode, 0, done.stderr)

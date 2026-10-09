@@ -10,6 +10,26 @@ SPEC.loader.exec_module(d)
 
 
 class ContractTests(unittest.TestCase):
+    def test_original_profiles_reject_missing_or_unstructured_evidence(self):
+        fields = {'skill': ('task',), 'context': ('query', 'passage'),
+                  'update': ('update', 'task_status'), 'research': ('claim', 'passage')}
+        for profile, required in fields.items():
+            state = dict.fromkeys(required, 'Concrete evidence.')
+            self.assertEqual(d.build_request(state, profile)['state'], state)
+            for invalid in ('legacy text', ['legacy text'], {'unrelated': 'text'},
+                            *({**state, field: ''} for field in required),
+                            *({k: v for k, v in state.items() if k != field} for field in required)):
+                with self.subTest(profile=profile, state=invalid), self.assertRaises(d.DecisionError):
+                    d.build_request(invalid, profile)
+
+    def test_evaluation_fixture_covers_every_profile_and_multiple_labels(self):
+        cases = json.loads((ROOT / 'Tests/fixtures/decisions.json').read_text())['items']
+        self.assertEqual({case['profile'] for case in cases}, set(d.PROFILES))
+        for profile in d.PROFILES:
+            with self.subTest(profile=profile):
+                self.assertGreaterEqual(len({case['expected'] for case in cases
+                                             if case['profile'] == profile}), 2)
+
     def test_scope_requires_review_even_for_a_confident_result(self):
         labels = d.PROFILES['scope']['criteria']
         payload = {'model': d.MODEL, 'answers': {'decision': {

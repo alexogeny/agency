@@ -39,6 +39,16 @@ if status is-interactive
         abbr --add --position command oldtasks 'long-processes'
     end
 
+    complete --erase --command cleanup
+    function cleanup --description 'Scan disk usage and propose cleanups'
+        command housekeeping $argv
+    end
+
+    # Keep the compiler on PATH for build tools and non-interactive shells.
+    function cc --description 'Scan disk usage and propose cleanups'
+        command housekeeping $argv
+    end
+
     # `gcl owner/repo` clones or updates ~/Code/repo, then enters it.
     function gcl --description 'Clone or update a repository under ~/Code'
         set --local destination (git-get $argv)

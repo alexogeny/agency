@@ -47,6 +47,11 @@ agency_plan_scratch() {
   local canonical="$HOME/Scratch"
   local legacy="$HOME/scratch"
 
+  if [[ -d $canonical && -L $legacy && $legacy -ef $canonical ]]; then
+    printf '  [%-16s] %s -> %s\n' "unchanged alias" "$legacy" "$canonical"
+    return
+  fi
+
   if [[ -e $legacy && -e $canonical && $legacy -ef $canonical ]]; then
     printf '  [%-16s] %s (same directory on a case-insensitive filesystem)\n' "directory exists" "$canonical"
     return
@@ -117,6 +122,8 @@ agency_plan_user_links() {
     agency-decide
     agency-decide-mcp
     agency-decision-usage
+    agency-storage
+    housekeeping
     git-get
     long-processes
     sandbox
@@ -141,11 +148,14 @@ agency_plan_user_links() {
   for tool in "${tools[@]}"; do
     if [[ ${AGENCY_PLATFORM:-linux} == macos ]]; then
       case $tool in
-        long-processes|instruction-bench|resource-bench|perf-diagnose) continue ;;
+        agency-storage|housekeeping|long-processes|instruction-bench|resource-bench|perf-diagnose) continue ;;
       esac
     fi
     agency_plan_link "$AGENCY_DIR/Tools/$tool" "$HOME/.local/bin/$tool"
   done
+  if [[ ${AGENCY_PLATFORM:-linux} == linux ]]; then
+    agency_plan_link "$AGENCY_DIR/Tools/housekeeping" "$HOME/.local/bin/cleanup"
+  fi
   agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
   agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.claude/CLAUDE.md"
   agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.pi/agent/AGENTS.md"
@@ -211,11 +221,17 @@ agency_print_install_plan() {
   printf 'Checkout: %s\n' "$AGENCY_DIR"
   printf 'No sudo prompt will be shown and no commands below will be executed.\n\n'
 
-  printf '\033[1mDirectories and managed agent files\033[0m\n'
+  printf '\033[1mLarge-drive storage\033[0m\n'
+  source "$AGENCY_DIR/scripts/configure-storage.sh"
+  agency_configure_storage --dry-run
+
+  printf '\n\033[1mDirectories and managed agent files\033[0m\n'
   agency_plan_scratch
   agency_plan_user_links
 
   printf '\n\033[1mPackages and developer runtimes\033[0m\n'
+  printf '  [%-16s] merge system/snap-pac.ini into /etc/snap-pac.ini before package transactions\n' \
+    "snapshot policy"
   if [[ -n ${competing[*]:-} ]]; then
     printf '  [%-16s] pacman -Rns --noconfirm %s\n' \
       "remove frontend" "${competing[*]}"
