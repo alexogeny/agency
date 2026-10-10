@@ -122,6 +122,7 @@ if [[ $platform == linux ]]; then
   agency_link "$AGENCY_DIR/Tools/housekeeping" "$HOME/.local/bin/cleanup"
 fi
 agency_link "$AGENCY_DIR/Tools/agency-ui" "$HOME/.local/bin/agency-ui"
+agency_link "$AGENCY_DIR/Tools/agency-browser" "$HOME/.local/bin/agency-browser"
 agency_link "$AGENCY_DIR/Tools/agency-decide" "$HOME/.local/bin/agency-decide"
 agency_link "$AGENCY_DIR/Tools/agency-decide-mcp" "$HOME/.local/bin/agency-decide-mcp"
 agency_link "$AGENCY_DIR/Tools/agency-decision-usage" "$HOME/.local/bin/agency-decision-usage"

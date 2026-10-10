@@ -119,6 +119,7 @@ agency_plan_user_links() {
   local tool skill_dir skill_name
   local -a tools=(
     agency-ui
+    agency-browser
     agency-decide
     agency-decide-mcp
     agency-decision-usage

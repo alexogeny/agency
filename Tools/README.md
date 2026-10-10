@@ -933,3 +933,104 @@ Optional frame extraction enumerates Firefox child browsing contexts instead
 of mistaking an iframe shell for complete content. It extracts text from
 same-origin frames, requires an explicit origin for any cross-origin frame, and
 redacts frame queries while reporting skipped and failed frames.
+
+## `agency-browser`
+
+Attach Playwright MCP to an existing logged-in Chrome session, propose a named
+control with Jev, and pace navigation or collection without OCR. See the
+[browser-workflow skill](../Skills/browser-workflow/SKILL.md) for setup, current
+Playwright schemas, review requirements, and private artifact storage.
+
+`packet` extracts only explicitly reviewed link/button refs from a snapshot.
+`choose` sends the goal, bounded context, and 1–32 candidate descriptions to
+`browser-workflow/next-control`; `--dry-run` prints the exact request without a
+provider call. Its output retains the reported charge, token usage, latency,
+and hashes tying the proposal to the observation. `done` and `unsure` never
+produce a click target. `click` takes a packet and choice, obtains a fresh
+snapshot through the existing MCP session, validates the hashes, and performs
+one reviewed click. It refuses changed observations and does not retry.
+
+`call TOOL --arguments FILE --session FILE --origin URL` invokes a caller-chosen
+MCP tool through a loopback endpoint. `get-json --url URL --allow-prefix URL/
+--session FILE` issues one same-origin GET inside the supplied prefix using the
+browser's existing session. Session files and outputs are private and belong
+outside repositories; output parents must exist.
+
+The shared `Pacer` defaults to a two-second minimum plus 0–2 seconds of uniform
+jitter after completion, and one in-flight action per origin across processes.
+All calls in a workflow must share `--pace-state` (default: XDG state under
+`agency/browser/pacing`). `get-json` reports hosted HTTP 429/503 to it, honors
+`Retry-After`, and persists exponential cooldowns. Long cooldowns and busy
+origins defer the caller rather than blocking or replaying an action. Direct
+clicks do not expose hosted response headers; inspect actual rate-limit
+evidence before continuing. Pacing applies to logical operations, not every
+page asset or unpaced request inside a custom browser script.
+
+The runtime uses Python's standard library and Linux file locks. It currently
+targets Linux; Windows and macOS browser attachment are unverified.
+
+`download --url URL --destination NEW_PATH --download-directory CHROME_DIR
+--filename NAME --expected-size BYTES --session FILE` waits for a newly completed
+file in Chrome's configured download directory and verifies its size and SHA-256
+while copying it to a private, exclusively created destination. It ignores old
+and partial files and serializes the complete transfer under the origin's
+pacing lock. The downloaded URL remains local. A missing or ambiguous completed
+file defers the workflow; inspect it before another download.
+
+`download-batch` runs a reviewed generic manifest through that same Chrome
+transport. Chrome uses its existing credentials and follows normal download
+redirects; Agency does not extract cookies or authentication tokens. The queue
+is serialized and uses the shared origin pacer. No model call is made per file.
+Keep the manifest, collection, and session outside Git in private directories.
+
+```json
+{
+  "schema_version": 1,
+  "allowed_origins": ["https://example.com"],
+  "items": [
+    {
+      "id": "lecture-1",
+      "url": "https://example.com/files/123/download",
+      "filename": "Lecture 1.pdf",
+      "expected_size": 1024,
+      "path": "lectures/lecture-1.pdf"
+    }
+  ]
+}
+```
+
+`filename` is the name Chrome actually saves, including any displayed name;
+`path` is the relative path in the collection. Use distinct stable IDs and
+destinations. Each item requires a known byte size and may include a lowercase
+SHA-256 checksum in `sha256`. The manifest accepts 1–4096 items, at most 4 MiB,
+and an explicit allowlist of initial HTTP(S) origins. Browser redirects follow
+Chrome's normal behavior; the allowlist is not a redirect firewall. Paths
+cannot escape the collection or traverse symlinks within it.
+
+```console
+agency-browser download-batch --manifest /PRIVATE/PLAN/downloads.json \
+  --destination /PRIVATE/COLLECTION --download-directory /CHROME/DOWNLOADS \
+  --session /PRIVATE/SESSION/session.json --progress
+agency-browser download-batch --manifest /PRIVATE/PLAN/downloads.json \
+  --destination /PRIVATE/COLLECTION --verify-only
+```
+
+Rerun the first command to verify completed files locally and continue the
+queue. An append-only, mode-600 `.agency-downloads.jsonl` in the collection
+retains resource identities, checksums, bytes, pacing waits, and sanitized
+failure codes. Signed URL queries are omitted from the journal and may be
+refreshed while the item's ID, URL origin/path, filename, size, and destination
+stay the same. Use a new ID and destination for a different resource/version.
+The journal preserves previous successful checksums even after failed checks.
+One collection lock prevents overlapping batch runners.
+
+Existing files require a matching manifest checksum or prior successful
+receipt. Mismatched files are preserved and stop the queue. Missing files from
+an interrupted transfer require inspection of Chrome's download state before
+rerunning with `--retry-interrupted`; there is no automatic retry. Unknown
+filenames/sizes, expired authentication, prompts, and stalled downloads also
+require inspection. `--verify-only` makes no browser or provider calls and
+records verification receipts. `--dry-run` validates the manifest and prints
+counts without creating a collection or contacting Chrome. A fully completed
+resume also needs no MCP session. Exit status is nonzero for an incomplete
+batch; `--progress` writes only item IDs, status, and byte counts to stderr.

@@ -46,6 +46,9 @@ def _load_profiles():
                 raise ValueError('Invalid contract fields: ' + str(path))
             if 'bands_field' in definition and definition['bands_field'] != 'bands':
                 raise ValueError('Invalid contract bands field: ' + str(path))
+            if 'candidates_field' in definition and (definition['candidates_field'] != 'candidates'
+                    or 'bands_field' in definition or 'candidates' not in fields):
+                raise ValueError('Invalid contract candidates field: ' + str(path))
             if 'review_required' in definition and type(definition['review_required']) is not bool:
                 raise ValueError('Invalid contract review policy: ' + str(path))
             profiles[identifier] = definition
@@ -284,7 +287,7 @@ def build_request(state, profile):
             if field == 'evidence_complete':
                 if type(state[field]) is not bool:
                     raise DecisionError('evidence_complete must be a boolean.')
-            elif field != rubric.get('bands_field'):
+            elif field not in (rubric.get('bands_field'), rubric.get('candidates_field')):
                 if type(state[field]) is not str or not state[field].strip():
                     raise DecisionError('Contract evidence fields must be nonempty text.')
     if rubric.get('bands_field'):
@@ -294,6 +297,13 @@ def build_request(state, profile):
                        or type(v) is not str or not v.strip() or len(v) > 4096 for k, v in bands.items())):
             raise DecisionError('Supply 2 to 8 named bands with exact descriptors; unsure and insufficient are reserved.')
         labels = {**bands, **labels}
+    if rubric.get('candidates_field'):
+        candidates = state['candidates']
+        if (type(candidates) is not dict or not 1 <= len(candidates) <= 32 or set(candidates) & set(labels)
+                or any(type(k) is not str or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,63}', k)
+                       or type(v) is not str or not v.strip() or len(v) > 2048 for k,v in candidates.items())):
+            raise DecisionError('Supply 1 to 32 named candidates with inspected descriptors; fixed labels are reserved.')
+        labels = {**candidates, **labels}
     request = {'model': MODEL, 'state': state, 'questions': {'decision': {
         'type': 'choice', 'instructions': rubric['question'] + ' ' + ADVISORY_INSTRUCTION,
         'criteria': labels,

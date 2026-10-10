@@ -787,9 +787,36 @@
         "change": "The only available observation is that client.py was modified. The diff and behavior have not been inspected."
       },
       "expected": "unsure"
+    },
+    {
+      "id": "browser-interview",
+      "profile": "browser-workflow/next-control",
+      "state": {
+        "goal": "Read interview instructions",
+        "context": "Assessment navigation, no page content has been read yet.",
+        "candidates": {
+          "e2": "link: Assessment 1 Portfolio",
+          "e4": "link: Assessment 2 Interview",
+          "e6": "link: Assessment 3 Exam"
+        }
+      },
+      "expected": "e4"
+    },
+    {
+      "id": "browser-missing-file",
+      "profile": "browser-workflow/next-control",
+      "state": {
+        "goal": "Download the submitted report",
+        "context": "Only unrelated controls are available; the assignment page has not loaded.",
+        "candidates": {
+          "e2": "link: Account settings",
+          "e4": "button: Delete submission"
+        }
+      },
+      "expected": "unsure"
     }
   ],
-  "max_calls": 84,
+  "max_calls": 86,
   "concurrency": 4,
   "deadline_seconds": 60
 }

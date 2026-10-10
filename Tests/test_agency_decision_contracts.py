@@ -10,6 +10,38 @@ SPEC.loader.exec_module(d)
 
 
 class ContractTests(unittest.TestCase):
+    def test_browser_candidates_define_this_requests_exact_labels(self):
+        state = {'goal': 'Read the download instructions', 'context': 'Reviewed resource controls',
+                 'candidates': {'e12': 'link: Download guide', 'f2e16': 'button: Show details'}}
+        request = d.build_request(state, 'browser-workflow/next-control')
+        labels = request['questions']['decision']['criteria']
+        self.assertEqual(set(labels), {'e12', 'f2e16', 'done', 'unsure'})
+        self.assertEqual(labels['e12'], state['candidates']['e12'])
+        payload = {'model': d.MODEL, 'answers': {'decision': {
+            'type': 'choice', 'choice': 'e12', 'confidence': 1,
+            'probabilities': {key: float(key == 'e12') for key in labels}}},
+            'usage': {'input_tokens': 10, 'output_tokens': 1}}
+        result = d._validate_response(payload, 'browser-workflow/next-control', labels)
+        self.assertTrue(result['review_required'])
+        payload['answers']['decision']['choice'] = 'e99'
+        with self.assertRaises(d.DecisionError):
+            d._validate_response(payload, 'browser-workflow/next-control', labels)
+
+    def test_browser_candidates_reject_missing_reserved_or_unbounded_inputs(self):
+        state = {'goal': 'Read', 'context': 'Reviewed controls', 'candidates': {'e12': 'link: Guide'}}
+        invalid = ({}, [], {'done': 'link: Submit'}, {'unsure': 'button: Delete'},
+                   {'12': 'link: Guide'}, {'e12': ''}, {'e12': 'x' * 2049},
+                   {'e' + str(i): 'link: Resource' for i in range(33)})
+        for candidates in invalid:
+            with self.subTest(candidates=candidates), self.assertRaises(d.DecisionError):
+                d.build_request({**state, 'candidates': candidates}, 'browser-workflow/next-control')
+        for missing in state:
+            with self.subTest(missing=missing), self.assertRaises(d.DecisionError):
+                d.build_request({k: v for k, v in state.items() if k != missing}, 'browser-workflow/next-control')
+        accepted = {**state, 'candidates': {'e' + str(i): 'link: Resource' for i in range(32)}}
+        self.assertEqual(len(d.build_request(accepted, 'browser-workflow/next-control')
+                             ['questions']['decision']['criteria']), 34)
+
     def test_original_profiles_reject_missing_or_unstructured_evidence(self):
         fields = {'skill': ('task',), 'context': ('query', 'passage'),
                   'update': ('update', 'task_status'), 'research': ('claim', 'passage')}
@@ -29,6 +61,12 @@ class ContractTests(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.assertGreaterEqual(len({case['expected'] for case in cases
                                              if case['profile'] == profile}), 2)
+
+    def test_evaluation_fixture_budget_covers_its_unique_requests(self):
+        manifest = json.loads((ROOT / 'Tests/fixtures/decisions.json').read_text())
+        requests = {json.dumps(d.build_request(case['state'], case['profile']), sort_keys=True)
+                    for case in manifest['items']}
+        self.assertGreaterEqual(manifest['max_calls'], len(requests))
 
     def test_scope_requires_review_even_for_a_confident_result(self):
         labels = d.PROFILES['scope']['criteria']
