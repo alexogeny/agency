@@ -190,7 +190,7 @@ def _read_process_file(path):
     return value
 
 
-def inspect_processes(roots):
+def inspect_processes(roots, *, ignore_own_arguments=False):
     roots = {str(root) for root in roots}
     if not roots:
         return {'blocked': {}, 'uninspected_processes': 0}
@@ -209,6 +209,8 @@ def inspect_processes(roots):
     except OSError as error:
         raise RuntimeError('Cannot inspect the current working directory') from error
     record(os.path.abspath(sys.prefix), own_pid, 'current Python environment')
+    if ignore_own_arguments and sys.argv and not sys.argv[0].startswith('-'):
+        record(os.path.abspath(sys.argv[0]), own_pid, 'command path')
     try:
         processes = os.scandir('/proc')
     except OSError as error:
@@ -263,6 +265,9 @@ def inspect_processes(roots):
             except OSError:
                 incomplete = True
             for name in ('maps', 'cmdline', 'environ'):
+                if name == 'cmdline' and entry.name == own_pid and ignore_own_arguments:
+                    # The scanner's target argument is not a runtime dependency.
+                    continue
                 try:
                     content = _read_process_file(process / name)
                     if name == 'maps':

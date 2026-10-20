@@ -83,7 +83,7 @@ def _frame(candidates, labels, reasons, selected, focus, top, columns, rows, col
     controls = 'Up/Down move  Space toggle  Enter review  '
     controls += 'R refresh  ' if refreshable else ''
     controls += 'q/Esc cancel'
-    lines = [line('SELECT PROJECT DIRECTORIES', '1;38;5;183'),
+    lines = [line('SELECT CLEANUP TARGETS', '1;38;5;183'),
              line(f'{len(selected)} selected · {_size(total)} observed · nothing removed', '38;5;141'),
              line('-' * width, '38;5;60')]
     visible = []

@@ -59,6 +59,23 @@ class ProjectCleanupTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'active'):
                 module.validate_projects([self.item])
 
+    def test_inspection_can_exclude_its_own_scan_arguments_while_preserving_source_checks(self):
+        script = '''import importlib.util,json,sys
+spec=importlib.util.spec_from_file_location('projects',sys.argv[1]); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+print(json.dumps(module.inspect_processes([sys.argv[2]], ignore_own_arguments=True)))
+'''
+        result = subprocess.run([sys.executable, '-B', '-c', script, str(TOOL), str(self.env)],
+                                cwd=TOOL.parent.parent, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import json
+        self.assertEqual(json.loads(result.stdout)['blocked'], {})
+        own_source = self.env / 'inspection.py'
+        own_source.write_text(script)
+        result = subprocess.run([sys.executable, '-B', str(own_source), str(TOOL), str(self.env)],
+                                cwd=TOOL.parent.parent, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(self.env), json.loads(result.stdout)['blocked'])
+
     def test_unsafe_recursive_removal_implementation_is_refused(self):
         with patch.object(module.shutil.rmtree, 'avoids_symlink_attacks', False):
             with self.assertRaisesRegex(RuntimeError, 'descriptor-safe'):

@@ -23,6 +23,7 @@ let actualReadFailure: unknown;
 let reads = 0, closes = 0;
 const descriptors = new Set<number>();
 function profileRoot() { return root; }
+function writeProfileLifecycle() {}
 const mkdirSync = fs.mkdirSync, existsSync = fs.existsSync, rmSync = fs.rmSync, unlinkSync = fs.unlinkSync;
 function openSync(...args) { const descriptor = fs.openSync(...args); descriptors.add(descriptor); return descriptor; }
 function closeSync(descriptor) { closes++; fs.closeSync(descriptor); descriptors.delete(descriptor); }

@@ -1024,6 +1024,51 @@ function profileRoot(profile: string, ephemeral: boolean) {
   return mkdtempSync(join(ephemeralRoot, `${profile}-`));
 }
 
+function readProfileLifecycle(root: string) {
+  const path = `${root}.agency.json`;
+  const info = lstatSync(path);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > 65536) {
+    throw new Error("profile lifecycle metadata must be a small regular file");
+  }
+  const value = JSON.parse(readFileSync(path, "utf8"));
+  if (!value || value.schema_version !== 1 || value.owner !== "web-research" ||
+      typeof value.pinned !== "boolean" || typeof value.purpose !== "string" || !value.purpose.trim()) {
+    throw new Error("profile lifecycle metadata has invalid ownership or purpose");
+  }
+  return value as JsonObject;
+}
+
+function writeProfileLifecycle(root: string, updates: JsonObject) {
+  for (let path = root; path !== dirname(path); path = dirname(path)) {
+    if (lstatSync(path).isSymbolicLink()) throw new Error("profile path must not contain symlinks");
+  }
+  const now = Date.now() / 1000;
+  let previous: JsonObject;
+  try {
+    previous = readProfileLifecycle(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    previous = {schema_version: 1, owner: "web-research", purpose: "persistent research profile",
+                pinned: true, created_at: now, last_used_at: now, completed_at: null};
+  }
+  const value = {...previous, ...updates};
+  const path = `${root}.agency.json`;
+  const temporary = `${path}.${process.pid}.tmp`;
+  const descriptor = openSync(temporary, "wx", 0o600);
+  try {
+    try {
+      writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporary, path);
+  } catch (error) {
+    unlinkSync(temporary);
+    throw error;
+  }
+  return value;
+}
+
 function claimProfile(
   profile: string,
   transientPreferences: FirefoxPreference[] = [],
@@ -1076,6 +1121,7 @@ function claimProfile(
   const userJs = join(root, "user.js");
   let previousUserJs: string | null = null;
   try {
+    if (!ephemeral) writeProfileLifecycle(root, {last_used_at: Date.now() / 1000, completed_at: null});
     previousUserJs = existsSync(userJs) ? readFileSync(userJs, "utf8") : null;
     if (managePreferences) {
       const preferences: FirefoxPreference[] = [
@@ -1122,6 +1168,10 @@ function releaseProfile(claimed: ReturnType<typeof claimProfile>) {
       } else {
         writeFileSync(claimed.userJs, claimed.previousUserJs, { mode: 0o600 });
       }
+    }
+    if (!claimed.ephemeral) {
+      const now = Date.now() / 1000;
+      writeProfileLifecycle(claimed.root, {last_used_at: now, last_released_at: now});
     }
   } catch (error) {
     restoreError = error;
@@ -6389,6 +6439,33 @@ async function commandBrowser(args: string[]) {
   }
 }
 
+function commandProfileState(args: string[]) {
+  const profile = checkedProfile(takeOption(args, "--profile", "default"));
+  const purpose = takeOption(args, "--purpose", "");
+  const pinned = takeFlag(args, "--pinned");
+  const unpinned = takeFlag(args, "--unpinned");
+  const completed = takeFlag(args, "--completed");
+  const active = takeFlag(args, "--active");
+  if (args.length || (pinned && unpinned) || (completed && active)) {
+    throw new Error("profile-state accepts --purpose, --pinned or --unpinned, and --completed or --active");
+  }
+  const root = profileRoot(profile, false);
+  if (purpose || pinned || unpinned || completed || active) {
+    if (purpose && (!purpose.trim() || purpose.length > 256)) throw new Error("profile purpose must be 1–256 characters");
+    const claimed = claimProfile(profile, [], false);
+    try {
+      const updates: JsonObject = {};
+      if (purpose) updates.purpose = purpose;
+      if (pinned || unpinned) updates.pinned = pinned;
+      if (completed || active) updates.completed_at = completed ? Date.now() / 1000 : null;
+      writeProfileLifecycle(root, updates);
+    } finally {
+      releaseProfile(claimed);
+    }
+  }
+  console.log(JSON.stringify(readProfileLifecycle(root), null, 2));
+}
+
 function help() {
   console.log(`web-research — bounded HTTP retrieval and local Firefox research
 
@@ -6407,6 +6484,7 @@ Usage:
   web-research local QUERY [--limit N] [--json]
   web-research stats
   web-research browser [URL] [--profile NAME] [--detach]
+  web-research profile-state --profile NAME [--purpose TEXT] [--pinned|--unpinned] [--completed|--active]
 
 Browser options:
   --profile NAME          Persistent profile (default: automatic ephemeral for search)
@@ -6497,6 +6575,7 @@ try {
   else if (command === "scrape-many") await commandScrapeMany(args);
   else if (command === "replay") commandReplay(args);
   else if (command === "capture-gc") commandCaptureGc(args);
+  else if (command === "profile-state") commandProfileState(args);
   else if (command === "map") await commandMap(args);
   else if (command === "snapshot") await commandSnapshot(args);
   else if (command === "crawl") await commandCrawl(args);

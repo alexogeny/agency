@@ -431,6 +431,9 @@ cc --verbose          # Full breakdowns, paths and trade-offs
 cc --limit 15
 housekeeping --plain
 housekeeping --json > /tmp/housekeeping.json
+housekeeping --dry-run --json             # Inventory plus complete cleanup eligibility
+housekeeping --dry-run --system-caches    # Also plan pacman retention without elevation
+housekeeping --dry-run --system-caches --pacman-keep 3
 ```
 
 The default view shows five folders with their two largest categories, compact
@@ -455,9 +458,10 @@ classification evidence to folders, and `breakdown_note` to the result. Generate
 detail is bounded; if its limit is reached, category totals continue and the
 report marks the omitted detail.
 
-`--dry-run` lists native cache actions and project candidates, including
-recognized Python environments and `node_modules`. With `--apply`, a scrollable
-checkbox picker starts with every project folder unselected. Use Up/Down to move,
+`--dry-run` lists native cache actions, application cleanup rules and project
+candidates, including recognized Python environments and `node_modules`. With
+`--apply`, a scrollable checkbox picker starts with every application target and
+project folder unselected. Use Up/Down to move,
 Space to toggle `[ ]` / `[x]`, and Enter to review the chosen folders. Review-only
 rows display `[-]` and cannot be selected; toggling one keeps your other choices.
 Before the picker opens, eligible folders are checked for active use, changed
@@ -495,7 +499,7 @@ excluded. Each cache root is checked for changed identity, symlink traversal and
 mount boundaries before execution. Commands use fixed argument arrays with the
 observed cache path set in the tool's environment; displayed text is never
 executed as a shell command. A failure stops subsequent actions and reports
-prior completed commands. The tool never requests sudo. Bun runs from a temporary empty project and its
+prior completed commands. Bun runs from a temporary empty project and its
 reported cache location must match the scanned target before removal. Pip
 availability is checked with the same isolated interpreter used for cleanup.
 
@@ -503,8 +507,63 @@ Cache sizes describe the complete observed cache, not predicted recovery;
 uv pruning removes unused entries only. Re-run the scan after cleanup to inspect
 the result. `--dry-run --json` includes a structured `cleanup_plan` with eligible
 actions, excluded actions and their reasons, and all bounded `project_candidates`
-with classification, size, selection eligibility and reasons. Browser caches and thumbnails include guidance.
-Scratch tasks, application data and possible build outputs require ownership
+and `application_candidates` with classification, sizes, selection eligibility
+and reasons. Application discovery continues below review groups such as
+`.local/share` and `.codex`. Proposal sizes partition the scanned files; a
+proposal's `subtree_totals` additionally includes nested proposals. Whole-profile
+candidate sizes use this inclusive total. Selecting a profile together with its
+caches is rejected, so overlapping sizes are never an additive recovery estimate.
+
+Application rules cover:
+
+- Web-research profiles: only `cache2` and `startupCache` in inactive Agency
+  profiles are cache targets. Their removal preserves cookies, logins, history,
+  site storage, extensions, captures and the research index. Agency PID locks,
+  Firefox POSIX record locks and process references block active profiles.
+- Whole web-research profiles: separate, explicit selections require valid
+  Agency lifecycle metadata, an unpinned profile, recorded completion and no
+  recorded use for at least 30 days. Legacy profiles without metadata remain
+  review-only. Whole-profile removal also removes that profile's login and site
+  data; captures and the index remain outside this action.
+- Codex app-server releases: match installation metadata under
+  `~/.codex/packages/app-server-daemon/releases`. Keep the current symlink target,
+  one immediately older rollback, newer staged releases and observed active
+  releases. Unknown versions, layouts and platforms remain review-only. Apply
+  takes the installation lock and rechecks retention before removing a selected
+  release. Sessions, memory and databases have no deletion rule.
+- Desktop thumbnails: only recognized thumbnail directory layouts containing
+  regular PNG previews are eligible. Unknown files, symlinks and other layouts
+  remain review-only; previews regenerate after cleanup.
+- Pacman archives: `--system-caches` explicitly adds `/var/cache/pacman/pkg` to
+  the inventory even though it lies outside the selected scan root. Its usage is
+  reported separately under `additional_scans`, not added to home totals.
+  Read-only `paccache -d` determines candidate files and bytes. Retain two versions
+  per package by default; `--pacman-keep N` changes that rule and requires at least
+  one. Inaccessible temporary download directories keep the inventory partial,
+  while individually verified native archive candidates can remain selectable.
+  Apply checks the native candidate manifest again and invokes `sudo-gui` only
+  after explicit selection and final confirmation. Authentication cancellation
+  or a cleanup error stops subsequent actions without an automatic retry.
+
+New application targets are optional; merely running `--apply` does not select
+them. Their paths, retention rules and trade-offs appear in the final review.
+Read-only planning may run native discovery commands; it never runs cleanup or
+requests administrator access. Same-user process inspection gaps are visible
+and require care when selecting affected applications. Paths and mount
+boundaries are rechecked before descriptor-anchored directory removal.
+Firefox's Linux lock handling uses the `.parentlock` POSIX record lock from
+[Mozilla's profile-lock implementation](https://searchfox.org/firefox-main/source/toolkit/profile/nsProfileLock.cpp),
+alongside conservative checks for its legacy symlink locks.
+
+File modification bounds and directory modification time accompany application
+proposals in JSON. They are activity hints, not proof of last use. Access times
+are not used: `noatime` filesystems cannot provide that evidence. Persistent
+web-research profiles record actual claim/release use in an adjacent
+`NAME.agency.json` file, outside the repository. They start pinned; starting a
+profile again clears its completed state. Inspect or explicitly change that
+state with `web-research profile-state` as documented in its command reference.
+
+Scratch tasks, remaining application data and possible build outputs require ownership
 and rebuild checks. A directory named `cache`, `venv` or `build` alone does not
 make its contents disposable.
 

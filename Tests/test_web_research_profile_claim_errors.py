@@ -20,6 +20,7 @@ const stopped = new Error('bounded recursion proof stopped');
 let roots = 0, attempts = 0, writes = 0, closes = 0, unlinks = 0;
 const descriptors = new Set();
 function profileRoot() { if (++roots > 4) throw stopped; return root; }
+function writeProfileLifecycle() {}
 const mkdirSync = fs.mkdirSync, existsSync = fs.existsSync, rmSync = fs.rmSync;
 function openSync(...args) {
   attempts++;

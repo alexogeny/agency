@@ -444,9 +444,10 @@ sees it, without borrowing a warm cache or a conveniently configured home.
 
 - `housekeeping` (also `cleanup`, or `cc` in interactive Fish) scans disk usage
   with animated folder bars and proposes native cache cleanups and larger
-  directories to review. `--dry-run` lists cache actions, environments and
-  dependencies; `--apply` offers explicit project-folder selection and asks for
-  final confirmation before cleanup.
+  directories to review. `--dry-run` lists cache actions, environments,
+  web-research profile caches, obsolete Codex releases and thumbnails with
+  retention and active-use checks. `--system-caches` adds a read-only pacman
+  archive plan. `--apply` offers explicit target selection and final confirmation.
 - `sudo-gui` runs approved administrator operations through native macOS
   authorization or Linux KDE askpass. macOS controls the authentication wording.
 - `comment-audit` finds empty, decorative, and historical comments without

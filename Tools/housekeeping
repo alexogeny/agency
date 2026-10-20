@@ -28,6 +28,7 @@ CATEGORY_LABELS = {
     'git_metadata': 'Git history & metadata',
     'possible_generated': 'Possible generated folders',
     'other': 'Source & other files',
+    'application_data': 'Application cleanup',
 }
 BREAKDOWN_NOTE = ('Categories describe observed structure, not deletion permission. '
                   'Source & other files includes unclassified data; it is not a verified list of canonical source. '
@@ -62,6 +63,9 @@ def mount_paths():
 
 def proposal(path, home):
     path = Path(path)
+    application = provider_helpers().proposal(path, home)
+    if application is not None:
+        return application
     try:
         relative = path.relative_to(home).as_posix()
     except ValueError:
@@ -84,9 +88,6 @@ def proposal(path, home):
         tradeoff = 'Future installs download or build again; use the pip belonging to your Python installation.'
         command = f'PIP_CACHE_DIR={quote} python -m pip cache purge'
         action = 'pip' if relative == '.cache/pip' else None
-    elif relative == '.cache/thumbnails':
-        kind, title = 'cache', 'Review generated thumbnails'
-        tradeoff = 'Previews regenerate. Close file managers and use desktop cache controls before removing selected files.'
     elif relative.startswith(('.cache/mozilla/', '.cache/chromium/', '.cache/google-chrome/')) and path.name in {'cache2', 'Cache', 'Code Cache', 'GPUCache'}:
         kind, title = 'cache', 'Clear browser cached files in browser settings'
         tradeoff = 'Pages load more slowly initially. Select cached files only; preserve passwords, cookies and site data.'
@@ -147,7 +148,7 @@ def directory_category(path, fd, parent_fd, home):
         return 'bytecode', 'Conventional Python bytecode directory; inspect unusual contents before removal'
     if name == '.git':
         return 'git_metadata', 'Git history and metadata; preserve this directory'
-    if name in {'uv', 'cache', 'pip', 'thumbnails', 'cache2', 'Cache', 'Code Cache', 'GPUCache'} or str(path) in {
+    if name in {'uv', 'cache', 'pip', 'thumbnails', 'cache2', 'startupCache', 'Cache', 'Code Cache', 'GPUCache'} or str(path) in {
             os.environ.get('UV_CACHE_DIR'), os.environ.get('BUN_INSTALL_CACHE_DIR'), os.environ.get('PIP_CACHE_DIR')}:
         candidate = proposal(path, home)
         if candidate and candidate['kind'] == 'cache':
@@ -171,7 +172,7 @@ def open_root(root, flags):
 def scan(root, home=None, mount_points=None, progress=None):
     root = Path(os.path.abspath(os.path.expanduser(str(root))))
     home = Path(home) if home is not None else Path.home()
-    result = {'schema_version': 2, 'root': str(root), 'partial': False, 'warnings': [],
+    result = {'schema_version': 2, 'root': str(root), 'home': str(home), 'partial': False, 'warnings': [],
               'warning_count': 0, 'symlinks_skipped': 0, 'mounts_skipped': 0,
               'hardlinks_deduplicated': 0, 'entries_seen': 0, 'size_note': SIZE_NOTE,
               'totals': {**counter(), 'breakdown': {}}, 'breakdown_note': BREAKDOWN_NOTE,
@@ -197,6 +198,7 @@ def scan(root, home=None, mount_points=None, progress=None):
     groups = {}
     links = set()
     candidates = []
+    candidate_parents = {}
     capped_groups = False
     capped_candidates = False
     detail_count = 0
@@ -210,6 +212,7 @@ def scan(root, home=None, mount_points=None, progress=None):
         initial = proposal(root, home)
         if initial:
             initial['identity'] = {'device': root_stat.st_dev, 'inode': root_stat.st_ino}
+            initial['directory_modified_at'] = root_stat.st_mtime
             candidates.append(initial)
         parent_fd = (open_root(root.parent, flags)
                      if root.name in {'target', '.next', '.nuxt', '.svelte-kit', '.turbo'} else None)
@@ -272,13 +275,15 @@ def scan(root, home=None, mount_points=None, progress=None):
                         warn(f'{path}: depth limit reached; subtree omitted')
                         continue
                     child_candidate = candidate
-                    if child_candidate is None:
-                        child_candidate = proposal(path, home)
-                        if child_candidate is not None:
+                    if candidate is None or candidate['kind'] == 'review':
+                        discovered = proposal(path, home)
+                        if discovered is not None and (candidate is None or discovered.get('provider') or discovered.get('action')):
                             if len(candidates) < MAX_GROUPS:
+                                child_candidate = discovered
+                                if candidate:
+                                    candidate_parents[child_candidate['path']] = candidate['path']
                                 candidates.append(child_candidate)
                             else:
-                                child_candidate = None
                                 if not capped_candidates:
                                     warn('Proposal detail limit reached; further proposals omitted.')
                                     capped_candidates = True
@@ -291,6 +296,7 @@ def scan(root, home=None, mount_points=None, progress=None):
                             continue
                         if child_candidate is not None and child_candidate['path'] == str(path):
                             child_candidate['identity'] = {'device': opened.st_dev, 'inode': opened.st_ino}
+                            child_candidate['directory_modified_at'] = opened.st_mtime
                         child_category, child_detail = category, detail
                         if category in {'other', 'possible_generated'}:
                             detected, evidence = directory_category(path, child_fd, fd, home)
@@ -330,6 +336,9 @@ def scan(root, home=None, mount_points=None, progress=None):
                             target['apparent_bytes'] += info.st_size
                             target['allocated_bytes'] += info.st_blocks * 512
                             target['files'] += 1
+                    if candidate is not None:
+                        candidate['oldest_file_modified_at'] = min(candidate.get('oldest_file_modified_at', info.st_mtime), info.st_mtime)
+                        candidate['newest_file_modified_at'] = max(candidate.get('newest_file_modified_at', info.st_mtime), info.st_mtime)
             except OSError as error:
                 warn(f'{path}: {error}')
         for group in groups.values():
@@ -337,7 +346,21 @@ def scan(root, home=None, mount_points=None, progress=None):
                 (item for item in group['generated_directories'] if item['files']),
                 key=lambda item: item['allocated_bytes'], reverse=True)
         result['folders'] = sorted(groups.values(), key=lambda x: x['allocated_bytes'], reverse=True)
-        result['proposals'] = sorted((c for c in candidates if c['allocated_bytes'] or c['apparent_bytes']),
+        by_path = {item['path']: item for item in candidates}
+        for item in candidates:
+            item['subtree_totals'] = {key: item[key] for key in counter()}
+        for item in reversed(candidates):
+            parent = by_path.get(candidate_parents.get(item['path']))
+            if parent:
+                for key, value in item['subtree_totals'].items():
+                    parent['subtree_totals'][key] += value
+                for key, combine in (('oldest_file_modified_at', min), ('newest_file_modified_at', max)):
+                    if key in item:
+                        parent[key] = combine(parent.get(key, item[key]), item[key])
+                if not item['scan_complete']:
+                    parent['scan_complete'] = False
+        result['proposals'] = sorted((c for c in candidates if c['allocated_bytes'] or c['apparent_bytes']
+                                     or (c.get('provider') and (c['subtree_totals']['allocated_bytes'] or c['subtree_totals']['apparent_bytes']))),
                                      key=lambda x: x['allocated_bytes'], reverse=True)
         return result
     finally:
@@ -426,7 +449,7 @@ def pip_available(executable):
         return False
 
 
-def cleanup_plan(result):
+def cleanup_plan(result, *, pacman_keep=2):
     actions, blocked = [], []
     for candidate in result['proposals']:
         if not candidate['command']:
@@ -464,9 +487,15 @@ def cleanup_plan(result):
             item['reason'] = 'Review only: scan incomplete; inspect this folder before cleanup.'
         else:
             item['reason'] = f"Review only: {CATEGORY_LABELS[item['category']]} removal is not supported."
+        path = Path(item['path'])
+        owned_roots = (provider_helpers().web_root(Path(result.get('home', str(Path.home())))) / 'profiles',
+                       Path(result.get('home', str(Path.home()))) / '.codex/packages')
+        if any(path.is_relative_to(root) for root in owned_roots):
+            item.update(selectable=False, reason='Review only: application-owned dependencies require the application retention rule.')
     projects.sort(key=lambda item: item['allocated_bytes'], reverse=True)
     return {'root': result['root'], 'executes_commands': False, 'actions': actions, 'blocked_actions': blocked,
             'project_candidates': projects,
+            'application_candidates': provider_helpers().plan(result['proposals'], pacman_keep=pacman_keep),
             'review_only_count': sum(not item['command'] for item in result['proposals']),
             'reclaimable_bytes_note': 'Sizes are observed, not guaranteed recovery. Cache recovery is unknown; uv prunes unused entries only.'}
 
@@ -527,6 +556,11 @@ def project_helpers():
     return load_helper('housekeeping_projects')
 
 
+def provider_helpers():
+    project_helpers()
+    return load_helper('housekeeping_providers')
+
+
 def choose_projects(candidates, *, colour=True, initial_selected=(), refresh=None, notice=''):
     return load_helper('housekeeping_picker').pick_projects(
         candidates, colour=colour, initial_selected=initial_selected, refresh=refresh, notice=notice)
@@ -535,8 +569,8 @@ def choose_projects(candidates, *, colour=True, initial_selected=(), refresh=Non
 def apply_cleanup(plan, *, colour=True):
     actions = list(plan['actions'])
     candidates = [dict(item, label=os.path.relpath(item['path'], plan.get('root', str(Path.home()))))
-                  for item in plan.get('project_candidates', [])]
-    eligible = [item for item in candidates if item['selectable']]
+                  for item in [*plan.get('project_candidates', []), *plan.get('application_candidates', [])]]
+    eligible = [item for item in candidates if item['selectable'] or item.get('refreshable')]
     helper = project_helpers() if eligible else None
     readiness = {'blocked': {}, 'uninspected_processes': 0}
     completed = removed = 0
@@ -546,7 +580,13 @@ def apply_cleanup(plan, *, colour=True):
 
     def inspect(items):
         try:
-            report = helper.report_projects(items)
+            projects = [item for item in items if not item.get('provider')]
+            applications = [item for item in items if item.get('provider')]
+            report = helper.report_projects(projects) if projects else {'blocked': {}, 'uninspected_processes': 0}
+            if applications:
+                app_report = provider_helpers().report_actions(applications, selection=False)
+                report['blocked'].update(app_report['blocked'])
+                report['uninspected_processes'] = max(report['uninspected_processes'], app_report['uninspected_processes'])
         except (OSError, RuntimeError) as error:
             if completed:
                 raise RuntimeError(f'Availability check stopped; {completed} cache commands completed. No project folders removed: {error}') from error
@@ -559,7 +599,9 @@ def apply_cleanup(plan, *, colour=True):
 
     def available():
         return [dict(item, selectable=False, reason=readiness['blocked'][item['path']])
-                if item['path'] in readiness['blocked'] else dict(item) for item in candidates]
+                if item['path'] in readiness['blocked'] else
+                dict(item, selectable=True, reason='Availability and retention rechecked; choose explicitly.')
+                if item.get('refreshable') else dict(item) for item in candidates]
 
     def refresh():
         inspect(eligible)
@@ -573,7 +615,7 @@ def apply_cleanup(plan, *, colour=True):
 
     try:
         if helper:
-            print('Checking project availability...', flush=True)
+            print('Checking cleanup availability...', flush=True)
             refresh()
         while True:
             selected = (choose_projects(available(), colour=colour, initial_selected=selected_paths,
@@ -586,20 +628,29 @@ def apply_cleanup(plan, *, colour=True):
             if selected:
                 print('Checking selected folders...', flush=True)
                 inspection = inspect(selected)
+                paths = {item['path'] for item in selected}
+                overlaps = False
+                for path in paths:
+                    for parent in (str(parent) for parent in Path(path).parents if str(parent) in paths):
+                        inspection['blocked'][path] = inspection['blocked'][parent] = 'Selections overlap; choose the whole profile or its caches.'
+                        overlaps = True
                 if inspection['blocked']:
                     selected_paths = tuple(path for path in selected_paths if path not in inspection['blocked'])
-                    notice = 'Some folders became unavailable; other choices kept. R refreshes availability.'
+                    notice = ('Selections overlap; choose a whole profile or its caches. Other choices kept.' if overlaps
+                              else 'Some folders became unavailable; other choices kept. R refreshes availability.')
                     continue
                 if inspection['uninspected_processes']:
                     print(f'Could not inspect {inspection["uninspected_processes"]} processes. Close apps using the selected folders before continuing.')
             for item in actions:
                 verify_cache(item)
             if selected:
-                print('\nPROJECT FOLDERS TO DELETE PERMANENTLY')
+                print('\nSELECTED CLEANUP TARGETS')
                 for item in selected:
                     print(f'  {size(item["allocated_bytes"]):>10}  {safe(item["path"])}')
-                print('Entire selected folders, including local edits, will be removed. Reinstall dependencies before using these projects.')
-            confirmed = input(f'Run {len(actions)} cache cleanup commands and delete {len(selected)} selected project folders? [y/N] ').strip().lower() in {'y', 'yes'}
+                    if item.get('provider'):
+                        print(f'    {safe(item["title"])}. {safe(item["tradeoff"])}')
+                print('Selected directories will be removed, including local edits. Package archives use the displayed retention rule.')
+            confirmed = input(f'Run {len(actions)} cache cleanup commands and {len(selected)} selected cleanup actions? [y/N] ').strip().lower() in {'y', 'yes'}
             if not confirmed:
                 cancel_message()
                 return 0
@@ -639,11 +690,19 @@ def apply_cleanup(plan, *, colour=True):
                 for item in selected:
                     print(f'Removing: {safe(item["path"])}', flush=True)
                     mutation_started = True
-                    helper.remove_project(item)
+                    if item.get('provider'):
+                        process = provider_helpers().execute(item)
+                        for output in (process.stdout, process.stderr):
+                            if output.strip():
+                                print('\n'.join(safe(line) for line in output.rstrip().splitlines()))
+                        if process.returncode:
+                            raise RuntimeError(f'{item["action"]} cleanup failed ({process.returncode})')
+                    else:
+                        helper.remove_project(item)
                     removed += 1
-            except (OSError, RuntimeError) as error:
-                raise RuntimeError(f'Project cleanup stopped; {completed} cache commands and {removed} folder removals completed: {error}') from error
-            print(f'Completed {completed} cache cleanup commands and {removed} project folder removals. Run housekeeping again to refresh usage.')
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                raise RuntimeError(f'Selected cleanup stopped; {completed} cache commands and {removed} selected actions completed: {error}') from error
+            print(f'Completed {completed} cache cleanup commands and {removed} selected cleanup actions. Run housekeeping again to refresh usage.')
             return 0
     except (EOFError, KeyboardInterrupt):
         if mutation_started:
@@ -662,7 +721,7 @@ def render(result, limit=5, colour=False, verbose=False, dry_run=False, applying
     heading = 'CLEANUP PLAN' if applying else 'DRY RUN' if dry_run else 'HOUSEKEEPING'
     lines = [tint(f'◇ {heading}') + '  ' + safe(result['root'])]
     if dry_run or applying:
-        lines.append('Confirmation required before execution.' if applying else 'Preview only. No commands executed.')
+        lines.append('Confirmation required before execution.' if applying else 'Preview only. No commands executed for cleanup.')
         actions = plan['actions']
         if not actions:
             lines.append('No native cache actions in this scan.')
@@ -678,6 +737,26 @@ def render(result, limit=5, colour=False, verbose=False, dry_run=False, applying
             lines.append(f'  + {len(actions) - len(shown)} more cache actions; increase --limit or use --json.')
         for item in plan['blocked_actions']:
             lines.append(f'  Excluded: {safe(item["path"])} — {item["reason"]}')
+        applications = plan.get('application_candidates', [])
+        if applications:
+            lines.extend(['', tint('APPLICATION CLEANUP CANDIDATES · unselected')])
+            for item in applications if applying else applications[:limit]:
+                status = 'selectable' if item['selectable'] else 'review only'
+                lines.extend([f'  {size(item["allocated_bytes"]):>10}  {safe(item["title"])} [{status}]',
+                              f'    {safe(item["path"])}'])
+                if verbose or applying:
+                    lines.extend([f'    {safe(item["reason"])}', f'    {safe(item["tradeoff"])}'])
+                    if 'newest_file_modified_at' in item:
+                        newest = time.strftime('%Y-%m-%d', time.gmtime(item['newest_file_modified_at']))
+                        oldest = time.strftime('%Y-%m-%d', time.gmtime(item['oldest_file_modified_at']))
+                        lines.append(f'    File modifications: {oldest} to {newest} UTC; modification is an activity hint, not last access.')
+                    if item['action'] == 'pacman' and 'candidate_apparent_bytes' in item:
+                        lines.append(f'    Native dry run: {size(item["candidate_apparent_bytes"])} apparent candidate files; keep {item["keep_versions"]} versions.')
+            if not applying and len(applications) > limit:
+                lines.append(f'  + {len(applications) - limit} more application targets; use --json for all eligibility and age evidence.')
+            gaps = max((item['uninspected_processes'] for item in applications), default=0)
+            if gaps:
+                lines.append(f'  Could not fully inspect {gaps} processes; active-use checks are incomplete. Review running apps before applying.')
         projects = plan['project_candidates']
         if projects and applying:
             lines.extend(['', f'{len(projects)} project candidates · availability checked before selection',
@@ -713,6 +792,9 @@ def render(result, limit=5, colour=False, verbose=False, dry_run=False, applying
             lines.append('  No supported cache cleanup available.')
         for item in plan['actions'][:limit]:
             lines.append(f'  {size(item["allocated_bytes"]):>10}  {item["title"]}')
+        applications = plan.get('application_candidates', [])
+        if applications:
+            lines.append(f'  {sum(item["selectable"] for item in applications)} eligible application targets; --dry-run shows retention and exclusions.')
         if plan['blocked_actions']:
             lines.append(f'  {len(plan["blocked_actions"])} excluded cache action(s); --dry-run explains why.')
         generated = sorted((item for folder in result['folders'] for item in folder['generated_directories']),
@@ -774,6 +856,8 @@ def main(argv=None):
     parser.add_argument('--plain', action='store_true', help='disable colour and animation')
     parser.add_argument('--no-animation', action='store_true', help='disable animated scan progress')
     parser.add_argument('--limit', type=int, default=5, help='preview rows per section (default: 5; interactive picker and JSON include all)')
+    parser.add_argument('--system-caches', action='store_true', help='also inspect /var/cache/pacman/pkg explicitly, without elevation')
+    parser.add_argument('--pacman-keep', type=int, default=2, help='pacman package versions to retain (default: 2; minimum: 1)')
     args = parser.parse_args(argv)
     if args.apply and args.json:
         parser.error('--apply cannot be combined with --json; use --dry-run --json')
@@ -781,11 +865,27 @@ def main(argv=None):
         parser.error('--apply requires an interactive terminal for both the visible plan and confirmation')
     if args.limit < 1:
         parser.error('--limit must be positive')
+    if args.pacman_keep < 1:
+        parser.error('--pacman-keep must be at least 1')
     colour, motion = preferences()
     colour = colour and not args.plain and not args.json
     progress = Progress(motion and not (args.plain or args.no_animation or args.json), colour)
     try:
         result = scan(args.directory, progress=progress if progress.enabled else None)
+        system_root = Path('/var/cache/pacman/pkg')
+        if args.system_caches and not any(item['path'] == str(system_root) for item in result['proposals']):
+            try:
+                system = scan(system_root)
+                result['additional_scans'] = [system]
+                result['proposals'].extend(system['proposals'])
+                if system['partial']:
+                    result['partial'] = True
+                    result['warnings'].extend(system['warnings'])
+                    result['warning_count'] += system['warning_count']
+            except OSError as error:
+                result['partial'] = True
+                result['warning_count'] += 1
+                result['warnings'].append(f'System package cache unavailable: {error}')
     except KeyboardInterrupt:
         progress.close()
         print('housekeeping: scan cancelled; nothing changed.', file=sys.stderr)
@@ -796,8 +896,8 @@ def main(argv=None):
         return 2
     finally:
         progress.close()
-    if args.dry_run or args.apply:
-        result['cleanup_plan'] = cleanup_plan(result)
+    if args.dry_run or args.apply or not args.json:
+        result['cleanup_plan'] = cleanup_plan(result, pacman_keep=args.pacman_keep)
     if args.json:
         print(json.dumps(result, ensure_ascii=True, indent=2))
     else:

@@ -222,6 +222,35 @@ unreferenced objects exceed the retention count. Add `--apply` only after
 reviewing that list. Captures never retain headers, cookies, browser storage,
 request bodies, or secret-shaped URL parameters.
 
+## Profile lifetime and housekeeping
+
+Persistent profile claims and releases record actual use in
+`profiles/NAME.agency.json`, beside the Firefox directory. Profiles start pinned.
+Opening a profile clears its recorded completion. Existing profiles gain
+metadata when used through Agency; read-only housekeeping does not adopt them.
+Modification times are only activity hints, and access times are not used.
+
+```console
+web-research profile-state --profile TASK
+web-research profile-state --profile TASK --purpose "ongoing authenticated research" --pinned
+web-research profile-state --profile TASK --purpose "finished disposable research" --completed --unpinned
+housekeeping --dry-run --json
+```
+
+The first command only reads existing lifecycle metadata. The other commands
+explicitly change it and require an available profile. Use `--active` to clear
+completion; `--pinned` protects the whole profile. Marking a profile completed
+also records the current use, so it cannot become a whole-profile removal
+candidate until at least 30 days later. Legacy profiles with no metadata,
+pinned profiles and recently used profiles remain review-only.
+
+Housekeeping offers inactive `cache2` and `startupCache` directories separately,
+preserving cookies, logins, history, site storage, extensions, captures and the
+index. Whole-profile removal is a distinct explicit selection that removes
+the profile's login and site data. Both actions check Agency/native Firefox
+locks and active processes, and `--apply` requires selection and confirmation.
+Capture retention remains the separate `capture-gc` command above.
+
 ## Direct HTTP evidence
 
 `retrieve` processes up to 100 URLs sequentially and returns the
