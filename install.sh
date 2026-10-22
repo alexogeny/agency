@@ -128,6 +128,9 @@ agency_link "$AGENCY_DIR/Tools/agency-decide-mcp" "$HOME/.local/bin/agency-decid
 agency_link "$AGENCY_DIR/Tools/agency-decision-usage" "$HOME/.local/bin/agency-decision-usage"
 agency_link "$AGENCY_DIR/Tools/git-get" "$HOME/.local/bin/git-get"
 agency_link "$AGENCY_DIR/Tools/agent-work" "$HOME/.local/bin/agent-work"
+agency_link "$AGENCY_DIR/Tools/agent-work-hook" "$HOME/.local/bin/agent-work-hook"
+agency_link "$AGENCY_DIR/Tools/agent-work-watch" "$HOME/.local/bin/agent-work-watch"
+agency_link "$AGENCY_DIR/Tools/agent-work-bridge" "$HOME/.local/bin/agent-work-bridge"
 agency_link "$AGENCY_DIR/Tools/agent-context" "$HOME/.local/bin/agent-context"
 agency_link "$AGENCY_DIR/Tools/comment-audit" "$HOME/.local/bin/comment-audit"
 agency_link "$AGENCY_DIR/Tools/docs-exec" "$HOME/.local/bin/docs-exec"
@@ -152,6 +155,7 @@ agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.claude/CLAUDE.md"
 agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.pi/agent/AGENTS.md"
 agency_link "$AGENCY_DIR/Agents/pi/agency-web.ts" "$HOME/.pi/agent/extensions/agency-web.ts"
 agency_link "$AGENCY_DIR/Agents/pi/agency-decisions.ts" "$HOME/.pi/agent/extensions/agency-decisions.ts"
+agency_link "$AGENCY_DIR/Agents/pi/agency-work.ts" "$HOME/.pi/agent/extensions/agency-work.ts"
 agency_link \
   "$AGENCY_DIR/Agents/codex/coordinated-worker.toml" \
   "$HOME/.codex/agents/coordinated-worker.toml"

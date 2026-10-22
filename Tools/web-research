@@ -1069,12 +1069,7 @@ function writeProfileLifecycle(root: string, updates: JsonObject) {
   return value;
 }
 
-function claimProfile(
-  profile: string,
-  transientPreferences: FirefoxPreference[] = [],
-  managePreferences = true,
-  ephemeral = false,
-) {
+function lockProfile(profile: string, ephemeral = false) {
   const root = profileRoot(profile, ephemeral);
   const lock = ephemeral ? join(root, ".agency.lock") : `${root}.lock`;
   mkdirSync(root, { recursive: true });
@@ -1096,12 +1091,7 @@ function claimProfile(
         throw new Error("could not claim a new ephemeral Firefox profile");
       }
       unlinkSync(lock);
-      return claimProfile(
-        profile,
-        transientPreferences,
-        managePreferences,
-        ephemeral,
-      );
+      return lockProfile(profile, ephemeral);
     }
     throw new Error(
       `browser profile '${profile}' is already in use by process ${owner}`,
@@ -1118,6 +1108,17 @@ function claimProfile(
     if (ephemeral) rmSync(root, { recursive: true, force: true });
     throw error;
   }
+  return { root, lock, ephemeral };
+}
+
+function claimProfile(
+  profile: string,
+  transientPreferences: FirefoxPreference[] = [],
+  managePreferences = true,
+  ephemeral = false,
+) {
+  const locked = lockProfile(profile, ephemeral);
+  const { root, lock } = locked;
   const userJs = join(root, "user.js");
   let previousUserJs: string | null = null;
   try {
@@ -1148,12 +1149,10 @@ function claimProfile(
     throw error;
   }
   return {
-    root,
-    lock,
+    ...locked,
     userJs,
     previousUserJs,
     managePreferences,
-    ephemeral,
   };
 }
 
@@ -6452,7 +6451,7 @@ function commandProfileState(args: string[]) {
   const root = profileRoot(profile, false);
   if (purpose || pinned || unpinned || completed || active) {
     if (purpose && (!purpose.trim() || purpose.length > 256)) throw new Error("profile purpose must be 1–256 characters");
-    const claimed = claimProfile(profile, [], false);
+    const locked = lockProfile(profile);
     try {
       const updates: JsonObject = {};
       if (purpose) updates.purpose = purpose;
@@ -6460,7 +6459,7 @@ function commandProfileState(args: string[]) {
       if (completed || active) updates.completed_at = completed ? Date.now() / 1000 : null;
       writeProfileLifecycle(root, updates);
     } finally {
-      releaseProfile(claimed);
+      unlinkSync(locked.lock);
     }
   }
   console.log(JSON.stringify(readProfileLifecycle(root), null, 2));

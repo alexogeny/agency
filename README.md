@@ -71,14 +71,17 @@ handoffs.
 ```console
 agent-work --json start --task "repair the parser" --scope src/parser \
   --timebox 45m --owner codex-root
-agent-work --json heartbeat TASK_ID --agent codex-root \
+AGENT_WORK_TOKEN_FILE=CREDENTIAL agent-work --json heartbeat TASK_ID --agent codex-root \
   --note "focused tests passed; preparing integration"
 agent-work --json status --repo "$PWD"
 agent-work --json history TASK_ID
-agent-work --json finish TASK_ID --status complete \
+AGENT_WORK_TOKEN_FILE=CREDENTIAL agent-work --json finish TASK_ID --status complete \
   --agent codex-root --summary "parser repair verified" \
   --changed src/parser --check "focused parser tests passed"
 ```
+
+Use the `credential_file` returned by `start` for `CREDENTIAL`; it stays in
+private machine-local state. Each mutating command needs that task credential.
 
 This unlocks massively parallel work. Agents do not need branch and worktree
 choreography for every task. Use a worktree for a separate branch history, an
@@ -90,9 +93,15 @@ sequence. Repository status stays bounded unless `--all-repos` requests the
 machine-wide board. Stale records are evidence to inspect, never permission to
 kill a process or seize another task's files.
 
-The [claim-routed messaging workshop](Workshops/claim-routing.md) sketches the
-next step: deterministic requests to claim owners, client-specific delivery,
-and atomic subtree yielding without forcing either task into another worktree.
+The register also supports durable broadcasts and claim negotiation. A blocked
+agent can register with `--no-claims`, request paths from their actual owners,
+and receive replies through its client session. Owners can yield, defer, deny
+or counter; ownership moves atomically after every required owner accepts.
+Broad claims can yield a subtree through an explicit exclusion. Queued,
+delivered and acknowledged messages remain distinct from granted write access.
+See the [claim messaging design and acceptance evidence](Workshops/claim-routing.md)
+and [`coordinate`](Skills/coordinate/SKILL.md) for credentials, client delivery,
+recovery and controlled-session bridges.
 
 ### Give a workload a clean room
 

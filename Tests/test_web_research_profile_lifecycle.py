@@ -62,6 +62,36 @@ class WebResearchProfileLifecycleTests(unittest.TestCase):
         self.assertEqual(protected.read_text(), '{"secret": "preserve"}')
         self.assertFalse(lock.exists())
 
+    def test_metadata_edits_preserve_completion_and_activity_timestamps(self):
+        result = self.run_state('--purpose', 'finished research', '--completed')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = Path(str(self.profile) + '.agency.json')
+        original = json.loads(result.stdout)
+        original.update(last_used_at=1000, last_released_at=1100)
+        metadata.write_text(json.dumps(original))
+        for arguments, expected in (
+            (('--unpinned',), {'pinned': False}),
+            (('--purpose', 'archived research'), {'purpose': 'archived research'}),
+            (('--pinned',), {'pinned': True}),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_state(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                original.update(expected)
+                self.assertEqual(json.loads(result.stdout), original)
+                self.assertFalse(Path(str(self.profile) + '.lock').exists())
+
+    def test_active_explicitly_clears_completion_without_recording_browser_use(self):
+        result = self.run_state('--completed')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = Path(str(self.profile) + '.agency.json')
+        original = json.loads(result.stdout)
+        original.update(last_used_at=1000, last_released_at=1100)
+        metadata.write_text(json.dumps(original))
+        result = self.run_state('--active')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {**original, 'completed_at': None})
+
     def test_normal_claim_records_use_clears_completion_and_preserves_pinning(self):
         result = self.run_state('--purpose', 'fixture', '--unpinned', '--completed')
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+os.execvp("bun", ["bun", str(Path(__file__).resolve().with_name("agent_work_bridge.ts")), *sys.argv[1:]])

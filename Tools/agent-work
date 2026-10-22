@@ -14,6 +14,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_work_messages as messages
+
 ACTIVE_STATES = ("active", "waiting")
 TERMINAL_STATES = ("complete", "failed", "abandoned", "superseded")
 PURPLE = "\033[1;35m"
@@ -62,7 +66,8 @@ def state_root():
         else Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
         / "agent-work"
     )
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
     return root
 
 
@@ -72,6 +77,7 @@ def database():
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA foreign_keys=ON")
+    os.chmod(path, 0o600)
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS tasks (
@@ -139,7 +145,9 @@ def database():
         "CREATE INDEX IF NOT EXISTS task_events_task_time "
         "ON task_events(task_id, occurred_at, id)"
     )
+    messages.schema(connection)
     connection.commit()
+    messages.provision_legacy(sys.modules[__name__], connection)
     return connection
 
 
@@ -184,6 +192,8 @@ def normalize_claim(root, value):
 
 
 def claims_overlap(first, second):
+    if first.startswith("/") != second.startswith("/"):
+        return False
     if first == "." or second == ".":
         return True
     return (
@@ -302,6 +312,10 @@ def serialize_task(connection, row, claims=None):
         "summary": row["summary"],
         "checks": json.loads(row["checks_json"]),
         "changed": json.loads(row["changed_json"]),
+        "credential_file": str(messages.credential_path(sys.modules[__name__], row["id"]))
+            if connection.execute("SELECT 1 FROM task_auth WHERE task_id=?", (row["id"],)).fetchone() else None,
+        "claim_protocol": 2,
+        **messages.attention(sys.modules[__name__], connection, row),
     }
 
 
@@ -324,7 +338,9 @@ def serialize_event(row):
 
 
 def emit(value, as_json):
-    if as_json:
+    task_value = isinstance(value, dict) and "seconds_remaining" in value
+    task_list = isinstance(value, list) and (not value or "seconds_remaining" in value[0])
+    if as_json or not (task_value or task_list):
         print(json.dumps(value, indent=2, sort_keys=True))
         return
     if isinstance(value, list):
@@ -344,6 +360,12 @@ def emit(value, as_json):
         print(f"  note      {value['latest_note']}")
     if value["summary"]:
         print(f"  summary   {value['summary']}")
+    if value["exclusions"]:
+        print(f"  excludes  {json.dumps(value['exclusions'])}")
+    if value["paused_scopes"]:
+        print(f"  paused    {json.dumps(value['paused_scopes'])}")
+    if value["unread_messages"] or value["pending_requests"]:
+        print(f"  attention {value['unread_messages']} unread · {len(value['pending_requests'])} pending requests")
 
 
 def human_duration(seconds):
@@ -373,6 +395,10 @@ def emit_table(tasks):
         print(f"{task['id']:<31} {task['status']:<10} {left:>8}  {owner:<18} {scope}")
         if task["latest_note"]:
             print(f"  ↳ {task['latest_note']}")
+        if task["exclusions"] or task["paused_scopes"]:
+            print(f"  ↳ exclusions {json.dumps(task['exclusions'])} · paused {json.dumps(task['paused_scopes'])}")
+        if task["unread_messages"] or task["pending_requests"]:
+            print(f"  ↳ {task['unread_messages']} unread · {len(task['pending_requests'])} pending requests")
 
 
 def find_conflicts(connection, repo_id, claims, exclude_task=None):
@@ -389,7 +415,7 @@ def find_conflicts(connection, repo_id, claims, exclude_task=None):
     conflicts = []
     for row in connection.execute(query, parameters):
         for claim in claims:
-            if claims_overlap(claim, row["path"]):
+            if messages.overlaps(sys.modules[__name__], connection, row["id"], row["path"], claim):
                 conflicts.append(
                     {
                         "task_id": row["id"],
@@ -430,8 +456,10 @@ def board_rows(connection, arguments, states, *, bounded=True):
 
 
 def command_start(arguments, as_json):
+    if bool(arguments.client) != bool(arguments.session):
+        fail("--client and --session must be supplied together", 2)
     root, common, repo_id, branch = repository(arguments.worktree)
-    claims = sorted({normalize_claim(root, value) for value in arguments.scope})
+    claims = sorted({normalize_claim(root, value) for value in arguments.scope or []})
     duration = parse_duration(arguments.timebox)
     now = utc_now()
     task_id = f"{slug(arguments.task)}-{secrets.token_hex(3)}"
@@ -504,11 +532,20 @@ def command_start(arguments, as_json):
         status="active",
         details={"claims": claims, "worktree": str(Path(arguments.worktree).resolve())},
     )
+    token = secrets.token_hex(32)
+    connection.execute("INSERT INTO task_auth(task_id,token_hash) VALUES(?,?)", (task_id, messages.token_hash(token)))
+    messages.save_credential(sys.modules[__name__], task_id, token)
+    if arguments.client and arguments.session:
+        messages.register_session(sys.modules[__name__], connection, task_record(connection, task_id), arguments.client, arguments.session)
+    messages.claim_notice(sys.modules[__name__], connection, task_record(connection, task_id), claims)
     connection.commit()
+    messages.wake(connection)
     record = serialize_task(connection, task_record(connection, task_id))
+    record["task_token"] = token
     emit(record, as_json)
     if not as_json:
         print(f"{DIM}export AGENT_WORK_ID={task_id}{RESET}")
+        print(f"export AGENT_WORK_TOKEN={token}")
 
 
 def command_claim(arguments, as_json):
@@ -523,11 +560,13 @@ def command_claim(arguments, as_json):
             fail("claim requires TASK_ID and at least one path", 2)
         task_id, *paths = arguments.values
     row = task_record(connection, task_id)
+    messages.authorize(sys.modules[__name__], connection, row, legacy=True)
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
         fail(f"cannot add write scope to {row['status']} task {row['id']}", 2)
     root = Path(row["repo_root"])
     claims = sorted({normalize_claim(root, value) for value in paths})
+    messages.assert_not_paused(sys.modules[__name__], connection, task_id, claims)
     conflicts = find_conflicts(connection, row["repo_id"], claims, row["id"])
     if conflicts:
         connection.rollback()
@@ -539,6 +578,7 @@ def command_claim(arguments, as_json):
                         "claim_kind": "write",
                         "read_allowed": True,
                         "conflicts": conflicts,
+                        "next_action": f"agent-work request-claim {task_id} {' '.join(claims)} --message REASON",
                     },
                     indent=2,
                 )
@@ -551,10 +591,7 @@ def command_claim(arguments, as_json):
                     file=sys.stderr,
                 )
         raise SystemExit(3)
-    connection.executemany(
-        "INSERT OR IGNORE INTO claims (task_id, path) VALUES (?, ?)",
-        [(row["id"], claim) for claim in claims],
-    )
+    messages.grant_paths(connection, row["id"], claims)
     append_event(
         connection,
         row["id"],
@@ -564,7 +601,9 @@ def command_claim(arguments, as_json):
         status=row["status"],
         details={"claims": claims},
     )
+    messages.claim_notice(sys.modules[__name__], connection, row, claims)
     connection.commit()
+    messages.wake(connection)
     emit(serialize_task(connection, task_record(connection, row["id"])), as_json)
 
 
@@ -572,6 +611,7 @@ def command_heartbeat(arguments, as_json):
     connection = database()
     connection.execute("BEGIN IMMEDIATE")
     row = task_record(connection, task_id_from(arguments))
+    messages.authorize(sys.modules[__name__], connection, row, legacy=True)
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
         fail(f"cannot heartbeat {row['status']} task {row['id']}", 2)
@@ -603,6 +643,7 @@ def command_finish(arguments, as_json):
     connection = database()
     connection.execute("BEGIN IMMEDIATE")
     row = task_record(connection, task_id_from(arguments))
+    messages.authorize(sys.modules[__name__], connection, row, legacy=True)
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
         fail(f"task {row['id']} is already {row['status']}", 2)
@@ -632,7 +673,11 @@ def command_finish(arguments, as_json):
         note=arguments.summary,
         details={"checks": arguments.check, "changed": arguments.changed},
     )
+    messages.finish_requests(sys.modules[__name__], connection, row)
+    messages.claim_notice(sys.modules[__name__], connection, row,
+                          claims_by_task(connection, [row['id']])[row['id']], "claim-released")
     connection.commit()
+    messages.wake(connection)
     emit(serialize_task(connection, task_record(connection, row["id"])), as_json)
 
 
@@ -807,16 +852,19 @@ def parser():
         "start", help="register a timeboxed task and atomically claim write scope"
     )
     start.add_argument("--task", required=True, metavar="DESCRIPTION")
-    start.add_argument(
+    scope = start.add_mutually_exclusive_group(required=True)
+    scope.add_argument(
         "--scope",
         action="append",
-        required=True,
         help="path reserved for writes; repeatable; reads never require a claim",
     )
+    scope.add_argument("--no-claims", action="store_true", help="register a task before negotiating its first write claim")
     start.add_argument("--timebox", default="1h")
     start.add_argument("--worktree", default=os.getcwd())
     start.add_argument("--pid", type=int)
     start.add_argument("--owner", metavar="AGENT", help="task owner label")
+    start.add_argument("--client", choices=("codex", "claude", "pi"))
+    start.add_argument("--session", help="bind delivery to this client session")
     add_json_option(start)
     start.set_defaults(handler=command_start)
 
@@ -882,6 +930,7 @@ def parser():
     )
     add_json_option(history)
     history.set_defaults(handler=command_history)
+    messages.parser(sys.modules[__name__], commands)
     return root
 
 

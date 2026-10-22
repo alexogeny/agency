@@ -87,7 +87,7 @@ try {
 class WebResearchProfilePreferencesErrorsTests(unittest.TestCase):
     def run_phase(self, phase):
         source = TOOL.read_text()
-        source = source[source.index("function claimProfile("):source.index("\nclass Bidi {")]
+        source = source[source.index("function lockProfile("):source.index("\nclass Bidi {")]
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             script = workspace / "preferences.ts"

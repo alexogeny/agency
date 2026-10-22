@@ -89,7 +89,7 @@ try {
 class WebResearchProfileClaimErrorsTests(unittest.TestCase):
     def run_phase(self, phase):
         source = TOOL.read_text()
-        source = source[source.index('function claimProfile('):source.index('\nfunction releaseProfile(')]
+        source = source[source.index('function lockProfile('):source.index('\nfunction releaseProfile(')]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / 'claim.ts'

@@ -19,6 +19,7 @@ class AgentWorkTests(unittest.TestCase):
         self.state = self.workspace / "state"
         self.repo = self.workspace / "repo"
         self.other_repo = self.workspace / "other"
+        self.tokens = {}
         self.git("init", "--initial-branch=main", self.repo)
         self.git("init", "--initial-branch=main", self.other_repo)
 
@@ -34,16 +35,22 @@ class AgentWorkTests(unittest.TestCase):
         )
 
     def run_tool(self, *arguments, cwd=None, check=True):
+        token = next((self.tokens[str(value)] for value in arguments if str(value) in self.tokens), None)
         result = subprocess.run(
             [TOOL, *map(str, arguments)],
             cwd=cwd or self.repo,
             check=False,
             text=True,
             capture_output=True,
-            env={**os.environ, "AGENT_WORK_STATE_DIR": str(self.state)},
+            env={**os.environ, "AGENT_WORK_STATE_DIR": str(self.state),
+                 "AGENT_WORK_TOKEN": token or ""},
         )
         if check and result.returncode:
             self.fail(result.stderr or result.stdout)
+        if result.returncode == 0 and "start" in arguments:
+            value = json.loads(result.stdout)
+            if "task_token" in value:
+                self.tokens[value["id"]] = value["task_token"]
         return result
 
     def start(self, description, scope, *, repo=None, owner=None):
@@ -314,6 +321,12 @@ class AgentWorkTests(unittest.TestCase):
         self.assertIn("task_events", tables)
         self.assertEqual(len(backups), 1)
         self.assertEqual(backed_up_tasks, [("legacy-task",)])
+        credential = Path(record["credential_file"])
+        self.assertEqual(credential.stat().st_mode & 0o777, 0o600)
+        self.run_tool("heartbeat", "legacy-task", "--json")
+        self.tokens["legacy-task"] = credential.read_text().strip()
+        notice = json.loads(self.run_tool("broadcast", "legacy-task", "--message", "Existing owner can negotiate", "--json").stdout)
+        self.assertEqual(notice["sender"], "legacy-task")
 
 
 if __name__ == "__main__":

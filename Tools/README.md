@@ -689,8 +689,92 @@ boards, and records terminal handoffs without modifying Git. Existing ledgers
 are backed up and upgraded in place when new coordination fields are needed.
 Claims reserve writes only: reading, searching, reviewing, or otherwise
 inspecting a claimed path remains allowed. `inspect TASK_ID` reads one exact
-record; `inspect` without an ID opens or emits the active board. Use
-`agent-work --help` for the task lifecycle and JSON interface.
+record; `inspect` without an ID opens or emits the active board.
+
+`start --no-claims` registers a blocked task without inventing a reservation.
+New tasks return `task_token` once and a private `credential_file` outside the
+repository. Prefix mutating commands with `AGENT_WORK_TOKEN_FILE=PATH` (or
+forward `AGENT_WORK_TOKEN` in the worker environment). Status never exposes the
+token. Active legacy tasks gain private credential files on migration and keep
+lifecycle compatibility. Their owners can use that credential path to bind the
+current client session and negotiate without closing the task.
+
+```console
+agent-work --json start --task "Repair parser" --no-claims --owner codex-parser
+AGENT_WORK_TOKEN_FILE=CREDENTIAL agent-work --json request-claim TASK src/parser --message "Needed for assigned fix" --key parser-fix
+agent-work --json inbox OWNER_TASK
+AGENT_WORK_TOKEN_FILE=OWNER_CREDENTIAL agent-work --json respond OWNER_TASK REQUEST --revision 1 --decision yield --quiesced
+agent-work --json request TASK REQUEST
+agent-work --json check-write TASK src/parser/file.py
+```
+
+`broadcast` snapshots other active/waiting tasks in the same repository.
+`request-claim` routes to all effective owners and emits a repository intent
+notice. Owners can `yield`, `defer --until TIME`, `deny --message REASON`, or
+`counter --path PATH`. Yield requires stopping every writer first. Multi-owner
+requests transfer in one transaction after every owner accepts the same
+revision. `revise-request` resets approvals; `cancel-request` releases temporary
+pauses. Changed claims require review, not a stale approval. Deadlines, silence
+and dead processes never grant ownership. Wait cycles appear in request output.
+
+Broad claims retain explicit yielded exclusions. `check-write` checks effective
+ownership and pending pauses; exit 3 refuses the write while reads remain
+allowed. Exclusions persist when the recipient finishes, and require explicit
+reacquisition. All cooperating agents must use the updated CLI; claims do not
+enforce filesystem permissions or stop an existing background writer.
+
+`inbox` is read-only with respect to message state; `ack TASK MESSAGE` records
+acknowledgement without changing claims. `message TASK MESSAGE` shows each
+recipient's queued/delivered/acknowledged state. Requests have a separate
+pending/granted/denied/cancelled/needs-review lifecycle. Retry identical requests
+or broadcasts with the same `--key`; reusing a key for different content fails.
+
+The installer adds unfiltered lifecycle hooks for Codex/Claude and the Pi
+`agency-work.ts` extension. Hooks bind tasks when they observe an authenticated
+JSON start result, or use `session TASK --client CLIENT --session ID` explicitly.
+Hooks deliver at the next prompt/tool/stop boundary; arbitrary idle TUIs remain
+queued. Pi's local watcher steers active work and wakes idle sessions through
+custom extension messages. Session switches stop the watcher.
+
+Inbox hooks consume the full JSON event in chunks, replacing JSON strings
+larger than 64 KiB (encoded) with `null` before parsing the bounded metadata. Image data
+and large tool text therefore do not prevent session routing or delivery;
+small authenticated registration records remain available even after images.
+The retained JSON is limited to 1 MiB, and hook inputs are never stored.
+
+`agent-work-watch --client CLIENT --session ID` streams durable inbox batches
+as JSONL. It uses a private Unix datagram wake socket, with a fifteen-second
+reconciliation fallback for missed wakeups. Consumers reply on stdin with
+`{"delivered":"BATCH_ID"}` only after the client accepts the context. Unconfirmed
+batches retry after their lease; delivered but unacknowledged messages retry
+after five minutes. Stable message IDs make retries identifiable. Hooks mark
+delivery after emitting context; that records adapter submission rather than
+proof the model read or agreed with it. Each delivery contains at most eight
+messages and 32 KiB of context, with actionable requests ahead of routine
+notices. Longer notes are summarised with commands to inspect their full
+records. Routine claim updates coalesce to the latest ownership snapshot;
+replaced notices are `superseded`, without fabricating acknowledgement.
+
+`agent-work-bridge` (Bun) supplies optional controlled transports:
+
+```console
+agent-work-bridge --client codex --session THREAD --url ws://127.0.0.1:4500
+agent-work-bridge --client claude --session UUID -- --max-budget-usd 2
+```
+
+Codex mode connects to an explicitly selected loopback app-server, steers an
+active turn and starts an idle one without model or permission overrides. A
+`--token-file PATH` supplies listener authentication. The caller handles any
+app-server approval requests emitted on stdout, sending JSON replies on stdin.
+Claude mode launches a controlled `stream-json` worker, forwards client JSONL
+on stdin/stdout, and confirms delivery only after replayed-input acknowledgement.
+`--resume yes` is for exclusive control of an existing session, not attachment
+to a working TUI. Bridge startup is explicit and can incur normal model costs
+when it wakes a session. It never launches automatically from the ledger.
+
+See [coordinate](../Skills/coordinate/SKILL.md) and the
+[design and acceptance record](../Workshops/claim-routing.md), or use
+`agent-work --help` for the CLI.
 
 ## `agent-context`
 

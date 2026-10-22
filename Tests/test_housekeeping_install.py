@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +9,28 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class HousekeepingInstallTests(unittest.TestCase):
+    def test_missing_housekeeping_preserves_interactive_compiler(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / '.local/bin'
+            bin_dir.mkdir(parents=True)
+            compiler = bin_dir / 'cc'
+            compiler.write_text('#!/bin/sh\nprintf "compiler fixture\\n"\n')
+            compiler.chmod(0o755)
+            env = dict(os.environ, HOME=str(root), XDG_CONFIG_HOME=str(root / '.config'),
+                       PATH=os.pathsep.join((str(bin_dir), '/usr/bin', '/bin')), TERM='xterm')
+            result = subprocess.run(
+                [shutil.which('fish'), '--no-config', '-i', '-c',
+                 'source $argv[1]; command -sq housekeeping; and exit 9; '
+                 'functions -q cc; and exit 7; '
+                 'functions cleanup | string match --quiet "*housekeeping*"; and exit 8; '
+                 'cc --version',
+                 str(ROOT / 'config/fish/config.fish')],
+                env=env, text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, 'compiler fixture\n')
+
     def test_installer_links_both_names_without_shadowing_compiler(self):
         installer = (ROOT / 'install.sh').read_text()
         for name in ('housekeeping', 'cleanup'):
