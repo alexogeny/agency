@@ -92,8 +92,8 @@ source "$1/scripts/install-macos.sh"
 AGENCY_DIR=$1
 brew() {
   case "$*" in
-    "list --formula uv") return 1 ;;
-    "list "*) return 0 ;;
+    "list --formula") sed '/^uv$/d;/^#/d;/^$/d' "$AGENCY_DIR/packages-macos.txt" ;;
+    "list --cask") printf '%s\n' firefox 1password 1password-cli font-fantasque-sans-mono-nerd-font ;;
     "--prefix rustup") printf '/brew/opt/rustup\n' ;;
     *) printf '%s\n' "$*" >> "$HOME/brew.log" ;;
   esac
@@ -113,7 +113,8 @@ source "$1/scripts/install-macos.sh"
 AGENCY_DIR=$1
 brew() {
   case "$*" in
-    "list "*) return 0 ;;
+    "list --formula") sed '/^#/d;/^$/d' "$AGENCY_DIR/packages-macos.txt" ;;
+    "list --cask") printf '%s\n' firefox 1password 1password-cli font-fantasque-sans-mono-nerd-font ;;
     "--prefix rustup") printf '/brew/opt/rustup\n' ;;
     *) printf '%s\n' "$*" >> "$HOME/brew.log" ;;
   esac
@@ -136,7 +137,8 @@ source "$1/scripts/install-macos.sh"
 AGENCY_DIR=$1
 brew() {
   case "$*" in
-    "list --formula "*) return 0 ;;
+    "list --formula") sed '/^#/d;/^$/d' "$AGENCY_DIR/packages-macos.txt" ;;
+    "list --cask") printf '%s\n' firefox 1password 1password-cli font-fantasque-sans-mono-nerd-font ;;
     "--prefix rustup") return 7 ;;
     *) printf '%s\n' "$*" >> "$HOME/unexpected-cask-calls" ;;
   esac
@@ -180,8 +182,8 @@ source "$1/scripts/install-macos.sh"
 AGENCY_DIR=$1
 brew() {
   case "$*" in
-    "list --cask font-fantasque-sans-mono-nerd-font") return 1 ;;
-    "list "*) return 0 ;;
+    "list --formula") sed '/^#/d;/^$/d' "$AGENCY_DIR/packages-macos.txt" ;;
+    "list --cask") printf '%s\n' firefox 1password 1password-cli ;;
     "--prefix rustup") printf '/brew/opt/rustup\n' ;;
     *) printf '%s\n' "$*" >> "$HOME/brew.log" ;;
   esac

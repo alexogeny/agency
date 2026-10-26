@@ -80,6 +80,13 @@ first-party state, cache, and site preferences instead of presenting a new
 browser on every request. Never inspect, export, print, or copy cookies, local
 storage, challenge tokens, or credentials.
 
+Persistent profiles record actual use and start pinned. Use
+`web-research profile-state --profile TASK_NAME` to inspect their lifecycle.
+After a disposable research task is complete, explicitly record its purpose,
+completion and unpinned state only when its login and site data may be discarded.
+Housekeeping previews inactive browser caches separately from whole-profile
+removal; see the command reference for retention and confirmation rules.
+
 Seed a stable Agency profile with sanitized preferences from the current
 Firefox installation:
 

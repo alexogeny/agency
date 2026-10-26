@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-update=false
-case ${1:-} in
-  --update) update=true ;;
-  "") ;;
-  *)
-    printf 'Usage: %s [--update]\n' "${0##*/}" >&2
-    exit 2
-    ;;
-esac
-(( $# <= 1 )) || { printf 'Usage: %s [--update]\n' "${0##*/}" >&2; exit 2; }
+script_directory=${BASH_SOURCE[0]%/*}
+[[ $script_directory != "${BASH_SOURCE[0]}" ]] || script_directory=.
+source "$script_directory/lib.sh"
+update=$(agency_install_update_mode "$@")
 
 stable_is_default=false
 while IFS= read -r toolchain; do

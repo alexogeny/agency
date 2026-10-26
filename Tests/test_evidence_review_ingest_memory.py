@@ -59,7 +59,7 @@ class EvidenceReviewIngestMemoryTests(unittest.TestCase):
     def test_normalized_ledger_is_not_retained_after_writes(self):
         self.input('records.jsonl', [])
         records = [{'title': 'Same study', 'doi': '10.1/same'}] * 2000
-        with patch.dict(INGEST.__globals__, load_records=lambda *args: records):
+        with patch.dict(INGEST.__globals__, iter_records=lambda *args: iter(records)):
             tracemalloc.start()
             try:
                 self.run_ingest()

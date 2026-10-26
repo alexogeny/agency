@@ -8,6 +8,18 @@ agency_as_root() {
   fi
 }
 
+agency_install_update_mode() {
+  if (( $# > 1 )) || [[ -n ${1:-} && $1 != --update ]]; then
+    printf 'Usage: %s [--update]\n' "${0##*/}" >&2
+    return 2
+  fi
+  if [[ ${1:-} == --update ]]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
 agency_ensure_backup_root() {
   if [[ -z ${AGENCY_BACKUP_ROOT:-} ]]; then
     AGENCY_BACKUP_ROOT="$HOME/.local/state/agency/backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -66,16 +78,18 @@ agency_install_policy() (
   ' agency-install-policy "$policy_temporary/policies.json" "$policy_target"
 )
 
-agency_link() {
+agency_link_with_prefix() {
   local source=$1
   local target=$2
+  shift 2
 
   if [[ ! -e $source && ! -L $source ]]; then
     printf 'Managed link source does not exist: %s\n' "$source" >&2
     return 1
   fi
 
-  mkdir -p "$(dirname -- "$target")"
+  # Only filesystem writes use the optional prefix; backup planning stays local.
+  "$@" mkdir -p "$(dirname -- "$target")"
   if [[ -e $target && $source -ef $target ]]; then
     return
   fi
@@ -84,38 +98,20 @@ agency_link() {
     local backup
     agency_ensure_backup_root
     backup=$(agency_backup_path "$target")
-    mkdir -p "$(dirname -- "$backup")"
-    mv -- "$target" "$backup"
+    "$@" mkdir -p "$(dirname -- "$backup")"
+    "$@" mv -- "$target" "$backup"
     printf 'Backed up %s to %s\n' "$target" "$backup"
   fi
 
-  ln -sfn -- "$source" "$target"
+  "$@" ln -sfn -- "$source" "$target"
+}
+
+agency_link() {
+  agency_link_with_prefix "$1" "$2"
 }
 
 agency_link_as_root() {
-  local source=$1
-  local target=$2
-
-  if [[ ! -e $source && ! -L $source ]]; then
-    printf 'Managed link source does not exist: %s\n' "$source" >&2
-    return 1
-  fi
-
-  agency_as_root mkdir -p "$(dirname -- "$target")"
-  if [[ -e $target && $source -ef $target ]]; then
-    return
-  fi
-
-  if [[ -e $target && ! -L $target ]]; then
-    local backup
-    agency_ensure_backup_root
-    backup=$(agency_backup_path "$target")
-    agency_as_root mkdir -p "$(dirname -- "$backup")"
-    agency_as_root mv -- "$target" "$backup"
-    printf 'Backed up %s to %s\n' "$target" "$backup"
-  fi
-
-  agency_as_root ln -sfn -- "$source" "$target"
+  agency_link_with_prefix "$1" "$2" agency_as_root
 }
 
 agency_install_git_identity() {
@@ -226,4 +222,48 @@ agency_merge_agent_hooks() {
     return
   fi
   return "$status"
+}
+
+clone_pinned_recipe() {
+  local package=$1 revision=$2 target=$3 actual
+  git clone --depth 1 "https://aur.archlinux.org/${package}.git" "$target"
+  git -C "$target" cat-file -e "${revision}^{commit}" || {
+    printf '%s AUR revision is no longer the fetched head; review and update the pin.\n' "$package" >&2
+    exit 1
+  }
+  actual=$(git -C "$target" rev-parse HEAD)
+  [[ $actual == "$revision" ]] || {
+    printf '%s AUR head %s does not match pinned revision %s.\n' \
+      "$package" "$actual" "$revision" >&2
+    exit 1
+  }
+}
+
+agency_user_links() {
+  local mode=$1 callback platform source target skill_dir skill_name
+  case $mode in
+    apply) callback=agency_link ;;
+    preview) callback=agency_plan_link ;;
+    *) printf 'Unknown managed link mode: %s\n' "$mode" >&2; return 2 ;;
+  esac
+  while IFS=$'\t' read -r platform source target; do
+    [[ -n $platform && $platform != \#* ]] || continue
+    case $platform in
+      all) ;;
+      linux|macos) [[ $platform == "${AGENCY_PLATFORM:-linux}" ]] || continue ;;
+      *) printf 'Unknown managed link platform: %s\n' "$platform" >&2; return 2 ;;
+    esac
+    "$callback" "$AGENCY_DIR/$source" "$HOME/$target" || return
+  done < "$AGENCY_DIR/scripts/managed-user-links.tsv" || return
+
+  if [[ $mode == apply ]]; then
+    mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.pi/agent/skills" || return
+  fi
+  for skill_dir in "$AGENCY_DIR"/Skills/*; do
+    [[ -d $skill_dir ]] || continue
+    skill_name=${skill_dir##*/}
+    "$callback" "$skill_dir" "$HOME/.agents/skills/$skill_name" || return
+    "$callback" "$skill_dir" "$HOME/.claude/skills/$skill_name" || return
+    "$callback" "$skill_dir" "$HOME/.pi/agent/skills/$skill_name" || return
+  done
 }

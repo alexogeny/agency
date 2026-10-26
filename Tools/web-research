@@ -7,6 +7,7 @@ import { createServer as createHttpServer, request as httpRequest } from "node:h
 import {
   closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
@@ -158,6 +159,8 @@ type Page = {
     markdown: boolean;
     html: boolean;
     links: boolean;
+    dom?: boolean;
+    ranking?: boolean;
   };
 };
 type PageBatchFailure = {
@@ -233,6 +236,7 @@ function terminalText(value: unknown) {
 }
 
 function fail(message: string): never {
+  if (workerMode) throw new Error(message);
   process.stderr.write(`${red}error:${reset} ${terminalText(message)}\n`);
   process.exit(1);
 }
@@ -1024,12 +1028,52 @@ function profileRoot(profile: string, ephemeral: boolean) {
   return mkdtempSync(join(ephemeralRoot, `${profile}-`));
 }
 
-function claimProfile(
-  profile: string,
-  transientPreferences: FirefoxPreference[] = [],
-  managePreferences = true,
-  ephemeral = false,
-) {
+function readProfileLifecycle(root: string) {
+  const path = `${root}.agency.json`;
+  const info = lstatSync(path);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > 65536) {
+    throw new Error("profile lifecycle metadata must be a small regular file");
+  }
+  const value = JSON.parse(readFileSync(path, "utf8"));
+  if (!value || value.schema_version !== 1 || value.owner !== "web-research" ||
+      typeof value.pinned !== "boolean" || typeof value.purpose !== "string" || !value.purpose.trim()) {
+    throw new Error("profile lifecycle metadata has invalid ownership or purpose");
+  }
+  return value as JsonObject;
+}
+
+function writeProfileLifecycle(root: string, updates: JsonObject) {
+  for (let path = root; path !== dirname(path); path = dirname(path)) {
+    if (lstatSync(path).isSymbolicLink()) throw new Error("profile path must not contain symlinks");
+  }
+  const now = Date.now() / 1000;
+  let previous: JsonObject;
+  try {
+    previous = readProfileLifecycle(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    previous = {schema_version: 1, owner: "web-research", purpose: "persistent research profile",
+                pinned: true, created_at: now, last_used_at: now, completed_at: null};
+  }
+  const value = {...previous, ...updates};
+  const path = `${root}.agency.json`;
+  const temporary = `${path}.${process.pid}.tmp`;
+  const descriptor = openSync(temporary, "wx", 0o600);
+  try {
+    try {
+      writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporary, path);
+  } catch (error) {
+    unlinkSync(temporary);
+    throw error;
+  }
+  return value;
+}
+
+function lockProfile(profile: string, ephemeral = false) {
   const root = profileRoot(profile, ephemeral);
   const lock = ephemeral ? join(root, ".agency.lock") : `${root}.lock`;
   mkdirSync(root, { recursive: true });
@@ -1051,12 +1095,7 @@ function claimProfile(
         throw new Error("could not claim a new ephemeral Firefox profile");
       }
       unlinkSync(lock);
-      return claimProfile(
-        profile,
-        transientPreferences,
-        managePreferences,
-        ephemeral,
-      );
+      return lockProfile(profile, ephemeral);
     }
     throw new Error(
       `browser profile '${profile}' is already in use by process ${owner}`,
@@ -1073,9 +1112,21 @@ function claimProfile(
     if (ephemeral) rmSync(root, { recursive: true, force: true });
     throw error;
   }
+  return { root, lock, ephemeral };
+}
+
+function claimProfile(
+  profile: string,
+  transientPreferences: FirefoxPreference[] = [],
+  managePreferences = true,
+  ephemeral = false,
+) {
+  const locked = lockProfile(profile, ephemeral);
+  const { root, lock } = locked;
   const userJs = join(root, "user.js");
   let previousUserJs: string | null = null;
   try {
+    if (!ephemeral) writeProfileLifecycle(root, {last_used_at: Date.now() / 1000, completed_at: null});
     previousUserJs = existsSync(userJs) ? readFileSync(userJs, "utf8") : null;
     if (managePreferences) {
       const preferences: FirefoxPreference[] = [
@@ -1102,12 +1153,10 @@ function claimProfile(
     throw error;
   }
   return {
-    root,
-    lock,
+    ...locked,
     userJs,
     previousUserJs,
     managePreferences,
-    ephemeral,
   };
 }
 
@@ -1122,6 +1171,10 @@ function releaseProfile(claimed: ReturnType<typeof claimProfile>) {
       } else {
         writeFileSync(claimed.userJs, claimed.previousUserJs, { mode: 0o600 });
       }
+    }
+    if (!claimed.ephemeral) {
+      const now = Date.now() / 1000;
+      writeProfileLifecycle(claimed.root, {last_used_at: now, last_released_at: now});
     }
   } catch (error) {
     restoreError = error;
@@ -1151,6 +1204,7 @@ class Bidi {
   >();
   listeners = new Map<string, Set<(params: any) => void>>();
   subscriptions = new Set<string>();
+  subscriptionIds = new Map<string, string>();
 
   constructor(url: string) {
     this.socket = new WebSocket(url);
@@ -1268,11 +1322,12 @@ class Bidi {
   async subscribe(method: string, context: string) {
     const key = `${method}\n${context}`;
     if (this.subscriptions.has(key)) return;
-    await this.command("session.subscribe", {
+    const result = await this.command("session.subscribe", {
       events: [method],
       contexts: [context],
     });
     this.subscriptions.add(key);
+    if (typeof result.subscription === "string") this.subscriptionIds.set(key, result.subscription);
   }
 
   async navigate(
@@ -1345,120 +1400,167 @@ async function terminateBrowserProcess(
 ) {
   if (processHandle.exitCode !== null) return;
   processHandle.kill();
-  await Promise.race([processHandle.exited, sleep(3_000)]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([processHandle.exited, new Promise(resolve => { timer = setTimeout(resolve, 3_000); })]);
+  } finally { clearTimeout(timer); }
   if (processHandle.exitCode === null) {
     processHandle.kill(9);
     await processHandle.exited;
   }
 }
 
+type BrowserResources = {
+  abort: AbortController;
+  proxyReady?: ReturnType<typeof safeProxy>;
+  proxy?: Awaited<ReturnType<typeof safeProxy>>;
+  claimed?: ReturnType<typeof claimProfile>;
+  processHandle?: ReturnType<typeof Bun.spawn>;
+  bidi?: Bidi;
+  closing?: boolean;
+  cleanup?: Promise<void>;
+};
+const activeBrowserResources = new Set<BrowserResources>();
+let workerStopping = false;
+
+function closeBrowserResources(resources: BrowserResources): Promise<void> {
+  if (resources.cleanup) return resources.cleanup;
+  resources.closing = true;
+  resources.abort.abort();
+  resources.cleanup = Promise.resolve().then(async () => {
+    const errors: unknown[] = [];
+    const attempt = async (operation: () => unknown) => {
+      try { await operation(); } catch (error) { errors.push(error); }
+    };
+    await attempt(() => resources.bidi?.close());
+    await attempt(() => resources.processHandle && terminateBrowserProcess(resources.processHandle));
+    await attempt(() => resources.claimed && releaseProfile(resources.claimed));
+    await attempt(async () => {
+      const proxy = resources.proxy || await resources.proxyReady;
+      if (proxy) await proxy.close();
+    });
+    activeBrowserResources.delete(resources);
+    if (errors.length === 1) throw errors[0];
+    if (errors.length) throw new AggregateError(errors, "browser resource cleanup failed");
+  });
+  return resources.cleanup;
+}
+
 async function startBrowser(
   options: BrowserOptions,
   transientPreferences: FirefoxPreference[] = [],
 ) {
-  if (
-    !options.headless &&
-    !process.env.DISPLAY &&
-    !process.env.WAYLAND_DISPLAY
-  ) {
+  if (!options.headless && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
     throw new Error("no graphical display is available; use --headless");
   }
-  const proxy = await safeProxy(options.allowPrivate);
-  let claimed: ReturnType<typeof claimProfile>;
+  if (workerMode && workerStopping) throw new Error("browser worker is shutting down");
+  const resources: BrowserResources = { abort: new AbortController() };
+  activeBrowserResources.add(resources);
   try {
-    claimed = claimProfile(
-      options.profile,
-      [
-        ...options.templatePreferences,
-        ...transientPreferences,
-        ["network.proxy.type", 1],
-        ["network.proxy.http", "127.0.0.1"],
-        ["network.proxy.http_port", proxy.port],
-        ["network.proxy.ssl", "127.0.0.1"],
-        ["network.proxy.ssl_port", proxy.port],
-        ["network.proxy.no_proxies_on", ""],
-        ["network.proxy.allow_hijacking_localhost", true],
-      ],
-      true,
-      options.ephemeral,
-    );
-  } catch (error) {
-    await proxy.close();
-    throw error;
-  }
-  const port = choosePort();
-  const command = [
-    "firefox",
-    "--no-remote",
-    "--profile",
-    claimed.root,
-    "--remote-debugging-port",
-    String(port),
-  ];
-  if (options.headless) command.push("--headless");
-  command.push("about:blank");
-  let processHandle: ReturnType<typeof Bun.spawn>;
-  try {
-    processHandle = Bun.spawn(command, {
-      stdout: "ignore",
-      stderr: "ignore",
-      stdin: "ignore",
-    });
-  } catch (error) {
-    try {
-      releaseProfile(claimed);
-    } finally {
-      await proxy.close();
+    resources.proxyReady = safeProxy(options.allowPrivate);
+    const proxy = await resources.proxyReady;
+    resources.proxy = proxy;
+    if (resources.closing) throw new Error("browser operation cancelled");
+    const claimed = claimProfile(options.profile, [
+      ...options.templatePreferences, ...transientPreferences,
+      ["network.proxy.type", 1], ["network.proxy.http", "127.0.0.1"],
+      ["network.proxy.http_port", proxy.port], ["network.proxy.ssl", "127.0.0.1"],
+      ["network.proxy.ssl_port", proxy.port], ["network.proxy.no_proxies_on", ""],
+      ["network.proxy.allow_hijacking_localhost", true],
+    ], true, options.ephemeral);
+    resources.claimed = claimed;
+    const port = choosePort();
+    const command = ["firefox", "--no-remote", "--profile", claimed.root,
+      "--remote-debugging-port", String(port)];
+    if (options.headless) command.push("--headless");
+    command.push("about:blank");
+    const processHandle = Bun.spawn(command, { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+    resources.processHandle = processHandle;
+    const deadline = Date.now() + 20_000;
+    let ready = false;
+    while (Date.now() < deadline) {
+      if (resources.closing) throw new Error("browser operation cancelled");
+      if (processHandle.exitCode !== null) break;
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/`, { signal: resources.abort.signal });
+        if (response.ok) { ready = true; break; }
+      } catch (error) { if (resources.closing) throw error; }
+      await sleep(150);
     }
-    throw error;
-  }
-  const deadline = Date.now() + 20_000;
-  let ready = false;
-  while (Date.now() < deadline) {
-    if (processHandle.exitCode !== null) break;
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/`);
-      if (response.ok) {
-        ready = true;
-        break;
-      }
-    } catch {}
-    await sleep(150);
-  }
-  if (!ready) {
-    await terminateBrowserProcess(processHandle);
-    releaseProfile(claimed);
-    await proxy.close();
-    throw new Error(
-      processHandle.exitCode !== null
-        ? "Firefox exited before its local control socket became ready"
-        : "Firefox control socket did not become ready within 20 seconds",
-    );
-  }
-  const bidi = new Bidi(`ws://127.0.0.1:${port}/session`);
-  let context: string;
-  try {
+    if (!ready) throw new Error(processHandle.exitCode !== null
+      ? "Firefox exited before its local control socket became ready"
+      : "Firefox control socket did not become ready within 20 seconds");
+    const bidi = new Bidi(`ws://127.0.0.1:${port}/session`);
+    resources.bidi = bidi;
     await bidi.open();
-    context = await bidi.context();
+    const context = await bidi.context();
     await bidi.command("script.addPreloadScript", {
-      functionDeclaration: ordinaryBrowserPreload,
-      contexts: [context],
+      functionDeclaration: ordinaryBrowserPreload, contexts: [context],
     });
+    return { bidi, context, processHandle, proxy, ...claimed, resources };
   } catch (error) {
-    bidi.close();
-    await terminateBrowserProcess(processHandle);
-    releaseProfile(claimed);
-    await proxy.close();
+    await closeBrowserResources(resources);
     throw error;
   }
-  return { bidi, context, processHandle, proxy, ...claimed };
 }
 
 async function stopBrowser(browser: Awaited<ReturnType<typeof startBrowser>>) {
-  browser.bidi.close();
-  await terminateBrowserProcess(browser.processHandle);
-  releaseProfile(browser);
-  await browser.proxy.close();
+  await closeBrowserResources(browser.resources);
+}
+
+let workerMode = false;
+let workerInput: string | undefined;
+let workerBrowser: { key: string; browser: Awaited<ReturnType<typeof startBrowser>> } | undefined;
+let workerIdleTimer: ReturnType<typeof setTimeout> | undefined;
+let workerBrowserClosing: Promise<void> | undefined;
+
+async function closeWorkerBrowser() {
+  clearTimeout(workerIdleTimer);
+  workerIdleTimer = undefined;
+  const lease = workerBrowser;
+  workerBrowser = undefined;
+  if (lease) {
+    const closing = stopBrowser(lease.browser);
+    workerBrowserClosing = closing;
+    try { await closing; } finally { if (workerBrowserClosing === closing) workerBrowserClosing = undefined; }
+  } else await workerBrowserClosing;
+}
+
+async function shutdownWorkerBrowsers() {
+  workerStopping = true;
+  const results = await Promise.allSettled([
+    closeWorkerBrowser(), ...[...activeBrowserResources].map(closeBrowserResources),
+  ]);
+  const failures = results.filter(result => result.status === "rejected");
+  if (failures.length) throw new AggregateError(failures.map(result => result.reason), "worker browser cleanup failed");
+}
+
+async function freshWorkerContext(browser: Awaited<ReturnType<typeof startBrowser>>) {
+  const previous = browser.context;
+  const created = await browser.bidi.command("browsingContext.create", { type: "tab" });
+  browser.context = String(created.context);
+  await browser.bidi.command("script.addPreloadScript", {
+    functionDeclaration: ordinaryBrowserPreload, contexts: [browser.context],
+  });
+  const tree = await browser.bidi.tree();
+  const obsolete = new Set<string>([previous, ...(tree.contexts || []).map((node: any) => String(node.context))]);
+  obsolete.delete(browser.context);
+  for (const context of obsolete) {
+    const events: string[] = [];
+    const ids: string[] = [];
+    for (const subscription of browser.bidi.subscriptions) {
+      if (!subscription.endsWith("\n" + context)) continue;
+      const id = browser.bidi.subscriptionIds?.get(subscription);
+      if (id) ids.push(id);
+      else events.push(subscription.slice(0, subscription.length - context.length - 1));
+      browser.bidi.subscriptionIds?.delete(subscription);
+      browser.bidi.subscriptions.delete(subscription);
+    }
+    if (ids.length) await browser.bidi.command("session.unsubscribe", { subscriptions: ids });
+    if (events.length) await browser.bidi.command("session.unsubscribe", { events, contexts: [context] });
+    await browser.bidi.command("browsingContext.close", { context });
+  }
+  browser.bidi.listeners.clear();
 }
 
 async function withBrowser<T>(
@@ -1466,11 +1568,31 @@ async function withBrowser<T>(
   operation: (browser: Awaited<ReturnType<typeof startBrowser>>) => Promise<T>,
   transientPreferences: FirefoxPreference[] = [],
 ) {
-  const browser = await startBrowser(options, transientPreferences);
+  if (!workerMode || options.ephemeral || transientPreferences.length) {
+    if (workerMode) await closeWorkerBrowser();
+    const browser = await startBrowser(options, transientPreferences);
+    try { return await operation(browser); }
+    finally { await stopBrowser(browser); }
+  }
+  clearTimeout(workerIdleTimer);
+  await workerBrowserClosing;
+  // Only process/profile-affecting options control the browser lease.
+  const key = JSON.stringify([options.profile, options.headless, options.allowPrivate, options.templatePreferences]);
+  if (workerBrowser && (workerBrowser.key !== key || workerBrowser.browser.processHandle.exitCode !== null)) {
+    await closeWorkerBrowser();
+  }
+  if (!workerBrowser) workerBrowser = { key, browser: await startBrowser(options) };
   try {
-    return await operation(browser);
+    await freshWorkerContext(workerBrowser.browser);
+    return await operation(workerBrowser.browser);
+  } catch (error) {
+    await closeWorkerBrowser();
+    throw error;
   } finally {
-    await stopBrowser(browser);
+    if (workerBrowser) {
+      workerIdleTimer = setTimeout(() => { void closeWorkerBrowser().catch(error => info(String(error))); }, 30_000);
+      workerIdleTimer.unref();
+    }
   }
 }
 
@@ -1827,7 +1949,7 @@ function zipEntryNames(bytes: Buffer) {
   return names;
 }
 
-function verifyDownload(bytes: Buffer, expectedType: string) {
+function verifyDownload(bytes: Buffer, expectedType: string, verifyContainer = true) {
   const simpleSignatures: Record<string, Array<number[] | Buffer>> = {
     pdf: [Buffer.from("%PDF-")],
     png: [[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
@@ -1849,7 +1971,7 @@ function verifyDownload(bytes: Buffer, expectedType: string) {
       false,
     );
   }
-  if (new Set(["docx", "xlsx", "pptx"]).has(expectedType)) {
+  if (verifyContainer && new Set(["docx", "xlsx", "pptx"]).has(expectedType)) {
     const entries = zipEntryNames(bytes);
     const requiredDirectory = { docx: "word/", xlsx: "xl/", pptx: "ppt/" }[
       expectedType
@@ -1866,6 +1988,49 @@ function verifyDownload(bytes: Buffer, expectedType: string) {
       );
     }
   }
+}
+
+function verifyDownloadFile(path: string, expectedType: string) {
+  const fd = openSync(path, "r");
+  const invalidContainer = () => new RetrievalFailure("validation", "office-container-mismatch", `download is not a valid ${expectedType} container`, false);
+  try {
+    const size = fstatSync(fd).size;
+    const readAt = (offset: number, length: number) => {
+      if (offset < 0 || length < 0 || offset + length > size) throw invalidContainer();
+      const bytes = Buffer.allocUnsafe(length);
+      let read = 0;
+      while (read < length) {
+        const count = readSync(fd, bytes, read, length - read, offset + read);
+        if (!count) throw invalidContainer();
+        read += count;
+      }
+      return bytes;
+    };
+    const office = new Set(["docx", "xlsx", "pptx"]).has(expectedType);
+    verifyDownload(readAt(0, Math.min(size, 8)), expectedType, false);
+    if (!office) return;
+    const tailStart = Math.max(0, size - 65_557);
+    const tail = readAt(tailStart, size - tailStart);
+    let end = -1;
+    for (let offset = tail.length - 22; offset >= 0; offset -= 1) {
+      if (tail.readUInt32LE(offset) === 0x06054b50) { end = offset; break; }
+    }
+    if (end < 0) throw invalidContainer();
+    const count = tail.readUInt16LE(end + 10);
+    let offset = tail.readUInt32LE(end + 16);
+    const directory = { docx: "word/", xlsx: "xl/", pptx: "ppt/" }[expectedType]!;
+    let contentTypes = false, hasDirectory = false;
+    for (let index = 0; index < count; index += 1) {
+      const header = readAt(offset, 46);
+      if (header.readUInt32LE(0) !== 0x02014b50) throw invalidContainer();
+      const nameLength = header.readUInt16LE(28);
+      const name = readAt(offset + 46, nameLength).toString("utf8");
+      if (name === "[Content_Types].xml") contentTypes = true;
+      if (name.startsWith(directory)) hasDirectory = true;
+      offset += 46 + nameLength + header.readUInt16LE(30) + header.readUInt16LE(32);
+    }
+    if (!contentTypes || !hasDirectory) throw invalidContainer();
+  } finally { closeSync(fd); }
 }
 
 async function waitForDownload(
@@ -1951,22 +2116,84 @@ function downloadPreferences(directory: string): FirefoxPreference[] {
   ];
 }
 
-const pageStabilityExpression = String.raw`(() => {
+const candidateSelectionHelper = String.raw`
+  const bestCandidate = (candidates, score, fallback) => {
+    let selected = candidates[0] || fallback
+    if (candidates.length < 2) return selected
+    let selectedScore = score(selected)
+    for (let index = 1; index < candidates.length; index += 1) {
+      const candidateScore = score(candidates[index])
+      if (candidateScore > selectedScore) {
+        selected = candidates[index]
+        selectedScore = candidateScore
+      }
+    }
+    return selected
+  }
+`;
+
+const domQueryHelpers = String.raw`
   const roots = [document]
-  let inspected = 0
-  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
-    for (const element of roots[index].querySelectorAll("*")) {
-      inspected += 1
-      if (element.shadowRoot) roots.push(element.shadowRoot)
-      if (inspected >= 50000 || roots.length >= 64) break scan
+  const elements = []
+  let domTruncated = false
+  let rankingTruncated = false
+  const rankCandidates = candidates => {
+    if (candidates.length > 128) { domTruncated = true; rankingTruncated = true }
+    return candidates.slice(0, 128)
+  }
+  const boundedDOM = typeof document.createTreeWalker === "function"
+  if (boundedDOM) {
+    scan: for (let index = 0; index < roots.length; index += 1) {
+      const walker = document.createTreeWalker(roots[index], 1)
+      let element
+      while (elements.length < 50000 && (element = walker.nextNode())) {
+        elements.push(element)
+        if (element.shadowRoot) {
+          if (roots.length >= 64) { domTruncated = true; continue }
+          roots.push(element.shadowRoot)
+        }
+      }
+      if (elements.length >= 50000) { domTruncated = true; break scan }
+    }
+  } else {
+    // Some DOM adapters expose selectors but no TreeWalker.
+    for (let index = 0, inspected = 0; index < roots.length && roots.length < 64; index += 1) {
+      for (const element of roots[index].querySelectorAll("*")) {
+        inspected += 1
+        if (element.shadowRoot) roots.push(element.shadowRoot)
+        if (inspected >= 50000 || roots.length >= 64) { domTruncated = true; break }
+      }
     }
   }
+  const queryAll = selector => boundedDOM ? elements.filter(element => element.matches(selector)) : roots.flatMap(root => [...root.querySelectorAll(selector)])
+  const descendantAggregates = new Map()
+  const descendantTotal = (element, selector, weight) => {
+    if (!boundedDOM) return [...element.querySelectorAll(selector)].reduce((total, node) => total + weight(node), 0)
+    let totals = descendantAggregates.get(selector)
+    if (!totals) {
+      totals = new Map()
+      for (let index = elements.length - 1; index >= 0; index -= 1) {
+        const node = elements[index]
+        const children = totals.get(node) || 0
+        if (!totals.has(node)) totals.set(node, 0)
+        const total = children + (node.matches(selector) ? weight(node) : 0)
+        if (node.parentElement) totals.set(node.parentElement, (totals.get(node.parentElement) || 0) + total)
+      }
+      descendantAggregates.set(selector, totals)
+    }
+    return totals.get(element) || 0
+  }
+`;
+
+const pageStabilityExpression = String.raw`(() => {
+  ${domQueryHelpers}
   let textLength = 0
   let links = 0
   for (const root of roots) {
     textLength += (root.textContent || "").length
-    links += root.querySelectorAll("a[href]").length
+    if (!boundedDOM) links += root.querySelectorAll("a[href]").length
   }
+  if (boundedDOM) links = queryAll("a[href]").length
   return JSON.stringify({
     readyState: document.readyState,
     url: location.href,
@@ -1975,6 +2202,7 @@ const pageStabilityExpression = String.raw`(() => {
     scrollHeight: document.documentElement?.scrollHeight || 0,
     links,
     shadowRoots: roots.length - 1,
+    dom_truncated: domTruncated,
   })
 })()`;
 
@@ -2035,16 +2263,7 @@ async function preparePage(
 }
 
 const pageAccessExpression = String.raw`(() => {
-  const roots = [document]
-  let inspected = 0
-  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
-    for (const element of roots[index].querySelectorAll("*")) {
-      inspected += 1
-      if (element.shadowRoot) roots.push(element.shadowRoot)
-      if (inspected >= 50000 || roots.length >= 64) break scan
-    }
-  }
-  const queryAll = selector => roots.flatMap(root => [...root.querySelectorAll(selector)])
+  ${domQueryHelpers}
   const visible = element => {
     const style = getComputedStyle(element)
     const bounds = element.getBoundingClientRect()
@@ -2052,14 +2271,14 @@ const pageAccessExpression = String.raw`(() => {
   }
   const title = document.title || ""
   const text = (document.body?.innerText || "").slice(0, 12000)
-  const contentRoots = queryAll('article, main, [role="main"], [role="article"], .article-body, .article-content, .post-content, .entry-content, #content').filter(visible)
+  const contentRoots = rankCandidates(queryAll('article, main, [role="main"], [role="article"], .article-body, .article-content, .post-content, .entry-content, #content').filter(visible))
   const mainTextLength = contentRoots.reduce((largest, element) => Math.max(largest, (element.innerText || "").length), 0)
   const articleCount = queryAll('article, [role="article"]').filter(visible).length
-  const contentLinks = contentRoots.reduce((total, element) => total + [...element.querySelectorAll('a[href]')].filter(visible).length, 0)
-  const structuredDataChars = [...document.querySelectorAll('meta[name="description"], meta[property^="og:"], script[type="application/ld+json"]')].reduce((total, element) => Math.min(20000, total + (element.getAttribute('content') || element.textContent || '').length), 0)
+  const contentLinks = contentRoots.reduce((total, element) => total + descendantTotal(element, 'a[href]', node => visible(node) ? 1 : 0), 0)
+  const structuredDataChars = queryAll('meta[name="description"], meta[property^="og:"], script[type="application/ld+json"]').filter(node => !boundedDOM || node.getRootNode() === document).reduce((total, element) => Math.min(20000, total + (element.getAttribute('content') || element.textContent || '').length), 0)
   const challengeControl = queryAll('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-sitekey], input[name*="captcha" i], #cf-challenge-running, .cf-challenge-running, [id*="turnstile" i], [class*="turnstile" i]').some(visible)
   const loginControl = queryAll('input[type="password"], form[action*="/login" i], form[action*="/signin" i], form[action*="/auth" i], [role="dialog"] a[href*="/login" i], [role="dialog"] a[href*="/signin" i], [role="dialog"] a[href*="/auth" i]').some(visible)
-  return JSON.stringify({ title, url: location.href, text, challengeControl, loginControl, mainTextLength, articleCount, contentLinks, structuredDataChars })
+  return JSON.stringify({ title, url: location.href, text, challengeControl, loginControl, mainTextLength, articleCount, contentLinks, structuredDataChars, dom_truncated: domTruncated })
 })()`;
 
 type PageAccessSignals = {
@@ -2220,20 +2439,43 @@ async function waitForPageAccess(
   );
 }
 
+const boundedTextCleanHelper = String.raw`
+  const cleanPrefix = (value, maximum) => {
+    const limit = maximum + 1
+    let output = "", pending = "", last = "", newlines = 0
+    let started = false
+    for (let index = 0; index < value.length; index += 1) {
+      let character = value[index]
+      const code = value.charCodeAt(index)
+      if (code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127) continue
+      if (character === "\t") character = " "
+      if (character === " " && (last === " " || last === "\n")) continue
+      if (character === "\n") {
+        if (last === " ") pending = pending.slice(0, -1)
+        if (newlines >= 2) continue
+        newlines += 1
+      } else newlines = 0
+      last = character
+      if (!character.trim()) {
+        if (started && pending.length < limit) pending += character
+        continue
+      }
+      started = true
+      output += (pending + character).slice(0, limit - output.length)
+      pending = ""
+      if (output.length >= limit) return output
+    }
+    return output
+  }
+`;
+
 function extractionExpression(options: BrowserOptions) {
   return String.raw`(() => {
   const maxContentChars = ${options.maxContentChars}
   const maxLinks = ${options.maxLinks}
-  const roots = [document]
-  let inspected = 0
-  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
-    for (const element of roots[index].querySelectorAll("*")) {
-      inspected += 1
-      if (element.shadowRoot) roots.push(element.shadowRoot)
-      if (inspected >= 50000 || roots.length >= 64) break scan
-    }
-  }
-  const queryAll = selector => roots.flatMap(root => [...root.querySelectorAll(selector)])
+  ${boundedTextCleanHelper}
+  ${domQueryHelpers}
+  const discoveryTruncated = domTruncated
   const first = selector => queryAll(selector)[0] || null
   const sensitive = name => /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(name) || /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|solution)(?:$|[_-])/.test(name) || /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(name)
   const absolute = value => {
@@ -2247,22 +2489,56 @@ function extractionExpression(options: BrowserOptions) {
       return url.href
     } catch { return "" }
   }
-  const candidates = queryAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content')
-  const score = element => (element.innerText || "").length - [...element.querySelectorAll("a")].reduce((total, link) => total + (link.innerText || "").length, 0) * 0.35
-  let source = candidates[0] || document.body || document.documentElement
-  if (candidates.length > 1) {
-    let bestScore = score(source)
-    for (let index = 1; index < candidates.length; index += 1) {
-      const candidate = candidates[index]
-      const candidateScore = score(candidate)
-      if (candidateScore > bestScore) {
-        source = candidate
-        bestScore = candidateScore
-      }
-    }
-  }
+  const candidates = rankCandidates(queryAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content'))
+  const score = element => (element.innerText || "").length - descendantTotal(element, "a", link => (link.innerText || "").length) * 0.35
+  ${candidateSelectionHelper}
+  const source = bestCandidate(candidates, score, document.body || document.documentElement)
   if (!source) return JSON.stringify({ title: document.title || "", url: absolute(location.href), canonicalUrl: absolute(location.href), published: "", byline: "", text: "", markdown: "", html: "", links: [] })
-  const root = source.cloneNode(true)
+  const boundedClone = source => {
+    const characterLimit = Math.max(1, maxContentChars * 2)
+    const nodeLimit = Math.min(50000, Math.max(1, maxContentChars + 1))
+    let characters = 0, nodes = 0
+    const shallow = node => {
+      nodes += 1
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        const raw = node.textContent || ""
+        const value = raw.slice(0, Math.max(0, characterLimit - characters))
+        characters += value.length
+        if (value.length < raw.length) domTruncated = true
+        if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(value)
+        const copy = node.cloneNode(false)
+        copy.textContent = value
+        return copy
+      }
+      const copy = document.createElementNS ? document.createElementNS(node.namespaceURI, node.prefix ? node.prefix + ":" + node.localName : node.localName) : node.cloneNode(false)
+      const attributes = node.attributes || []
+      if (attributes.length > 128) domTruncated = true
+      for (let index = 0; index < Math.min(attributes.length, 128); index += 1) {
+        const attribute = attributes[index]
+        const value = attribute.value.slice(0, Math.max(0, characterLimit - characters))
+        characters += value.length
+        if (value.length < attribute.value.length) domTruncated = true
+        if (attribute.namespaceURI) copy.setAttributeNS(attribute.namespaceURI, attribute.name, value)
+        else copy.setAttribute(attribute.name, value)
+      }
+      return copy
+    }
+    const root = shallow(source)
+    const stack = [{ original: source, copy: root, next: source.firstChild }]
+    while (stack.length) {
+      const current = stack[stack.length - 1]
+      const node = current.next
+      if (!node) { stack.pop(); continue }
+      current.next = node.nextSibling
+      if (node.nodeType === Node.ELEMENT_NODE && node.matches('script, style, nav, footer, header, aside, form, noscript, svg, canvas, iframe, button, [aria-hidden="true"]')) continue
+      if (nodes >= nodeLimit || characters >= characterLimit || stack.length >= 256) { domTruncated = true; break }
+      const copy = shallow(node)
+      current.copy.appendChild(copy)
+      if (node.firstChild) stack.push({ original: node, copy, next: node.firstChild })
+    }
+    return root
+  }
+  const root = boundedDOM ? boundedClone(source) : source.cloneNode(true)
   root.querySelectorAll('script, style, nav, footer, header, aside, form, noscript, svg, canvas, iframe, button, [aria-hidden="true"]').forEach(node => node.remove())
   const clean = value => value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/[ \t\f\v]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim()
   const metadata = {}
@@ -2302,7 +2578,7 @@ function extractionExpression(options: BrowserOptions) {
   }
   const jsonLd = []
   let jsonLdChars = 0
-  for (const script of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0, 32)) {
+  for (const script of queryAll('script[type="application/ld+json"]').filter(node => !boundedDOM || node.getRootNode() === document).slice(0, 32)) {
     const raw = script.textContent || ''
     if (!raw.trim() || raw.length > 524288 - jsonLdChars) continue
     jsonLdChars += raw.length
@@ -2353,7 +2629,12 @@ function extractionExpression(options: BrowserOptions) {
     if (tag === "table") return "\n\n" + table(node)
     return [...node.childNodes].map(walk).join("")
   }
-  const links = queryAll("a[href]").map(link => absolute(link.getAttribute("href"))).filter(value => value.startsWith("http://") || value.startsWith("https://"))
+  const linkSet = new Set()
+  for (const link of queryAll("a[href]")) {
+    const url = absolute(link.getAttribute("href"))
+    if (url.startsWith("http://") || url.startsWith("https://")) linkSet.add(url)
+    if (linkSet.size > maxLinks) break
+  }
   const canonical = absolute(document.querySelector('link[rel="canonical"]')?.getAttribute("href") || location.href)
   const published = first('meta[property="article:published_time"], meta[name="date"], time[datetime]')?.getAttribute("content") || first("time[datetime]")?.getAttribute("datetime") || ""
   const byline = first('meta[name="author"]')?.getAttribute("content") || first('[rel="author"], .byline, [class*="author"]')?.textContent || ""
@@ -2365,10 +2646,10 @@ function extractionExpression(options: BrowserOptions) {
       else element.removeAttribute(attribute)
     }
   }
-  const text = clean(source.innerText || root.textContent || "")
+  const text = cleanPrefix(source.innerText || root.textContent || "", maxContentChars)
   const markdown = clean(walk(root))
   const html = root.innerHTML
-  const uniqueLinks = [...new Set(links)]
+  const uniqueLinks = [...linkSet]
   const jobCards = []
   const seenJobs = new Set()
   const jobContainers = queryAll([
@@ -2428,28 +2709,22 @@ function extractionExpression(options: BrowserOptions) {
       text: text.length > maxContentChars,
       markdown: markdown.length > maxContentChars,
       html: html.length > maxContentChars,
-      links: uniqueLinks.length > maxLinks,
+      links: discoveryTruncated || uniqueLinks.length > maxLinks,
+      dom: domTruncated,
+      ranking: rankingTruncated,
     },
   })
 })()`;
 }
 
 const interactionExpression = String.raw`(() => {
-  const roots = [document]
-  let inspected = 0
-  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
-    for (const element of roots[index].querySelectorAll('*')) {
-      inspected += 1
-      if (element.shadowRoot) roots.push(element.shadowRoot)
-      if (inspected >= 50000 || roots.length >= 64) break scan
-    }
-  }
+  ${domQueryHelpers}
   const visible = element => {
     const style = getComputedStyle(element)
     const bounds = element.getBoundingClientRect()
     return style.display !== 'none' && style.visibility !== 'hidden' && bounds.width > 0 && bounds.height > 0
   }
-  const candidates = roots.flatMap(root => [...root.querySelectorAll('button, [role="button"], summary')])
+  const candidates = queryAll('button, [role="button"], summary')
   const choices = []
   for (const element of candidates) {
     if (!visible(element) || element.disabled || element.dataset.agencyInteractionCandidate || element.closest('form, [contenteditable="true"]')) continue
@@ -2482,41 +2757,23 @@ const interactionExpression = String.raw`(() => {
 
 const scrollExpression = String.raw`(() => {
   const agencyScrollTarget = true
-  const roots = [document]
-  let inspected = 0
-  scan: for (let index = 0; index < roots.length && roots.length < 64; index += 1) {
-    for (const element of roots[index].querySelectorAll('*')) {
-      inspected += 1
-      if (element.shadowRoot) roots.push(element.shadowRoot)
-      if (inspected >= 50000 || roots.length >= 64) break scan
-    }
-  }
-  const candidates = roots.flatMap(root => [...root.querySelectorAll('main, [role="main"], [role="feed"], [role="list"], section, div')]).filter(element => {
+  ${domQueryHelpers}
+  const candidates = rankCandidates(queryAll('main, [role="main"], [role="feed"], [role="list"], section, div').filter(element => {
     const style = getComputedStyle(element)
     const bounds = element.getBoundingClientRect()
     return bounds.width > 0 && bounds.height >= 150 && ['auto', 'scroll'].includes(style.overflowY) && element.scrollHeight - element.clientHeight > 100
-  })
-  let target = candidates[0]
-  if (candidates.length > 1) {
-    const score = element => (element.innerText || '').length + element.querySelectorAll('article, [role="article"]').length * 500
-    let bestScore = score(target)
-    for (let index = 1; index < candidates.length; index += 1) {
-      const candidate = candidates[index]
-      const candidateScore = score(candidate)
-      if (candidateScore > bestScore) {
-        target = candidate
-        bestScore = candidateScore
-      }
-    }
-  }
+  }))
+  ${candidateSelectionHelper}
+  const score = element => (element.innerText || '').length + descendantTotal(element, 'article, [role="article"]', () => 1) * 500
+  const target = bestCandidate(candidates, score)
   if (target) {
     const before = target.scrollTop
     target.scrollTop = target.scrollHeight
-    return JSON.stringify({ target: 'container', moved: target.scrollTop !== before })
+    return JSON.stringify({ target: 'container', moved: target.scrollTop !== before, dom_truncated: domTruncated, ranking_truncated: rankingTruncated })
   }
   const before = window.scrollY
   window.scrollTo(0, document.documentElement?.scrollHeight || document.body?.scrollHeight || 0)
-  return JSON.stringify({ target: 'document', moved: window.scrollY !== before })
+  return JSON.stringify({ target: 'document', moved: window.scrollY !== before, dom_truncated: domTruncated, ranking_truncated: rankingTruncated })
 })()`;
 
 type PageCaptureInput = {
@@ -2747,6 +3004,8 @@ function fusePageCapture(input: PageCaptureInput, identity = "live") {
         ? "public-content"
         : "structured-only";
   const truncated = {
+    ...(input.captures.some(capture => capture.truncated?.dom) ? { dom: true } : {}),
+    ...(input.captures.some(capture => capture.truncated?.ranking) ? { ranking: true } : {}),
     text:
       textWasTruncated ||
       input.captures.some((capture) => capture.truncated?.text),
@@ -2883,6 +3142,11 @@ function fusePageCapture(input: PageCaptureInput, identity = "live") {
       observation: `${links.length} links were retained with ${text.length} text characters`,
     });
   }
+  if (truncated.ranking) page.quality!.push({
+    code: "ranking-truncated", fields: ["text", "markdown", "html"],
+    observation: "Main-content ranking considered the first 128 matching containers in DOM order",
+    recommendation: "Inspect the page or narrower linked content when the relevant container may follow the ranking budget",
+  });
   const truncatedFields = Object.entries(truncated)
     .filter(([, value]) => value)
     .map(([field]) => field);
@@ -3168,22 +3432,15 @@ async function navigateAndExtract(
 }
 
 const frameExtractExpression = String.raw`(() => {
-  const candidates = [...document.querySelectorAll('article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content')]
-  const score = element => (element.innerText || "").length - [...element.querySelectorAll("a")].reduce((total, link) => total + (link.innerText || "").length, 0) * 0.35
-  let source = candidates[0] || document.body
-  if (candidates.length > 1) {
-    let bestScore = score(source)
-    for (let index = 1; index < candidates.length; index += 1) {
-      const candidate = candidates[index]
-      const candidateScore = score(candidate)
-      if (candidateScore > bestScore) {
-        source = candidate
-        bestScore = candidateScore
-      }
-    }
-  }
-  const clean = value => value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/[ \t\f\v]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim()
-  return JSON.stringify({ title: document.title || "", text: clean(source?.innerText || "") })
+  ${domQueryHelpers}
+  ${boundedTextCleanHelper}
+  const selector = 'article, main, [role="main"], .article-body, .article-content, .post-content, .entry-content, #content'
+  const candidates = rankCandidates(boundedDOM ? elements.filter(element => element.getRootNode() === document && element.matches(selector)) : [...document.querySelectorAll(selector)])
+  const score = element => (element.innerText || "").length - descendantTotal(element, "a", link => (link.innerText || "").length) * 0.35
+  ${candidateSelectionHelper}
+  const source = bestCandidate(candidates, score, document.body)
+  const text = cleanPrefix(source?.innerText || "", 500000)
+  return JSON.stringify({ title: document.title || "", text: text.slice(0, 500000), text_truncated: text.length > 500000, dom_truncated: domTruncated, ranking_truncated: rankingTruncated })
 })()`;
 
 type BrowsingContextNode = {
@@ -3253,6 +3510,9 @@ async function extractFrames(
         ...identity,
         title: String(extracted.title || ""),
         text: String(extracted.text || ""),
+        ...(extracted.dom_truncated ? { dom_truncated: true } : {}),
+        ...(extracted.ranking_truncated ? { ranking_truncated: true } : {}),
+        ...(extracted.text_truncated ? { text_truncated: true } : {}),
       });
     } catch {
       frames.push({
@@ -4549,7 +4809,7 @@ async function commandSearchMany(args: string[]) {
   }
   let payload: any;
   try {
-    payload = JSON.parse(await Bun.stdin.text());
+    payload = JSON.parse(workerInput ?? await Bun.stdin.text());
   } catch {
     fail("search-many requires a JSON request on stdin");
   }
@@ -4729,9 +4989,6 @@ function healthCheckpoint(
   appendInput = false,
 ) {
   const path = `${output}.health.ndjson`;
-  const currentInput = readFileSync(input);
-  const inputSha256 = createHash("sha256").update(currentInput).digest("hex");
-  const inputBytes = currentInput.byteLength;
   const checkpoint = new HealthCheckpoint(path);
   if (!existsSync(path)) {
     if (appendInput && statSync(output).size > 0) {
@@ -4739,6 +4996,7 @@ function healthCheckpoint(
         `${command} cannot verify --append-input without its existing health checkpoint; restore the original input or create a new output`,
       );
     }
+    const { sha256: inputSha256, bytes: inputBytes } = fileDigest(input);
     const run = {
       schema: "agency/web-health-run/1",
       command,
@@ -4755,7 +5013,7 @@ function healthCheckpoint(
     return checkpoint;
   }
   if (!resume) fail(`${command} health checkpoint exists; use --resume`);
-  const lines = readFileSync(path, "utf8").split(/\r?\n/).filter(Boolean);
+
   let acceptedInputSha256 = "";
   let acceptedInputBytes: number | null = null;
   const outcomes = new Set<HealthOutcome>([
@@ -4767,7 +5025,10 @@ function healthCheckpoint(
     "login-required",
     "rate-limited",
   ]);
-  for (const [index, line] of lines.entries()) {
+  let index = -1;
+  for (const line of utf8FileLines(path)) {
+    if (!line) continue;
+    index += 1;
     let record: any;
     try {
       record = JSON.parse(line);
@@ -4855,6 +5116,7 @@ function healthCheckpoint(
     const event = record as HealthEvent;
     checkpoint.events.set(checkpoint.eventKey(event.scope, event.key), event);
   }
+  const { sha256: inputSha256, bytes: inputBytes, prefixSha256 } = fileDigest(input, Infinity, acceptedInputBytes ?? undefined);
   if (
     acceptedInputSha256 === inputSha256 &&
     (acceptedInputBytes === null || acceptedInputBytes === inputBytes)
@@ -4871,9 +5133,6 @@ function healthCheckpoint(
       `${command} cannot verify an append against this older checkpoint; restore the original input or create a new output`,
     );
   }
-  const prefixSha256 = createHash("sha256")
-    .update(currentInput.subarray(0, acceptedInputBytes))
-    .digest("hex");
   if (
     inputBytes <= acceptedInputBytes ||
     prefixSha256 !== acceptedInputSha256
@@ -4906,7 +5165,7 @@ function batchQueries(value: string) {
   }
   const queries: string[] = [];
   const seen = new Set<string>();
-  for (const raw of readFileSync(input, "utf8").split(/\r?\n/)) {
+  for (const raw of utf8FileLines(input)) {
     const query = raw.trim();
     if (!query || seen.has(query)) continue;
     if (query.length > 1000) fail("search-batch queries must be at most 1000 characters");
@@ -4918,8 +5177,9 @@ function batchQueries(value: string) {
 
 function completedBatchQueries(output: string, retryFailures: boolean) {
   const completed = new Set<string>();
-  const text = readFileSync(output, "utf8");
-  for (const [index, line] of text.split(/\r?\n/).entries()) {
+  let index = -1;
+  for (const line of utf8FileLines(output)) {
+    index += 1;
     if (!line.trim()) continue;
     let record: any;
     try {
@@ -5108,16 +5368,43 @@ function batchUrls(value: string) {
   if (status.size > 256 * 1024 * 1024) {
     fail("scrape-batch input must be at most 256 MiB");
   }
-  const lines = readFileSync(input, "utf8")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const candidates: Array<{
-    url: string;
-    evidence?: Omit<DiscoveryEvidence, "url">;
-  }> = [];
-  if (lines[0]?.startsWith("{")) {
-    for (const [index, line] of lines.entries()) {
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const discoveryEvidence = new Map<string, DiscoveryEvidence[]>();
+  const addCandidate = (candidate: { url: string; evidence?: Omit<DiscoveryEvidence, "url"> }) => {
+    const url = checkedUrl(candidate.url);
+    if (url.username || url.password) {
+      fail("scrape-batch URLs must not contain embedded credentials");
+    }
+    const normalized = redactedOutputUrl(url.href);
+    if (!normalized) return;
+    if (candidate.evidence) {
+      const evidence = {
+        ...candidate.evidence,
+        url: normalized,
+      } satisfies DiscoveryEvidence;
+      const existing = discoveryEvidence.get(normalized) || [];
+      const key = JSON.stringify(evidence);
+      if (
+        existing.length < 8 &&
+        !existing.some((item) => JSON.stringify(item) === key)
+      ) {
+        existing.push(evidence);
+        discoveryEvidence.set(normalized, existing);
+      }
+    }
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    urls.push(normalized);
+  };
+  let jsonInput: boolean | undefined;
+  let index = -1;
+  for (const raw of utf8FileLines(input)) {
+    const line = raw.trim();
+    if (!line) continue;
+    index += 1;
+    jsonInput ??= line.startsWith("{");
+    if (jsonInput) {
       let record: any;
       try {
         record = JSON.parse(line);
@@ -5133,7 +5420,7 @@ function batchUrls(value: string) {
       }
       for (const result of record.results) {
         if (typeof result?.url !== "string") continue;
-        candidates.push({
+        addCandidate({
           url: result.url,
           evidence: {
             source: "search-result",
@@ -5150,40 +5437,35 @@ function batchUrls(value: string) {
           },
         });
       }
-    }
-  } else {
-    candidates.push(...lines.map((url) => ({ url })));
-  }
-  const urls: string[] = [];
-  const seen = new Set<string>();
-  const discoveryEvidence = new Map<string, DiscoveryEvidence[]>();
-  for (const candidate of candidates) {
-    const url = checkedUrl(candidate.url);
-    if (url.username || url.password) {
-      fail("scrape-batch URLs must not contain embedded credentials");
-    }
-    const normalized = redactedOutputUrl(url.href);
-    if (!normalized) continue;
-    if (candidate.evidence) {
-      const evidence = {
-        ...candidate.evidence,
-        url: normalized,
-      } satisfies DiscoveryEvidence;
-      const existing = discoveryEvidence.get(normalized) || [];
-      const key = JSON.stringify(evidence);
-      if (
-        existing.length < 8 &&
-        !existing.some((item) => JSON.stringify(item) === key)
-      ) {
-        existing.push(evidence);
-        discoveryEvidence.set(normalized, existing);
-      }
-    }
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    urls.push(normalized);
+    } else addCandidate({url: line});
   }
   return { input, urls, discoveryEvidence };
+}
+
+function fileDigest(path: string, maximum = Infinity, prefixBytes?: number) {
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const before = fstatSync(fd, { bigint: true });
+    const hash = createHash("sha256");
+    const prefix = createHash("sha256");
+    let bytes = 0;
+    while (bytes < maximum) {
+      const length = readSync(fd, buffer, 0, Math.min(buffer.length, maximum - bytes), null);
+      if (!length) break;
+      hash.update(buffer.subarray(0, length));
+      if (prefixBytes !== undefined && bytes < prefixBytes) prefix.update(buffer.subarray(0, Math.min(length, prefixBytes - bytes)));
+      bytes += length;
+    }
+    const after = fstatSync(fd, { bigint: true });
+    const current = statSync(path, { bigint: true });
+    if ([after, current].some(status => status.dev !== before.dev || status.ino !== before.ino || status.size !== before.size || status.mtimeNs !== before.mtimeNs || status.ctimeNs !== before.ctimeNs)) {
+      fail("input changed while hashing; retry with an unchanged input");
+    }
+    return { bytes, sha256: hash.digest("hex"), prefixSha256: prefix.digest("hex") };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function* utf8FileLines(path: string) {
@@ -5677,8 +5959,8 @@ async function commandDownload(args: string[]) {
       },
       downloadPreferences(temporaryDirectory),
     );
-    const bytes = readFileSync(downloadedPath);
-    if (bytes.length > maxBytes) {
+    const downloadedBytes = statSync(downloadedPath).size;
+    if (downloadedBytes > maxBytes) {
       throw new RetrievalFailure(
         "limit",
         "download-too-large",
@@ -5686,7 +5968,8 @@ async function commandDownload(args: string[]) {
         false,
       );
     }
-    verifyDownload(bytes, expectedType);
+    verifyDownloadFile(downloadedPath, expectedType);
+    const downloadDigest = fileDigest(downloadedPath);
     if (existsSync(destination.output) && !replace) {
       throw new RetrievalFailure(
         "policy",
@@ -5722,8 +6005,8 @@ async function commandDownload(args: string[]) {
       },
       output: {
         path: destination.output,
-        bytes: bytes.length,
-        sha256: createHash("sha256").update(bytes).digest("hex"),
+        bytes: downloadDigest.bytes,
+        sha256: downloadDigest.sha256,
         expected_type: expectedType,
         signature: "valid",
       },
@@ -5885,7 +6168,7 @@ async function commandScrapeMany(args: string[]) {
   if (args.length) fail("scrape-many accepts its request on stdin");
   let payload: unknown;
   try {
-    payload = JSON.parse(await Bun.stdin.text());
+    payload = JSON.parse(workerInput ?? await Bun.stdin.text());
   } catch {
     fail("scrape-many requires a JSON request on stdin");
   }
@@ -6389,6 +6672,33 @@ async function commandBrowser(args: string[]) {
   }
 }
 
+function commandProfileState(args: string[]) {
+  const profile = checkedProfile(takeOption(args, "--profile", "default"));
+  const purpose = takeOption(args, "--purpose", "");
+  const pinned = takeFlag(args, "--pinned");
+  const unpinned = takeFlag(args, "--unpinned");
+  const completed = takeFlag(args, "--completed");
+  const active = takeFlag(args, "--active");
+  if (args.length || (pinned && unpinned) || (completed && active)) {
+    throw new Error("profile-state accepts --purpose, --pinned or --unpinned, and --completed or --active");
+  }
+  const root = profileRoot(profile, false);
+  if (purpose || pinned || unpinned || completed || active) {
+    if (purpose && (!purpose.trim() || purpose.length > 256)) throw new Error("profile purpose must be 1–256 characters");
+    const locked = lockProfile(profile);
+    try {
+      const updates: JsonObject = {};
+      if (purpose) updates.purpose = purpose;
+      if (pinned || unpinned) updates.pinned = pinned;
+      if (completed || active) updates.completed_at = completed ? Date.now() / 1000 : null;
+      writeProfileLifecycle(root, updates);
+    } finally {
+      unlinkSync(locked.lock);
+    }
+  }
+  console.log(JSON.stringify(readProfileLifecycle(root), null, 2));
+}
+
 function help() {
   console.log(`web-research — bounded HTTP retrieval and local Firefox research
 
@@ -6407,6 +6717,7 @@ Usage:
   web-research local QUERY [--limit N] [--json]
   web-research stats
   web-research browser [URL] [--profile NAME] [--detach]
+  web-research profile-state --profile NAME [--purpose TEXT] [--pinned|--unpinned] [--completed|--active]
 
 Browser options:
   --profile NAME          Persistent profile (default: automatic ephemeral for search)
@@ -6474,10 +6785,7 @@ Crawl obeys robots.txt, stays on the starting origin, visits one page at a time,
 and skips common state-changing links. --ignore-robots requires explicit authority.`);
 }
 
-const args = Bun.argv.slice(2);
-const command = args.shift();
-
-try {
+async function dispatchWebCommand(command: string | undefined, args: string[]) {
   if (
     !command ||
     command === "help" ||
@@ -6497,6 +6805,7 @@ try {
   else if (command === "scrape-many") await commandScrapeMany(args);
   else if (command === "replay") commandReplay(args);
   else if (command === "capture-gc") commandCaptureGc(args);
+  else if (command === "profile-state") commandProfileState(args);
   else if (command === "map") await commandMap(args);
   else if (command === "snapshot") await commandSnapshot(args);
   else if (command === "crawl") await commandCrawl(args);
@@ -6504,6 +6813,73 @@ try {
   else if (command === "stats") commandStats(args);
   else if (command === "browser") await commandBrowser(args);
   else fail(`unknown command: ${command}`);
+}
+
+async function commandWorker() {
+  workerMode = true;
+  const output = console.log;
+  let parts: string[] = [];
+  let bytes = 0;
+  let closing = false;
+  const close = async () => {
+    if (closing) return;
+    closing = true;
+    await shutdownWorkerBrowsers();
+  };
+  const terminate = () => { void close().then(() => process.exit(0), error => {
+    info(String(error)); process.exit(1);
+  }); };
+  process.once("SIGTERM", terminate);
+  process.once("SIGINT", terminate);
+  process.stdin.setEncoding("utf8");
+  try {
+    for await (const chunk of process.stdin as AsyncIterable<string>) {
+      let start = 0;
+      while (start < chunk.length) {
+        const separator = chunk.indexOf("\n", start);
+        const end = separator < 0 ? chunk.length : separator;
+        const part = chunk.slice(start, end);
+        bytes += Buffer.byteLength(part);
+        if (bytes > 64 * 1024) throw new Error("worker request exceeds 64 KiB");
+        parts.push(part);
+        if (separator < 0) break;
+        const line = parts.join("");
+        parts = []; bytes = 0; start = separator + 1;
+        if (!line.trim()) continue;
+        let result: unknown;
+        try {
+          const request = JSON.parse(line);
+          if (!Array.isArray(request.args) || !request.args.every((arg: unknown) => typeof arg === "string") ||
+              typeof request.input !== "string" || !new Set(["search-many", "scrape", "scrape-many", "local", "replay"]).has(request.args[0])) {
+            throw new Error("invalid worker request");
+          }
+          workerInput = request.input;
+          let serialized = "";
+          console.log = (...values: unknown[]) => {
+            const value = values.map(String).join(" ");
+            if (Buffer.byteLength(serialized) + Buffer.byteLength(value) > 16 * 1024 * 1024) throw new Error("worker output exceeds 16 MiB");
+            serialized += value;
+          };
+          const args = [...request.args];
+          await dispatchWebCommand(args.shift(), args);
+          result = { result: JSON.parse(serialized) };
+        } catch (error) {
+          await closeWorkerBrowser();
+          result = { error: error instanceof Error ? error.message : String(error) };
+        } finally { console.log = output; workerInput = undefined; }
+        await new Promise<void>((resolve, reject) => {
+          process.stdout.write(JSON.stringify(result) + "\n", error => error ? reject(error) : resolve());
+        });
+      }
+    }
+  } finally { console.log = output; await close(); }
+}
+
+const args = Bun.argv.slice(2);
+const command = args.shift();
+try {
+  if (command === "worker") await commandWorker();
+  else await dispatchWebCommand(command, args);
 } catch (error) {
   fail(error instanceof Error ? error.message : String(error));
 }

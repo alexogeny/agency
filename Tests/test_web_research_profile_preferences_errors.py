@@ -23,6 +23,7 @@ let actualReadFailure: unknown;
 let reads = 0, closes = 0;
 const descriptors = new Set<number>();
 function profileRoot() { return root; }
+function writeProfileLifecycle() {}
 const mkdirSync = fs.mkdirSync, existsSync = fs.existsSync, rmSync = fs.rmSync, unlinkSync = fs.unlinkSync;
 function openSync(...args) { const descriptor = fs.openSync(...args); descriptors.add(descriptor); return descriptor; }
 function closeSync(descriptor) { closes++; fs.closeSync(descriptor); descriptors.delete(descriptor); }
@@ -86,7 +87,7 @@ try {
 class WebResearchProfilePreferencesErrorsTests(unittest.TestCase):
     def run_phase(self, phase):
         source = TOOL.read_text()
-        source = source[source.index("function claimProfile("):source.index("\nclass Bidi {")]
+        source = source[source.index("function lockProfile("):source.index("\nclass Bidi {")]
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             script = workspace / "preferences.ts"

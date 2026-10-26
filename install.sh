@@ -105,62 +105,26 @@ if [[ $platform == linux ]] && (( EUID != 0 )); then
   sudo_keepalive_pid=$!
 fi
 
+if [[ $platform == linux ]]; then
+  source "$AGENCY_DIR/scripts/configure-storage.sh"
+  agency_configure_storage
+fi
+
 agency_prepare_scratch
 mkdir -p \
   "$HOME/.codex/agents" \
   "$HOME/.claude/agents" \
   "$HOME/.pi/agent/extensions"
 mkdir -p "$HOME/.local/bin"
-agency_link "$AGENCY_DIR/Tools/agency-ui" "$HOME/.local/bin/agency-ui"
-agency_link "$AGENCY_DIR/Tools/agency-decide" "$HOME/.local/bin/agency-decide"
-agency_link "$AGENCY_DIR/Tools/agency-decide-mcp" "$HOME/.local/bin/agency-decide-mcp"
-agency_link "$AGENCY_DIR/Tools/agency-decision-usage" "$HOME/.local/bin/agency-decision-usage"
-agency_link "$AGENCY_DIR/Tools/git-get" "$HOME/.local/bin/git-get"
-agency_link "$AGENCY_DIR/Tools/agent-work" "$HOME/.local/bin/agent-work"
-agency_link "$AGENCY_DIR/Tools/agent-context" "$HOME/.local/bin/agent-context"
-agency_link "$AGENCY_DIR/Tools/comment-audit" "$HOME/.local/bin/comment-audit"
-agency_link "$AGENCY_DIR/Tools/docs-exec" "$HOME/.local/bin/docs-exec"
-agency_link "$AGENCY_DIR/Tools/document-inspect" "$HOME/.local/bin/document-inspect"
-agency_link "$AGENCY_DIR/Tools/evidence-review" "$HOME/.local/bin/evidence-review"
-agency_link "$AGENCY_DIR/Tools/repo-map" "$HOME/.local/bin/repo-map"
-agency_link "$AGENCY_DIR/Tools/repository-setup" "$HOME/.local/bin/repository-setup"
-agency_link "$AGENCY_DIR/Tools/report-build" "$HOME/.local/bin/report-build"
-agency_link "$AGENCY_DIR/Tools/system-context" "$HOME/.local/bin/system-context"
-agency_link "$AGENCY_DIR/Tools/web-research" "$HOME/.local/bin/web-research"
-agency_link "$AGENCY_DIR/Tools/web-research-mcp" "$HOME/.local/bin/web-research-mcp"
-agency_link "$AGENCY_DIR/Tools/sandbox" "$HOME/.local/bin/sandbox"
-agency_link "$AGENCY_DIR/Tools/sudo-gui" "$HOME/.local/bin/sudo-gui"
-if [[ $platform == linux ]]; then
-  agency_link "$AGENCY_DIR/Tools/long-processes" "$HOME/.local/bin/long-processes"
-  agency_link "$AGENCY_DIR/Tools/instruction-bench" "$HOME/.local/bin/instruction-bench"
-  agency_link "$AGENCY_DIR/Tools/resource-bench" "$HOME/.local/bin/resource-bench"
-  agency_link "$AGENCY_DIR/Tools/perf-diagnose" "$HOME/.local/bin/perf-diagnose"
-fi
-agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
-agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.claude/CLAUDE.md"
-agency_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.pi/agent/AGENTS.md"
-agency_link "$AGENCY_DIR/Agents/pi/agency-web.ts" "$HOME/.pi/agent/extensions/agency-web.ts"
-agency_link "$AGENCY_DIR/Agents/pi/agency-decisions.ts" "$HOME/.pi/agent/extensions/agency-decisions.ts"
-agency_link \
-  "$AGENCY_DIR/Agents/codex/coordinated-worker.toml" \
-  "$HOME/.codex/agents/coordinated-worker.toml"
-agency_link \
-  "$AGENCY_DIR/Agents/claude/coordinated-worker.md" \
-  "$HOME/.claude/agents/coordinated-worker.md"
+agency_user_links apply
 agency_merge_agent_hooks "$AGENCY_DIR/config/codex/hooks.json" "$HOME/.codex/hooks.json"
 agency_merge_agent_hooks "$AGENCY_DIR/config/claude/hooks.json" "$HOME/.claude/settings.json"
 
-mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.pi/agent/skills"
-for skill_dir in "$AGENCY_DIR"/Skills/*; do
-  [[ -d "$skill_dir" ]] || continue
-  skill_name=${skill_dir##*/}
-  agency_link "$skill_dir" "$HOME/.agents/skills/$skill_name"
-  agency_link "$skill_dir" "$HOME/.claude/skills/$skill_name"
-  agency_link "$skill_dir" "$HOME/.pi/agent/skills/$skill_name"
-done
-
 if [[ $platform == linux ]]; then
   mapfile -t packages < <(sed -E '/^[[:space:]]*(#|$)/d' "$AGENCY_DIR/packages.txt")
+
+  source "$AGENCY_DIR/scripts/configure-snapshots.sh"
+  agency_configure_snapshots
 
   # Podman is the one container stack. Remove only explicit competing frontends;
   # shared runtimes such as containerd are left alone in case another package uses them.

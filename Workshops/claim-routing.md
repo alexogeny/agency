@@ -1,165 +1,144 @@
-# Workshop: claim-routed agent messages
+# Claim-routed agent messages
 
-Status: proposed; no runtime implementation exists yet.
+Status: implemented in `Tools/agent-work`, `Tools/agent_work_messages.py`, the
+delivery helpers and client adapters. Tests use isolated ledgers and local
+protocol fixtures; they do not establish compatibility with every installed
+client version or run paid model sessions.
 
-## Problem
+## Ownership and communication
 
-Write claims prevent concurrent agents from editing overlapping paths, but a
-blocked agent currently needs a human to negotiate with the claim owner. The
-ledger already knows which task owns a path. It should be able to route a claim
-request to that task without guessing which client, session, or worktree owns
-it.
+The machine-local SQLite register is the source of truth. A task can start with
+no claims, broadcast to other active/waiting tasks in its canonical repository,
+or request paths from all overlapping effective owners. Linked Git worktrees
+share the repository identity. Recipient labels never determine delivery.
+Repository-root claims do not encompass absolute scratch claims outside that
+repository; negotiation cannot silently take or discard those reservations.
 
-A representative case has one broad audit claiming the repository and another
-task needing `src/_json`. The audit may be able to yield that subtree while
-retaining the rest of its write scope. Releasing the broad claim and rebuilding
-it from many paths would create a race and needless bookkeeping.
+A broadcast snapshots recipients when committed. A claim request records exact
+paths, a revision, its ownership snapshot, reason and optional advisory deadline.
+It creates owner inbox messages and a repository intent notice in the same
+transaction. Late joiners consult current claims and pending requests; old
+broadcasts do not become a historical replay for every new task.
 
-## Desired properties
+Owners yield, defer, deny or counter. A counterproposal is advisory until the
+requester adopts it with `revise-request`; all prior approvals are invalidated.
+Either the requester or an affected owner can cancel, releasing temporary pauses.
+Finishing a participant cancels its open negotiations. Wait cycles and overdue
+response deadlines are visible without changing ownership.
 
-- Route by canonical repository path, including ancestor and descendant claims.
-- Persist messages and delivery state in the ledger before attempting delivery.
-- Reach Codex, Claude Code, and Pi through explicit client adapters.
-- Wake an idle controlled session or steer an active one when the client allows
-  it.
-- Keep routing, delivery, acknowledgement, and ownership transitions
-  deterministic. The receiving agent still judges whether yielding is safe.
-- Transfer or narrow ownership atomically. Never let a requester seize a claim.
-- Continue to work when a broker or client is temporarily offline.
-- Treat arbitrary terminal input injection as unsupported.
-
-## Proposed flow
+## Atomic transfer
 
 ```text
-requester asks for src/_json
-        ↓
-ledger canonicalises the repository and path
-        ↓
-find active claims where claim contains request or request contains claim
-        ↓
-commit one immutable inbox message per owning task
-        ↓
-wake registered delivery adapters
-        ↓
-owner yields, defers, or denies through a structured response
-        ↓
-ledger applies any ownership transfer in one transaction
+register requester without claims
+    -> commit request and recipient messages
+    -> notify client adapters
+    -> each owner stops affected writers and accepts the exact revision
+    -> recheck the effective ownership snapshot
+    -> transfer all required claims in one transaction
+    -> deliver grant confirmation to participants
 ```
 
-The routing query must support fan-out. Active claims normally cannot overlap,
-so one requested path usually has one owner. Multiple requested paths,
-multi-owner ancestor requests, or migrated legacy state can still produce more
-than one recipient.
+No scope moves before every required owner accepts. An accepted owner's scope
+is paused while other owners decide. Changed ownership produces `needs-review`
+and releases pauses; the requester must revise before continuing. There is no
+timeout-based acceptance or stale-process takeover.
 
-## Ledger model
+An ancestor claim can retain its broad reservation with a yielded exclusion:
+claim `.` plus exclusion `src/parser` reserves the repository except that
+subtree. Effective overlap checks, status, ordinary claims and `check-write`
+understand exclusions. A recipient finishing does not return the hole to the
+broad owner. Explicit reacquisition checks for current conflicts again.
 
-Add three durable concepts:
+The register is cooperative. It cannot stop arbitrary filesystem writes or a
+formatter already running. Owners must quiesce all relevant writers before
+`yield --quiesced`; whole-tree tools must respect exclusions or use an isolated
+copy. Every cooperating client must use the current CLI. An old binary copied
+elsewhere cannot be made to understand new exclusions by updating the database.
 
-1. A task transport registration records the client kind, session identifier,
-   process identity, delivery endpoint, and last adapter heartbeat. A display
-   owner such as `codex-root` is not sufficient authentication by itself.
-2. A message records its repository, sender task, recipient task, requested
-   path, bounded optional note, correlation ID, timestamps, and
-   `queued → delivered → acknowledged → resolved` state.
-3. A claim exclusion represents a yielded hole beneath an ancestor claim. For
-   example, claim `.` plus exclusion `src/_json` owns the repository except that
-   subtree.
+## Persistence and identity
 
-SQLite remains the source of truth. A local Unix-domain socket can provide the
-wake-up edge so adapters do not busy-poll. If the socket or adapter is absent,
-the committed message stays queued and a later heartbeat drains it.
+The schema adds task credential hashes, claim exclusions, claim requests and
+responses, messages, per-recipient delivery state, session registrations and
+short-lived delivery batches. Task history records messages, acknowledgements,
+responses and ownership transitions. State and private credential files remain
+outside Git. The credential path is recoverable from task status; its contents
+are not printed there.
 
-## Commands to prototype
+New tasks return a one-time token and a private token file. Mutations require
+the correct task capability, not an owner display label. Active legacy tasks
+receive private credential files during migration and retain their old
+lifecycle commands. Owners can bind their current sessions with those
+credentials, without closing the tasks. These capabilities prevent accidental
+cross-task actions, not hostile access by another process running as the same
+operating-system user.
 
-```console
-agent-work request-claim REQUESTER_TASK src/_json \
-  --agent codex-worker --message "Can this subtree be yielded soon?"
-agent-work inbox OWNER_TASK --agent codex-auditor
-agent-work respond OWNER_TASK MESSAGE_ID --agent codex-auditor \
-  --decision yield
-```
+Request and broadcast idempotency keys reject mismatched retries. Notifications
+have stable IDs. Delivery retries are at least once, so recipients should
+deduplicate message IDs and check the current request revision before acting.
+Acknowledgement never implies consent or a grant.
 
-Other responses are `defer --until TIME` and `deny --reason TEXT`. An accepted
-`yield` is a transfer, not just a message:
+## Delivery
 
-- If the owner has the exact requested claim, remove it and assign it to the
-  requester in one transaction.
-- If the owner has an ancestor claim, add an exclusion and assign the requested
-  subtree in the same transaction.
-- If several claims must move, wait for every required owner to accept, then
-  commit the transfer as one barrier transaction.
+Persistence precedes notification. Watchers bind private Unix datagram sockets;
+ledger mutations send wake edges. Each watcher reconciles at least every
+fifteen seconds, so a missed edge or restarted adapter does not lose messages.
+No always-running broker service or arbitrary terminal input injection is
+required.
 
-The owner can later request the subtree back through the same protocol. Expiry,
-silence, a dead PID, or a stale heartbeat never grants an automatic transfer.
+Session registrations bind task IDs to explicit client/session IDs and delivery
+capabilities. Multiple tasks in one session share bounded inbox batches. The
+context is capped at eight messages and 32 KiB; full records remain inspectable.
+Routine claim notices coalesce to the latest ownership snapshot, retaining
+`superseded` delivery records without inventing acknowledgements. The
+watcher reserves a batch, emits it as JSONL and requires a receipt on stdin
+before marking it delivered. Unconfirmed leases retry; delivered messages
+without acknowledgement reappear after five minutes. Queued, delivered and
+acknowledged are separate from the request's granted or denied outcome.
 
-## Client delivery adapters
+Codex and Claude hooks can bind a JSON `start` result to the real invoking
+session after checking the task token and repository. They surface inboxes at
+prompt/tool/stop boundaries. Stop delivery avoids repeated continuation when
+`stop_hook_active` is already true. A hook marks submission after emitting
+model context; it cannot prove the client consumed stdout after a crash.
 
-Agency must launch or attach coordinated sessions through a supported control
-surface. The ledger cannot safely inject input into an arbitrary terminal
-process.
+Pi's extension starts a watcher only for registered sessions, delivers custom
+messages using `triggerTurn: true` and `deliverAs: steer`, and confirms the
+batch after the extension API accepts it. Session changes stop the watcher and
+discard asynchronous output belonging to the old session.
 
-### Codex
+Optional `agent-work-bridge` transports cover explicitly controlled sessions:
 
-For controlled sessions, Codex app-server exposes `turn/steer` for an active
-turn and `turn/start` for an idle thread. A hook-only fallback can surface
-messages through `PostToolUse` additional context and use `Stop` to continue,
-but delivery then waits for the next lifecycle boundary.
+- Codex: connect to a supplied loopback app-server WebSocket; initialize, read
+  thread state, steer the active turn or start an idle turn. No model, reasoning
+  or permission overrides are supplied. Approval requests remain with the
+  caller. WebSocket transport support depends on the installed Codex version.
+- Claude: launch an exclusive stream-json worker and forward ordinary client
+  JSONL. Input replay acknowledgements confirm context delivery. This is not
+  attachment to an arbitrary existing TUI.
 
-- [Codex app-server](https://developers.openai.com/codex/app-server)
-- [Codex hooks](https://developers.openai.com/codex/hooks)
+Unregistered or unsupported idle sessions stay queued and report no successful
+delivery. Peer messages remain bounded coordination data and confer no authority
+to expand the receiving task.
 
-### Claude Code
+## Acceptance evidence
 
-Run controlled workers with real-time `stream-json` input and output, retaining
-the session ID in the transport registration. A hook fallback can surface an
-inbox message after a tool or at stop, with the same event-boundary limitation.
+`Tests/test_agent_work_messages.py` exercises broadcasts, unclaimed startup,
+idempotency, exact and ancestor transfers, multiple owners, exclusions and
+reacquisition, deferral, denial, counterproposals, cancellation, stale revisions,
+changed claims, wait cycles, concurrent acquisition, task credentials and CLI
+errors. `Tests/test_agent_work.py` retains lifecycle and migration coverage.
 
-- [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference)
-- [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+`Tests/test_agent_work_delivery.py` exercises two registered sessions through
+request, reply, grant and acknowledgement; offline queues; actual-session
+binding; stop-loop protection; watcher receipts; Pi idle wake and session
+cleanup; installation fragments; and controlled Codex/Claude protocol contracts.
+The Bun fixtures use the real extension/helper/watcher paths with mocked client
+APIs, and mocked Codex/Claude transports with checked message envelopes.
 
-### Pi
+## Client protocol references
 
-Pi RPC provides `steer` for active work and ordinary prompts for idle work. A
-Pi extension can instead watch the local wake channel and call `sendMessage`
-with `triggerTurn: true`, which also wakes an idle session.
-
-- [Pi RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
+- [Codex hooks](https://learn.chatgpt.com/docs/hooks)
+- [Codex app-server](https://learn.chatgpt.com/docs/app-server)
+- [Claude hooks](https://code.claude.com/docs/en/hooks)
+- [Claude CLI](https://code.claude.com/docs/en/cli-reference)
 - [Pi extensions](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)
-
-## Message safety
-
-Deliver a fixed, structured claim-request envelope as developer or extension
-context. Keep the optional human note separate and bounded. Never evaluate
-message text as shell input, infer new authority from it, or let it override the
-recipient's task. The adapter should tell the agent exactly which ledger command
-records its response.
-
-Use idempotency keys for retries. Acknowledgement means the client received the
-message; it does not mean the model agreed. Store every response and ownership
-transition in task history.
-
-## Acceptance workshop
-
-- An exact-path request reaches its owning task once.
-- An ancestor claim receives a descendant request.
-- One request spanning several independently claimed children fans out and
-  waits for all required responses.
-- A controlled active session receives a steering message before its next model
-  call; a controlled idle session starts a turn.
-- An offline adapter later drains the same queued message without duplication.
-- Yielding a subtree atomically creates the exclusion and requester claim.
-- A denied, deferred, stale, or unauthenticated request changes no ownership.
-- The broad owner can no longer write inside a yielded exclusion.
-- A vanilla TUI without a registered adapter remains queued and is reported as
-  undelivered rather than receiving terminal keystrokes.
-
-## Open questions
-
-- Should the broker be a small user service, or should each adapter watch the
-  wake socket directly?
-- Should transport capabilities be per task, per session, or short-lived bearer
-  tokens stored beside the machine-local ledger?
-- How should a broad task declare the smallest useful exclusions when generated
-  files or whole-tree tools cross the yielded boundary?
-- Should claim requests have advisory deadlines, and how prominently should an
-  overdue unanswered request appear in status output?

@@ -10,6 +10,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/agent-work-hook --client claude",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -18,6 +27,15 @@
           {
             "type": "command",
             "command": "$HOME/.local/bin/agency-decision-usage --client claude",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/agent-work-hook --client claude",
             "timeout": 3
           }
         ]
@@ -33,6 +51,15 @@
           }
         ],
         "matcher": "^(Bash|mcp__agency[-_]decide__classify(_batch)?)$"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/agent-work-hook --client claude",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "Stop": [
@@ -41,6 +68,15 @@
           {
             "type": "command",
             "command": "$HOME/.local/bin/agency-decision-usage --client claude",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/agent-work-hook --client claude",
             "timeout": 3
           }
         ]

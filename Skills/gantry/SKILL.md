@@ -44,6 +44,10 @@ and report missing setup through `gantry doctor`; let the user enter credentials
 through the intended setup flow.
 
 After approval, follow the supervision and teardown procedure in the reference.
+Use [decision-routing](../decision-routing/SKILL.md) for unfamiliar failure
+diagnostics, repeated log findings, or consequential result claims at the
+specific points described there. Routine status, budgets, and lease state stay
+deterministic; labels never authorize a launch, repair, or release.
 Use `--json` for agent-driven operations and parse the returned fields rather
 than terminal prose. If installed syntax differs from this skill, inspect
 `gantry COMMAND --help` and preserve these safety boundaries.

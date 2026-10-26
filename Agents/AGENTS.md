@@ -45,6 +45,11 @@ A closer project `AGENTS.md` may add or override local guidance.
 
 - Use named or clearly applicable skills; keep their procedures there.
   Use `repo-map` before broad exploration of unfamiliar repositories.
+- Use `decision-routing` for repeated, bounded semantic choices with inspected
+  evidence, such as test ordering, failure triage, requirement coverage, research
+  screening, and claim review. Skip obvious or deterministic choices; there is
+  no per-turn quota. Labels remain advisory and grant no action or retention
+  permission. Follow its per-profile evaluation guidance before reducing review.
 - Use `coordinate` and `agent-work` for durable, multi-session, or concurrent
   repository work: narrow write claims, heartbeats, and evidence at handoff.
   Reads need no claim. Promote reusable utilities and judgement through that

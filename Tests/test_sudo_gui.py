@@ -276,6 +276,66 @@ class SudoGuiTests(unittest.TestCase):
         self.assertFalse((self.calls / "kdialog").exists())
         self.assertIn("locked", result.stderr)
 
+    def prompt_fixture(self):
+        self.write_executable('faillock', 'exit 0')
+        self.write_executable('kdialog',
+                              'printf "%s\\n" "$*" > "$SUDO_GUI_TEST_CALLS/dialog"\n'
+                              'printf "test password\\n"')
+        return self.write_executable('sudo', '"$SUDO_ASKPASS" >/dev/null')
+
+    def test_message_and_exact_quoted_command_appear_in_direct_prompt(self):
+        sudo = self.prompt_fixture()
+        result = self.run_tool('--message', 'Move container data to the larger disk.',
+                               '--', sudo, 'rsync', 'a directory/', 'destination/')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dialog = (self.calls / 'dialog').read_text()
+        self.assertIn('Move container data to the larger disk.', dialog)
+        self.assertIn('Command:', dialog)
+        self.assertIn(f'{sudo} rsync a\\ directory/ destination/', dialog)
+        self.assertNotIn('test password', result.stdout + result.stderr)
+
+    def test_workflow_prompt_shows_nested_sudo_command(self):
+        self.prompt_fixture()
+        workflow = self.write_executable('workflow', 'sudo systemctl stop mnt-storage.mount')
+        result = self.run_tool('--message', 'Check that storage mounts on access.', '--', workflow)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dialog = (self.calls / 'dialog').read_text()
+        self.assertIn('Check that storage mounts on access.', dialog)
+        self.assertIn('sudo systemctl stop mnt-storage.mount', dialog)
+        self.assertNotIn(str(workflow), dialog)
+
+    def test_absolute_nested_sudo_recovers_command_without_proxy_context(self):
+        sudo = self.prompt_fixture()
+        workflow = self.write_executable('workflow', f'"{sudo}" -A echo "a directory"')
+        for context in ('', 'stale unrelated command'):
+            with self.subTest(context=context):
+                result = self.run_tool('--message', 'Inspect the storage folder.', '--', workflow,
+                                       SUDO_GUI_COMMAND=context)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                dialog = (self.calls / 'dialog').read_text()
+                self.assertIn('Inspect the storage folder.', dialog)
+                self.assertIn(f'{sudo} -A echo a\\ directory', dialog)
+                self.assertNotIn('stale unrelated command', dialog)
+                self.assertNotIn(str(workflow), dialog)
+
+    def test_legacy_prompt_option_and_markup_are_displayed_as_text(self):
+        sudo = self.prompt_fixture()
+        result = self.run_tool('--prompt', 'Keep <b>literal</b> & readable.', '--', sudo, 'echo', '<hidden>')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dialog = (self.calls / 'dialog').read_text()
+        self.assertIn('Keep &lt;b&gt;literal&lt;/b&gt; &amp; readable.', dialog)
+        self.assertNotIn('<hidden>', dialog)
+        self.assertIn('Command:', dialog)
+
+    def test_message_shell_syntax_is_not_executed(self):
+        sudo = self.prompt_fixture()
+        marker = self.workspace / 'must-not-exist'
+        message = f'Explain $(touch {marker}) and `touch {marker}` literally.'
+        result = self.run_tool('--message', message, '--', sudo, 'true')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertIn(message, (self.calls / 'dialog').read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

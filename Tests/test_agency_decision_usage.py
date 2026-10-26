@@ -19,6 +19,18 @@ def report(identifier='a' * 32, decisions=1, errors=0, reused=0):
 
 
 class UsageHookTests(unittest.TestCase):
+    def test_evaluation_receipts_count_more_than_one_batch(self):
+        self.hook('UserPromptSubmit')
+        self.hook('PostToolUse', tool_name='Bash', tool_response=report(decisions=60))
+        self.assertEqual(self.hook('Stop')['systemMessage'], 'Jev: 60 decisions')
+
+    def test_evaluation_receipts_enforce_the_overall_limit(self):
+        self.hook('UserPromptSubmit')
+        self.hook('PostToolUse', tool_name='Bash', tool_response=report(decisions=1024))
+        self.assertEqual(self.hook('Stop')['systemMessage'], 'Jev: 1024 decisions')
+        self.hook('PostToolUse', tool_name='Bash', tool_response=report('b' * 32, decisions=1025))
+        self.assertEqual(self.hook('Stop')['systemMessage'], 'Jev: 1024 decisions · count incomplete')
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

@@ -39,6 +39,17 @@ if status is-interactive
         abbr --add --position command oldtasks 'long-processes'
     end
 
+    if command -sq housekeeping
+        complete --erase --command cleanup
+        function cleanup --description 'Scan disk usage and propose cleanups'
+            command housekeeping $argv
+        end
+
+        function cc --description 'Scan disk usage and propose cleanups'
+            command housekeeping $argv
+        end
+    end
+
     # `gcl owner/repo` clones or updates ~/Code/repo, then enters it.
     function gcl --description 'Clone or update a repository under ~/Code'
         set --local destination (git-get $argv)

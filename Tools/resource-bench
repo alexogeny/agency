@@ -171,10 +171,12 @@ def temporary_path(prefix, suffix):
 def process_tree(root_pid):
     pending = [root_pid]
     found = []
+    visited = set()
     while pending:
         pid = pending.pop()
-        if pid in found:
+        if pid in visited:
             continue
+        visited.add(pid)
         found.append(pid)
         try:
             tasks = list(Path(f"/proc/{pid}/task").iterdir())

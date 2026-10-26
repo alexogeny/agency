@@ -12,8 +12,8 @@ to broaden the task.
 Run the approved workflow in the same invocation:
 
 ```sh
-sudo-gui -- ./install.sh
-sudo-gui -- sudo systemctl restart example.service
+sudo-gui --message 'Install the approved development tools.' -- ./install.sh
+sudo-gui --message 'Restart the example service to apply its new settings.' -- sudo systemctl restart example.service
 ```
 
 Check `uname -s` before selecting platform-specific behavior.
@@ -47,11 +47,20 @@ a password in a custom dialog or use it as AppleScript's `password` argument.
 
 On Linux with KDE:
 
+Supply a short human-readable action summary with `--message`. The dialog shows
+that summary and the shell-quoted command automatically. For a script, it shows
+the actual nested sudo command that requests authentication. `--prompt` remains
+an alias. Messages and command arguments are displayed as text, never evaluated;
+keep secrets out of both. The summary does not expand the user's authorization.
+
 The tool gives the exact requested sudo command a one-attempt KDE askpass
 helper. For a script or installer, it temporarily routes PATH-resolved `sudo`
 calls through the same helper. Use ordinary `sudo` inside that workflow; do not
 add `-n`, which explicitly disables authentication. The workflow must stop if a
-sudo command fails.
+sudo command fails. An absolute-path `sudo -A` invocation also uses the askpass
+helper; it reads the requesting process arguments through `/proc` when the proxy
+context is absent. If those arguments cannot be inspected, it refuses to prompt
+and asks for a direct invocation through `sudo-gui`.
 
 Sudo uses an existing authorization or a command-specific `NOPASSWD` rule
 without opening a dialog. If the exact command needs a password, the askpass

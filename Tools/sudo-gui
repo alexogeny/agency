@@ -8,12 +8,29 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: sudo-gui [--prompt TEXT] [-- COMMAND [ARG...]]
+Usage: sudo-gui [--message TEXT] [-- COMMAND [ARG...]]
 
 Run COMMAND with a one-attempt KDE askpass helper available to sudo. Direct
 sudo commands authenticate in that same sudo invocation. On cancellation,
 failure, or active PAM lockout, stop without retrying.
+
+--message adds a short explanation above the exact sudo command in the dialog.
+--prompt remains an alias for --message.
 EOF
+}
+
+set_dialog_command() {
+  local command_text
+  printf -v command_text '%q ' "$@"
+  export SUDO_GUI_COMMAND="${command_text% }"
+}
+
+escape_dialog_text() {
+  local text=$1
+  text=${text//&/\&amp;}
+  text=${text//</\&lt;}
+  text=${text//>/\&gt;}
+  printf '%s' "$text"
 }
 
 config_value() {
@@ -77,6 +94,7 @@ faillock_command=${SUDO_GUI_FAILLOCK:-faillock}
 faillock_config=${SUDO_GUI_FAILLOCK_CONFIG:-/etc/security/faillock.conf}
 
 if [[ ${SUDO_GUI_PROXY_MODE:-} == 1 && ${0##*/} == sudo ]]; then
+  set_dialog_command sudo "$@"
   exec "$SUDO_GUI_SUDO_REAL" -A "$@"
 fi
 
@@ -107,10 +125,21 @@ if [[ ${SUDO_GUI_ASKPASS_MODE:-} == 1 ]]; then
     exit 1
   fi
 
+  if [[ -z ${SUDO_GUI_COMMAND:-} ]]; then
+    command_arguments=()
+    if ! mapfile -d '' -t command_arguments < "/proc/$PPID/cmdline" || (( ${#command_arguments[@]} == 0 )); then
+      write_state unavailable
+      printf 'Cannot identify the requesting command; run it directly through sudo-gui.\n' >&2
+      exit 1
+    fi
+    set_dialog_command "${command_arguments[@]}"
+  fi
+
   password=""
+  dialog="<qt><p>$(escape_dialog_text "$SUDO_GUI_PROMPT")</p><p>Command:</p><pre>$(escape_dialog_text "$SUDO_GUI_COMMAND")</pre></qt>"
   if ! password=$("$kdialog_command" \
     --title "Administrator authorization" \
-    --password "$SUDO_GUI_PROMPT"); then
+    --password "$dialog"); then
     password=""
     unset password
     write_state cancelled
@@ -135,7 +164,7 @@ fi
 prompt="Administrator authorization is required for the approved task."
 while (( $# )); do
   case $1 in
-    --prompt)
+    --message|--prompt)
       (( $# >= 2 )) || { usage >&2; exit 2; }
       prompt=$2
       shift 2
@@ -194,12 +223,15 @@ export SUDO_GUI_PROMPT="$prompt"
 export SUDO_GUI_STATE_DIR="$state_dir"
 export SUDO_GUI_SUDO_REAL="$sudo_executable"
 
+unset SUDO_GUI_COMMAND
 status=0
 if (( $# == 0 )); then
+  set_dialog_command "$sudo_executable" -v
   "$sudo_executable" -A -p '' -v || status=$?
 elif [[ ${1##*/} == sudo ]]; then
   requested_sudo=$1
   shift
+  set_dialog_command "$requested_sudo" "$@"
   "$requested_sudo" -A "$@" || status=$?
 else
   ln -s "$self_path" "$state_dir/sudo"

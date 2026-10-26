@@ -1,0 +1,819 @@
+#!/usr/bin/env python3
+import argparse
+import ctypes
+import fcntl
+import json
+import os
+import pwd
+import re
+import runpy
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+process_helpers = runpy.run_path(str(Path(__file__).resolve().with_name('agency_processes.py')))
+
+FSTAB_PATH = Path('/etc/fstab')
+FOLDERS = {'cache': '.cache', 'scratch': 'Scratch', 'containers': '.local/share/containers'}
+PODMAN_CONFIG = '[engine]\nimage_copy_tmp_dir = "storage"\n'
+FILESYSTEMS = {'btrfs', 'ext4', 'xfs'}
+BEGIN = '# BEGIN agency-storage'
+END = '# END agency-storage'
+
+
+def run(arguments, **kwargs):
+    result = subprocess.run(arguments, text=True, capture_output=True, **kwargs)
+    if result.returncode:
+        raise RuntimeError(f"{arguments[0]} failed ({result.returncode}): {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout
+
+
+def validate_volume(uuid, mount, fstype):
+    if not isinstance(uuid, str) or not re.fullmatch(r'[A-Za-z0-9-]+', uuid):
+        raise ValueError('Invalid filesystem UUID')
+    if not isinstance(mount, str) or not re.fullmatch(r'/mnt/[A-Za-z0-9][A-Za-z0-9_-]*', mount):
+        raise ValueError('Mount must be a single directory below /mnt, for example /mnt/storage')
+    if fstype not in FILESYSTEMS:
+        raise ValueError('Storage requires an existing Btrfs, ext4, or XFS filesystem')
+
+
+def fstab_plan(content, uuid, mount, fstype):
+    validate_volume(uuid, mount, fstype)
+    options = 'rw,nosuid,nodev,nofail,x-systemd.automount,x-systemd.device-timeout=10s'
+    if fstype == 'btrfs':
+        options += ',subvolid=5'
+    line = f'UUID={uuid} {mount} {fstype} {options} 0 {2 if fstype == "ext4" else 0}'
+    if content.count(BEGIN) != content.count(END) or content.count(BEGIN) > 1:
+        raise ValueError('Malformed Agency storage block in fstab')
+    block = f'{BEGIN}\n{line}\n{END}'
+    if BEGIN in content:
+        start, finish = content.index(BEGIN), content.index(END) + len(END)
+        if content[start:finish] != block:
+            raise ValueError('Existing Agency fstab block differs; review it before changing storage')
+        unmanaged = content[:start] + content[finish:]
+    else:
+        unmanaged = content
+    for row in unmanaged.splitlines():
+        fields = row.split()
+        if not fields or fields[0].startswith('#'):
+            continue
+        if len(fields) >= 2 and (fields[0] == f'UUID={uuid}' or fields[1] == mount):
+            raise ValueError('An unmanaged fstab entry already uses this UUID or mount; preserve it and resolve the conflict manually')
+    if BEGIN in content:
+        return content
+    return content + ('' if not content or content.endswith('\n') else '\n') + block + '\n'
+
+
+def mount_info(path, include_automount=False):
+    result = subprocess.run(['findmnt', '--json', '--nocanonicalize', '--direction', 'backward', '--first-only', '--mountpoint', str(path), '--output', 'TARGET,UUID,FSTYPE,OPTIONS'], text=True, capture_output=True)
+    if result.returncode == 1:
+        return None
+    if result.returncode:
+        raise RuntimeError(f'Cannot inspect mount: {result.stderr.strip()}')
+    entries = json.loads(result.stdout).get('filesystems', [])
+    if len(entries) > 1:
+        raise RuntimeError('Ambiguous mount result; refusing to infer filesystem identity')
+    if not entries or (entries[0]['fstype'] == 'autofs' and not include_automount):
+        return None
+    return entries[0]
+
+
+def mount_matches(config):
+    info = mount_info(config['mount'])
+    if not info or info['uuid'] != config['uuid'] or info['fstype'] != config['fstype']:
+        return False
+    options = set(info['options'].split(','))
+    return {'rw', 'nosuid', 'nodev'}.issubset(options) and 'noexec' not in options and (config['fstype'] != 'btrfs' or 'subvolid=5' in options)
+
+
+def automount_ready(config):
+    info = mount_info(config['mount'], include_automount=True)
+    if not info or info['fstype'] != 'autofs':
+        return False
+    if not Path('/dev/disk/by-uuid', config['uuid']).is_block_device():
+        return False
+    unit = run(['systemd-escape', '--path', '--suffix=mount', config['mount']]).strip()
+    result = subprocess.run(['systemctl', 'show', unit, '--property=What,Where'], text=True, capture_output=True)
+    if result.returncode:
+        return False
+    fields = dict(row.split('=', 1) for row in result.stdout.splitlines() if '=' in row)
+    device = fields.get('What', '')
+    return (bool(device) and os.path.realpath(device) == os.path.realpath('/dev/disk/by-uuid/' + config['uuid'])
+            and fields.get('Where') == config['mount'])
+
+
+def volumes():
+    data = json.loads(run(['lsblk', '--json', '--bytes', '--output', 'NAME,PATH,TYPE,SIZE,FSTYPE,UUID,LABEL,MOUNTPOINTS,RO,RM']))
+    result = []
+
+    def visit(items, removable=False):
+        for item in items:
+            item_removable = removable or bool(item.get('rm'))
+            mounts = [path for path in item.get('mountpoints', []) if path]
+            if item.get('uuid') and item.get('fstype') in FILESYSTEMS and not item.get('ro') and not item_removable:
+                free = None
+                for path in mounts:
+                    if Path(path).is_dir():
+                        free = shutil.disk_usage(path).free
+                        break
+                result.append({'uuid': item['uuid'], 'device': item['path'], 'fstype': item['fstype'], 'label': item.get('label'), 'size': item['size'], 'available': free, 'mountpoints': mounts})
+            visit(item.get('children', []), item_removable)
+
+    visit(data['blockdevices'])
+    return result
+
+
+def select_volume(uuid):
+    matches = [item for item in volumes() if item['uuid'] == uuid]
+    if len(matches) != 1:
+        raise ValueError('UUID must identify exactly one writable, non-removable Linux filesystem')
+    volume = matches[0]
+    if any(path in {'/', '/home', '/boot', '/usr', '/var'} for path in volume['mountpoints']):
+        raise ValueError('Refusing to use an operating-system filesystem as secondary storage')
+    return volume
+
+
+def config_path():
+    root = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    if not root.is_absolute():
+        raise ValueError('XDG_CONFIG_HOME must be an absolute path')
+    return root / 'agency/storage.json'
+
+
+def atomic_text(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def atomic_json(path, data):
+    atomic_text(path, json.dumps(data, indent=2) + '\n')
+
+
+def podman_config_path():
+    return config_path().parent.parent / 'containers/containers.conf.d/90-agency-storage.conf'
+
+
+def podman_config_ready():
+    path = podman_config_path()
+    if path.is_symlink() or (path.exists() and (not path.is_file() or path.read_text() != PODMAN_CONFIG)):
+        raise ValueError(f'Existing Podman config needs review: {path}')
+    return path.is_file()
+
+
+def configure_podman(source):
+    configured = podman_config_ready()
+    temporary = source / 'storage/tmp'
+    if temporary.is_symlink():
+        raise ValueError('Podman download directory must not be a symlink')
+    temporary.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not configured:
+        atomic_text(podman_config_path(), PODMAN_CONFIG)
+
+
+def podman_idle():
+    if run(['podman', 'ps', '--quiet']).strip():
+        raise RuntimeError('Podman has running containers; stop them before migrating storage')
+    if run(['podman', 'unshare', 'podman', 'mount']).strip():
+        raise RuntimeError('Podman has mounted containers; unmount them before migrating storage')
+
+
+def podman_local_info(source):
+    overrides = [name for name in ('CONTAINER_HOST', 'CONTAINER_CONNECTION', 'CONTAINERS_CONF',
+                                  'CONTAINERS_CONF_OVERRIDE', 'CONTAINERS_STORAGE_CONF', 'TMPDIR')
+                 if os.environ.get(name)]
+    if overrides:
+        raise ValueError('Unset Podman environment overrides before migration: ' + ', '.join(overrides))
+    info = json.loads(run(['podman', 'info', '--format', 'json']))
+    if not info['host']['security']['rootless']:
+        raise ValueError('Only local rootless Podman storage is supported')
+    if Path(info['store']['graphRoot']) != source / 'storage':
+        raise RuntimeError('Podman graphRoot is not the standard user storage path; review custom storage separately')
+    return info
+
+
+def podman_preflight(source):
+    podman_local_info(source)
+    podman_idle()
+
+
+def podman_download_issue(source):
+    info = podman_local_info(source)
+    temporary = Path(info['store']['imageCopyTmpDir'])
+    if temporary.resolve() != (source / 'storage/tmp').resolve():
+        return f'Podman download location overridden: {temporary}'
+    return None
+
+
+def podman_copy(arguments):
+    # Container files include subordinate UIDs/GIDs inaccessible to the host user.
+    return run(['podman', 'unshare', *arguments])
+
+
+def migrate_containers(config, source):
+    podman_copy([sys.executable, str(Path(__file__).resolve()), '_release-container-bind',
+                 '--source', str(source)])
+    output = run(['sudo', sys.executable, str(Path(__file__).resolve()), '_migrate-containers',
+                  '--uuid', config['uuid'], '--mount', config['mount'],
+                  '--fstype', config['fstype'], '--uid', str(config['uid'])])
+    print(output, end='', flush=True)
+
+
+def release_podman_bind(source):
+    mounts = nested_mounts([source])
+    if not mounts:
+        return
+    overlay = source / 'storage/overlay'
+    if mounts != [str(overlay)]:
+        raise RuntimeError('Refusing to traverse nested mounts: ' + ', '.join(mounts[:10]))
+    query = ['findmnt', '--json', '--first-only', '--output', 'TARGET,FSROOT,MAJ:MIN']
+    parent = json.loads(run([*query, '--target', str(source)]))['filesystems'][0]
+    mounted = json.loads(run([*query, '--mountpoint', str(overlay)]))['filesystems'][0]
+    expected = Path(parent['fsroot']) / overlay.relative_to(parent['target'])
+    if mounted['maj:min'] != parent['maj:min'] or Path(mounted['fsroot']) != expected:
+        raise RuntimeError('Podman overlay mount is not its expected self-bind; review it manually')
+    # Podman pins overlay in its persistent rootless mount namespace, even when idle.
+    run(['umount', '--', str(overlay)])
+
+
+def load_config():
+    path = config_path()
+    if path.is_symlink():
+        raise ValueError('Storage config must be a regular local file, not a link')
+    if not path.exists():
+        return None
+    config = json.loads(path.read_text())
+    required = {'version', 'home', 'uid', 'uuid', 'mount', 'fstype', 'folders'}
+    if not isinstance(config, dict) or not required.issubset(config):
+        raise ValueError('Storage config is missing required fields')
+    if config.get('version') != 1 or config.get('home') != str(Path.home()) or config.get('uid') != os.getuid():
+        raise ValueError('Storage config belongs to another user/home or has an unsupported version')
+    validate_volume(config['uuid'], config['mount'], config['fstype'])
+    if not isinstance(config.get('folders'), list) or not config['folders'] or any(name not in FOLDERS for name in config['folders']) or len(set(config['folders'])) != len(config['folders']):
+        raise ValueError('Invalid managed folder selection')
+    return config
+
+
+def folder_paths(config):
+    return [(name, Path(config['home']) / FOLDERS[name], Path(config['mount']) / 'agency' / str(config['uid']) / name) for name in config['folders']]
+
+
+def link_matches(source, destination):
+    return source.is_symlink() and os.readlink(source) == str(destination)
+
+
+def status(config):
+    mounted = mount_matches(config)
+    content = FSTAB_PATH.read_text()
+    fstab_ok = fstab_plan(content, config['uuid'], config['mount'], config['fstype']) == content
+    armed = not mounted and fstab_ok and automount_ready(config)
+    folders = []
+    for name, source, destination in folder_paths(config):
+        linked = link_matches(source, destination)
+        ready = linked and ((mounted and destination.is_dir()) or armed)
+        if source.is_symlink() and not linked:
+            state = 'conflicting link'
+        elif not linked:
+            state = 'migration pending'
+        elif not mounted and not armed:
+            state = 'mount unavailable'
+        elif not ready:
+            state = 'destination missing'
+        else:
+            state = 'unchanged'
+        if name == 'containers' and not podman_config_ready() and state == 'unchanged':
+            state = 'Podman configuration pending'
+        if name == 'containers' and mounted and state == 'unchanged':
+            temporary = destination / 'storage/tmp'
+            if temporary.is_symlink() or not temporary.is_dir():
+                state = 'Podman download directory missing'
+            else:
+                state = podman_download_issue(source) or state
+        if name == 'containers' and armed and state == 'unchanged':
+            state = 'Podman verification pending; access storage first'
+        folders.append({'name': name, 'source': str(source), 'destination': str(destination), 'state': state, 'backup': str(backup_path(source)), 'backup_exists': os.path.lexists(backup_path(source))})
+    return {'configured': True, 'mount': config['mount'], 'uuid': config['uuid'], 'mounted': mounted, 'automount_ready': armed, 'fstab_unchanged': fstab_ok, 'folders': folders, 'unchanged': (mounted or armed) and fstab_ok and all(folder['state'] == 'unchanged' for folder in folders)}
+
+
+def print_status(state, as_json=False):
+    if as_json:
+        print(json.dumps(state, indent=2))
+        return
+    if not state['configured']:
+        print('  [not configured  ] Optional secondary storage; run agency-storage setup --interactive')
+        return
+    mount_state = "unchanged" if state["mounted"] else "mount on access" if state.get("automount_ready") else "mount pending"
+    print(f"  [{mount_state:16}] {state['mount']}")
+    print(f"  [{'unchanged' if state['fstab_unchanged'] else 'fstab pending':16}] /etc/fstab storage entry")
+    for folder in state['folders']:
+        print(f"  [{folder['state']:16}] {folder['source']} -> {folder['destination']}")
+        if folder['backup_exists']:
+            print(f"  [backup retained ] {folder['backup']}; review agency-storage cleanup --dry-run")
+
+
+def active_users(paths, all_users=False):
+    roots = tuple(str(path).rstrip('/') + '/' for path in paths)
+    exact = {str(path).rstrip('/') for path in paths}
+    blockers = []
+    own = os.getpid()
+    for process in Path('/proc').iterdir():
+        if not process.name.isdigit() or int(process.name) == own:
+            continue
+        try:
+            if not all_users and process.stat().st_uid != os.getuid():
+                continue
+            name = process_helpers['read_process_file'](process / 'comm', text=True).strip()
+            targets = []
+            for entry in [process / 'cwd', *list((process / 'fd').iterdir())]:
+                try:
+                    targets.append(process_helpers['read_link'](entry))
+                except FileNotFoundError:
+                    continue
+            targets.extend(process_helpers['mapped_paths'](
+                process_helpers['read_process_file'](process / 'maps', text=True)))
+            if any(process_helpers['normalize_path'](target) in exact or target.startswith(roots) for target in targets):
+                blockers.append(f'{process.name} {name}')
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            blockers.append(f'{process.name} (cannot inspect process; run after logging out)')
+    return blockers
+
+
+def privileged_active_users(paths):
+    if not paths:
+        return []
+    return json.loads(run(['sudo', sys.executable, str(Path(__file__).resolve()),
+                           '_active-users', '--', *(str(path) for path in paths)]))
+
+
+def backup_path(source):
+    return source.with_name(source.name + '.agency-storage-backup')
+
+
+def migration_marker(destination):
+    return destination.with_name('.' + destination.name + '.agency-migration.json')
+
+
+def source_identity(source):
+    info = source.stat()
+    return {'source': str(source), 'device': info.st_dev, 'inode': info.st_ino}
+
+
+def assert_inactive(paths, users):
+    if not paths:
+        return
+    blockers = users(paths)
+    if blockers:
+        raise RuntimeError('Folder has active users; close them or run from a text console after logging out: ' + ', '.join(blockers[:15]))
+
+
+def exchange_link(source, destination, backup):
+    library = ctypes.CDLL(None, use_errno=True)
+    exchange = library.renameat2
+    exchange.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    exchange.restype = ctypes.c_int
+    backup.symlink_to(destination, target_is_directory=True)
+    if exchange(-100, os.fsencode(source), -100, os.fsencode(backup), 2):
+        error = ctypes.get_errno()
+        backup.unlink()
+        raise OSError(error, os.strerror(error))
+
+
+def rsync_arguments(source, destination, verify=False, exact=True):
+    # Compression is the destination filesystem's policy, not a content attribute.
+    arguments = ['rsync', '-aHAXx', '--numeric-ids', '--filter=-x btrfs.compression']
+    if exact:
+        arguments.append('--delete-delay')
+    else:
+        arguments.append('--omit-dir-times')
+    if verify:
+        arguments += ['--dry-run', '--checksum', '--itemize-changes']
+    arguments += ['--', str(source) + '/', str(destination) + '/']
+    return arguments
+
+
+def nested_mounts(paths):
+    prefixes = tuple(str(path).rstrip('/') + '/' for path in paths)
+    exact = {str(path).rstrip('/') for path in paths}
+    matches = []
+    for row in Path('/proc/self/mountinfo').read_text().splitlines():
+        mount = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), row.split()[4])
+        if mount in exact or mount.startswith(prefixes):
+            matches.append(mount)
+    return matches
+
+
+def assert_no_mounts(paths):
+    mounts = nested_mounts(paths)
+    if mounts:
+        raise RuntimeError('Refusing to traverse nested mounts: ' + ', '.join(mounts[:10]))
+
+
+def migrate_folder(source, destination, users=active_users, command=None):
+    command = command or run
+    if source.is_symlink():
+        if not link_matches(source, destination) or not destination.is_dir():
+            raise RuntimeError(f'Unexpected source link: {source}')
+        return
+    if source.exists() and not source.is_dir():
+        raise RuntimeError(f'Source is not a directory: {source}')
+    if os.path.ismount(source):
+        raise RuntimeError(f'Source is already a mount: {source}')
+    assert_no_mounts([source, destination])
+    assert_inactive([source], users)
+    backup = backup_path(source)
+    if backup.exists() or backup.is_symlink():
+        raise RuntimeError(f'Existing backup needs review: {backup}')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        raise RuntimeError(f'Unexpected destination link: {destination}')
+    marker = migration_marker(destination)
+    if not source.exists():
+        if destination.exists() or marker.exists():
+            raise RuntimeError(f'Existing destination needs review: {destination}')
+        destination.mkdir(mode=0o700)
+        source.symlink_to(destination, target_is_directory=True)
+        return
+    identity = source_identity(source)
+    if destination.exists():
+        if not marker.is_file() or json.loads(marker.read_text()) != identity:
+            raise RuntimeError(f'Unmanaged destination needs review: {destination}')
+    else:
+        if marker.exists() and json.loads(marker.read_text()) != identity:
+            raise RuntimeError(f'Unexpected destination migration marker: {marker}')
+        atomic_json(marker, identity)
+        destination.mkdir(mode=0o700)
+    size = int(command(['du', '-sx', '--block-size=1', '--', str(source)]).split()[0])
+    if shutil.disk_usage(destination).free < size * 1.1:
+        raise RuntimeError(f'Insufficient free space for verified migration of {source}')
+    print(f'Copying {source} to {destination} ({size / 1024**3:.1f} GiB); originals retained', flush=True)
+    command(rsync_arguments(source, destination))
+    assert_inactive([source], users)
+    differences = command(rsync_arguments(source, destination, verify=True))
+    if differences.strip():
+        raise RuntimeError(f'Copy verification failed; source unchanged: {differences[:1000]}')
+    if source_identity(source) != identity:
+        raise RuntimeError('Source directory changed during migration')
+    run(['sync', '-f', str(destination)])
+    assert_no_mounts([source, destination])
+    assert_inactive([source], users)
+    exchange_link(source, destination, backup)
+    descriptor = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    print(f'Linked {source}; original retained at {backup}', flush=True)
+
+
+def prepare_user_directory(path, uid, gid):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptors = [descriptor]
+    try:
+        for name, owner, group, mode in [('agency', 0, 0, 0o755), (str(uid), uid, gid, 0o700)]:
+            created = False
+            try:
+                os.mkdir(name, mode=mode, dir_fd=descriptor)
+                created = True
+            except FileExistsError:
+                pass
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            descriptors.append(descriptor)
+            if created:
+                os.fchown(descriptor, owner, group)
+            elif os.fstat(descriptor).st_uid != owner:
+                raise ValueError('Storage directory has unexpected ownership')
+            os.fchmod(descriptor, mode)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def open_root_lock(path):
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError('Storage lock must be a regular root-owned file with one link')
+    return descriptor
+
+
+def root_mount(uuid, mount, fstype, uid):
+    if os.geteuid() != 0 or uid <= 0:
+        raise ValueError('Mount setup requires root and a non-root destination user')
+    validate_volume(uuid, mount, fstype)
+    if int(os.environ.get('SUDO_UID', uid)) != uid:
+        raise ValueError('Destination user differs from sudo caller')
+    user = pwd.getpwuid(uid)
+    volume = select_volume(uuid)
+    if volume['fstype'] != fstype:
+        raise ValueError('Filesystem type changed')
+    path = Path(mount)
+    mount_parent = Path('/mnt').stat()
+    if mount_parent.st_uid != 0 or stat.S_IMODE(mount_parent.st_mode) & 0o022:
+        raise ValueError('/mnt must be root-owned and not writable by other users')
+    if Path('/mnt').is_symlink() or path.is_symlink():
+        raise ValueError('Mount path must not be a symlink')
+    lock_path = Path('/run/lock/agency-storage.lock')
+    with os.fdopen(open_root_lock(lock_path), 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        raw_mount = mount_info(path, include_automount=True)
+        info = raw_mount if raw_mount and raw_mount['fstype'] != 'autofs' else None
+        if info and not mount_matches({'uuid': uuid, 'mount': mount, 'fstype': fstype}):
+            raise ValueError('Mount path already holds another filesystem or incompatible options')
+        if not raw_mount and path.exists() and any(path.iterdir()):
+            raise ValueError('Unmounted mount directory is not empty')
+        fstab = FSTAB_PATH
+        if fstab.is_symlink():
+            raise ValueError('fstab is a symlink; review this configuration manually')
+        original = fstab.read_text()
+        if raw_mount and BEGIN not in original:
+            raise ValueError('Mount target is already in use outside Agency; choose an unused mount path')
+        proposed = fstab_plan(original, uuid, mount, fstype)
+        if not raw_mount:
+            path.mkdir(mode=0o755, exist_ok=True)
+            os.chown(path, 0, 0)
+            path.chmod(0o755)
+        if proposed != original:
+            descriptor, temporary = tempfile.mkstemp(prefix='.fstab-agency-', dir='/etc')
+            try:
+                with os.fdopen(descriptor, 'w') as stream:
+                    stream.write(proposed)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                run(['findmnt', '--verify', '--tab-file', temporary])
+                backup_dir = Path('/var/backups/agency-storage')
+                backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                shutil.copy2(fstab, backup_dir / f'fstab-{time.time_ns()}')
+                os.chmod(temporary, stat.S_IMODE(fstab.stat().st_mode))
+                os.replace(temporary, fstab)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            run(['systemctl', 'daemon-reload'])
+        if not info:
+            run(['systemctl', 'daemon-reload'])
+            unit = run(['systemd-escape', '--path', '--suffix=automount', mount]).strip()
+            run(['systemctl', 'start', unit])
+            run(['stat', '--', mount + '/.'])
+        config = {'uuid': uuid, 'mount': mount, 'fstype': fstype}
+        if not mount_matches(config):
+            raise RuntimeError('Mounted filesystem identity does not match the plan')
+        prepare_user_directory(path, uid, user.pw_gid)
+
+
+def root_migrate_containers(uuid, mount, fstype, uid):
+    if os.geteuid() != 0 or uid <= 0 or int(os.environ.get('SUDO_UID', uid)) != uid:
+        raise ValueError('Container migration requires root and the sudo caller UID')
+    validate_volume(uuid, mount, fstype)
+    config = {'uuid': uuid, 'mount': mount, 'fstype': fstype}
+    if not mount_matches(config):
+        raise RuntimeError('Storage mount unavailable; refusing to copy onto the system disk')
+    user = pwd.getpwuid(uid)
+    source = Path(user.pw_dir) / FOLDERS['containers']
+    destination = Path(mount) / 'agency' / str(uid) / 'containers'
+    with os.fdopen(open_root_lock(Path('/run/lock/agency-storage.lock')), 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            migrate_folder(source, destination, lambda paths: active_users(paths, all_users=True))
+        finally:
+            marker = migration_marker(destination)
+            if marker.is_file() and not marker.is_symlink():
+                os.chown(marker, uid, user.pw_gid, follow_symlinks=False)
+
+
+def apply_setup(config, new=False):
+    current = status(config)
+    if current['unchanged']:
+        if new:
+            atomic_json(config_path(), config)
+        print_status(current)
+        return
+    if not shutil.which('rsync'):
+        raise RuntimeError('rsync is required; install it before opting into storage setup')
+    paths = folder_paths(config)
+    for name, source, destination in paths:
+        if name == 'containers':
+            podman_config_ready()
+            if not link_matches(source, destination):
+                podman_preflight(source)
+    pending = [source for name, source, destination in paths
+               if name != 'containers' and not link_matches(source, destination)]
+    assert_inactive(pending, privileged_active_users)
+    for _, source, destination in paths:
+        if source.is_symlink() and not link_matches(source, destination):
+            raise RuntimeError(f'Unexpected source link: {source}')
+    if not current['mounted'] or not current['fstab_unchanged']:
+        run(['sudo', sys.executable, str(Path(__file__).resolve()), '_mount', '--uuid', config['uuid'], '--mount', config['mount'], '--fstype', config['fstype'], '--uid', str(config['uid'])])
+    if not mount_matches(config):
+        raise RuntimeError('Storage mount unavailable; refusing to write to the system disk')
+    root = Path(config['mount']) / 'agency' / str(config['uid'])
+    if not root.is_dir() or root.is_symlink() or root.stat().st_uid != os.getuid():
+        raise RuntimeError('Storage user directory is missing or has unexpected ownership')
+    if new:
+        atomic_json(config_path(), config)
+    for name, source, destination in paths:
+        if not mount_matches(config):
+            raise RuntimeError('Storage mount disappeared; migration stopped')
+        if name == 'containers':
+            if not link_matches(source, destination):
+                podman_idle()
+                migrate_containers(config, source)
+            if not destination.is_dir():
+                raise RuntimeError('Podman destination is missing; restore the migrated data before continuing')
+            configure_podman(source)
+            issue = podman_download_issue(source)
+            if issue:
+                raise RuntimeError(issue + '; review other containers.conf settings before continuing')
+        else:
+            migrate_folder(source, destination, users=privileged_active_users)
+    print_status(status(config))
+
+
+def cleanup(config, apply=False):
+    current = status(config)
+    if not current['unchanged']:
+        raise RuntimeError('Restore a healthy storage setup before removing original backups')
+    if not current.get('mounted', True):
+        raise RuntimeError('Access the storage mount first, then retry cleanup; cleanup previews do not activate mounts')
+    for name, source, destination in folder_paths(config):
+        backup = backup_path(source)
+        if not backup.exists():
+            continue
+        if backup.is_symlink() or not backup.is_dir():
+            raise RuntimeError(f'Backup is not a regular directory: {backup}')
+        marker = migration_marker(destination)
+        identity = json.loads(marker.read_text()) if marker.is_file() else None
+        expected = source_identity(backup)
+        expected['source'] = str(source)
+        if identity != expected:
+            raise RuntimeError(f'Backup identity does not match migration: {backup}')
+        print(f"  [{'remove backup' if apply else 'would remove':16}] {backup}")
+        if apply:
+            assert_no_mounts([backup, destination])
+            assert_inactive([backup], privileged_active_users)
+            arguments = rsync_arguments(backup, destination, verify=True, exact=False)
+            if name == 'containers':
+                podman_preflight(source)
+                for directory in (backup, destination):
+                    lock = directory / 'storage/storage.lock'
+                    if os.path.lexists(lock) and (lock.is_symlink() or not lock.is_file()):
+                        raise RuntimeError(f'Unexpected Podman runtime lock; retain backup for review: {lock}')
+                # Podman updates this coordination file even for read-only queries.
+                arguments.insert(1, '--exclude=/storage/storage.lock')
+                arguments.insert(0, 'sudo')
+            differences = run(arguments)
+            if differences.strip():
+                raise RuntimeError(f'Backup differs from destination; retained for review: {backup}')
+            assert_no_mounts([backup, destination])
+            assert_inactive([backup], privileged_active_users)
+            if name == 'containers':
+                podman_idle()
+                run(['sudo', 'rm', '-rf', '--', str(backup)])
+            else:
+                shutil.rmtree(backup)
+            marker.unlink()
+
+
+def choose_interactively(folders):
+    candidates = [item for item in volumes() if not any(path in {'/', '/home', '/boot', '/usr', '/var'} for path in item['mountpoints'])]
+    home_size = shutil.disk_usage(Path.home()).total
+    candidates = [item for item in candidates if item['size'] > home_size]
+    if not candidates:
+        print('No larger writable secondary Linux filesystem found; storage setup skipped.')
+        return None
+    print('Larger secondary storage is available:')
+    for index, item in enumerate(candidates, 1):
+        free = f"{item['available'] / 1024**3:.0f} GiB free" if item['available'] is not None else 'free space unknown until mounted'
+        print(f"  {index}. {item['label'] or item['device']} — {item['size'] / 1024**3:.0f} GiB, {free}")
+    names = ' and '.join('~/' + FOLDERS[name] for name in folders)
+    choice = input(f'Use a drive for {names}? Enter its number, or press Enter to skip: ').strip()
+    if not choice:
+        return None
+    if not choice.isdigit() or not 1 <= int(choice) <= len(candidates):
+        raise ValueError('Invalid drive selection; no changes made')
+    return candidates[int(choice) - 1]
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Opt-in secondary storage for caches, Scratch, and rootless Podman; never formats disks.')
+    commands = parser.add_subparsers(dest='command', required=True)
+    for name in ['status', 'inspect']:
+        command = commands.add_parser(name)
+        command.add_argument('--json', action='store_true')
+    setup = commands.add_parser('setup')
+    setup.add_argument('--uuid')
+    setup.add_argument('--mount')
+    setup.add_argument('--folders', nargs='+', choices=FOLDERS)
+    action = setup.add_mutually_exclusive_group()
+    action.add_argument('--apply', action='store_true')
+    action.add_argument('--dry-run', action='store_true')
+    action.add_argument('--interactive', action='store_true')
+    cleaning = commands.add_parser('cleanup')
+    cleaning_action = cleaning.add_mutually_exclusive_group()
+    cleaning_action.add_argument('--apply', action='store_true')
+    cleaning_action.add_argument('--dry-run', action='store_true')
+    for name in ('_mount', '_migrate-containers'):
+        internal = commands.add_parser(name, help=argparse.SUPPRESS)
+        internal.add_argument('--uuid', required=True)
+        internal.add_argument('--mount', required=True)
+        internal.add_argument('--fstype', required=True)
+        internal.add_argument('--uid', type=int, required=True)
+    inspection = commands.add_parser('_active-users', help=argparse.SUPPRESS)
+    inspection.add_argument('paths', type=Path, nargs='+')
+    release = commands.add_parser('_release-container-bind', help=argparse.SUPPRESS)
+    release.add_argument('--source', type=Path, required=True)
+    args = parser.parse_args()
+    if args.command == '_active-users':
+        if os.geteuid() != 0 or any(not path.is_absolute() for path in args.paths):
+            raise ValueError('Process inspection requires root and absolute paths')
+        print(json.dumps(active_users(args.paths, all_users=True)))
+        return 0
+    if args.command == '_release-container-bind':
+        mapping = Path('/proc/self/uid_map').read_text().splitlines()[0].split()
+        if os.geteuid() != 0 or mapping[0] != '0' or mapping[1] == '0':
+            raise ValueError('Container migration requires the rootless Podman user namespace')
+        release_podman_bind(args.source)
+        return 0
+    if args.command == '_migrate-containers':
+        root_migrate_containers(args.uuid, args.mount, args.fstype, args.uid)
+        return 0
+    if args.command == '_mount':
+        root_mount(args.uuid, args.mount, args.fstype, args.uid)
+        return 0
+    if args.command == 'inspect':
+        data = volumes()
+        print(json.dumps(data, indent=2) if args.json else '\n'.join(f"{item['uuid']}  {item['fstype']}  {item['size'] / 1024**3:.0f} GiB  {item['label'] or item['device']}" for item in data))
+        return 0
+    config = load_config()
+    if args.command == 'status':
+        state = status(config) if config else {'configured': False}
+        print_status(state, args.json)
+        return 0 if not config or state['unchanged'] else 1
+    if args.command == 'cleanup':
+        if not config:
+            raise ValueError('Storage is not configured')
+        cleanup(config, args.apply)
+        return 0
+    new = config is None
+    save_config = new
+    if config:
+        if (args.uuid and args.uuid != config['uuid']) or (args.mount and args.mount != config['mount']):
+            raise ValueError('Storage already configured differently; inspect the saved configuration')
+        if args.folders is not None:
+            if not set(config['folders']).issubset(args.folders):
+                raise ValueError('Keep existing managed folders when adding new ones')
+            folders = list(dict.fromkeys(args.folders))
+            save_config = folders != config['folders']
+            config = {**config, 'folders': folders}
+    if new and args.interactive:
+        if not sys.stdin.isatty():
+            print('Storage not configured; unattended setup skipped.')
+            return 0
+        volume = choose_interactively(args.folders or ['cache', 'scratch'])
+        if volume is None:
+            return 0
+        args.uuid = volume['uuid']
+    if new and args.uuid:
+        volume = select_volume(args.uuid)
+        config = {'version': 1, 'home': str(Path.home()), 'uid': os.getuid(), 'uuid': volume['uuid'], 'fstype': volume['fstype'], 'mount': args.mount or '/mnt/storage', 'folders': list(dict.fromkeys(args.folders or ['cache', 'scratch']))}
+        validate_volume(config['uuid'], config['mount'], config['fstype'])
+    if not config:
+        print_status({'configured': False})
+        return 0
+    current = status(config)
+    print_status(current)
+    if not save_config and current['unchanged']:
+        return 0
+    if not args.apply and not args.interactive:
+        return 0
+    if args.interactive and new:
+        print('This adds a UUID mount to /etc/fstab, copies and verifies the selected folders, then replaces their paths with links.')
+        print('Original folders remain as backups until explicit cleanup. Close applications using these folders first.')
+        if input('Apply this plan? [y/N] ').strip().lower() not in {'y', 'yes'}:
+            return 0
+    state_dir = config_path().parent
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with (state_dir / 'storage.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        apply_setup(config, save_config)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, RuntimeError, OSError) as error:
+        print(f'agency-storage: {error}', file=sys.stderr)
+        sys.exit(1)

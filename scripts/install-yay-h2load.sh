@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+script_directory=${BASH_SOURCE[0]%/*}
+[[ $script_directory != "${BASH_SOURCE[0]}" ]] || script_directory=.
+source "$script_directory/lib.sh"
 
-update=false
 yay_revision=cb43f84828ab4f9700f7c6f9c6d7a923d4cfaff0
 nghttp2_revision=2f11414698d4a0190de1681f817855d93e29fcd9
-case ${1:-} in
-  --update) update=true ;;
-  "") ;;
-  *)
-    printf 'Usage: %s [--update]\n' "${0##*/}" >&2
-    exit 2
-    ;;
-esac
-(( $# <= 1 )) || { printf 'Usage: %s [--update]\n' "${0##*/}" >&2; exit 2; }
+update=$(agency_install_update_mode "$@")
 
 if (( EUID == 0 )); then
   printf 'Build yay and nghttp2 as a normal user, not root.\n' >&2
@@ -35,21 +29,6 @@ verify_command() {
     exit 1
   fi
   "$name" --version
-}
-
-clone_pinned_recipe() {
-  local package=$1 revision=$2 target=$3 actual
-  git clone --depth 1 "https://aur.archlinux.org/${package}.git" "$target"
-  git -C "$target" cat-file -e "${revision}^{commit}" || {
-    printf '%s AUR revision is no longer the fetched head; review and update the pin.\n' "$package" >&2
-    exit 1
-  }
-  actual=$(git -C "$target" rev-parse HEAD)
-  [[ $actual == "$revision" ]] || {
-    printf '%s AUR head %s does not match pinned revision %s.\n' \
-      "$package" "$actual" "$revision" >&2
-    exit 1
-  }
 }
 
 temporary_directories=()

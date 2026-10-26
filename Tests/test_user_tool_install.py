@@ -1,14 +1,18 @@
 import os
 import shutil
-import stat
 import subprocess
+import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if __name__ == "__main__":
+    sys.path.insert(0, str(ROOT))
+
+from Tests.installer_fixtures import InstallerCommandFixture
+
 AGENT_INSTALLER = ROOT / "scripts/install-agent-clis.sh"
 AGENT_TOOL_CONFIGURATOR = ROOT / "scripts/configure-agent-tools.sh"
 PYTHON_INSTALLER = ROOT / "scripts/install-python-tools.sh"
@@ -16,7 +20,7 @@ RUST_INSTALLER = ROOT / "scripts/install-rust.sh"
 SCRATCH = Path(os.environ.get("AGENCY_TEST_SCRATCH", ROOT / ".cache/tests"))
 
 
-class UserToolInstallTests(unittest.TestCase):
+class UserToolInstallTests(InstallerCommandFixture, unittest.TestCase):
     def setUp(self):
         SCRATCH.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=SCRATCH)
@@ -28,11 +32,6 @@ class UserToolInstallTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
-
-    def executable(self, name, source):
-        path = self.bin / name
-        path.write_text(textwrap.dedent(source).lstrip())
-        path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     def environment(self):
         return {

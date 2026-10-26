@@ -2,6 +2,7 @@
 
 import argparse
 import datetime as dt
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -13,6 +14,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_work_messages as messages
 
 ACTIVE_STATES = ("active", "waiting")
 TERMINAL_STATES = ("complete", "failed", "abandoned", "superseded")
@@ -62,18 +67,44 @@ def state_root():
         else Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
         / "agent-work"
     )
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
     return root
+
+
+SCHEMA_VERSION = 2
+CLAIM_IDLE_HOURS = 6
 
 
 def database():
     path = state_root() / "tasks.sqlite3"
     connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA foreign_keys=ON")
-    connection.executescript(
-        """
+    os.chmod(path, 0o600)
+    if connection.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        migrate_database(connection, path)
+    messages.provision_legacy(sys.modules[__name__], connection)
+    expire_claims(connection)
+    return connection
+
+
+def migrate_database(connection, path):
+    connection.execute("PRAGMA journal_mode=WAL")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+    if columns and any(name not in columns for name in ("owner", "latest_note")):
+        timestamp = utc_now().strftime("%Y%m%dT%H%M%S%fZ")
+        backup = sqlite3.connect(path.with_name(f"tasks.pre-migration-{timestamp}.sqlite3"))
+        try:
+            connection.backup(backup)
+        finally:
+            backup.close()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if connection.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+            connection.commit()
+            return
+        statements = """
         CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY,
             repo_id TEXT NOT NULL,
@@ -102,45 +133,128 @@ def database():
         );
         CREATE INDEX IF NOT EXISTS claims_path ON claims(path);
         CREATE INDEX IF NOT EXISTS tasks_repo_status ON tasks(repo_id, status);
+        CREATE TABLE IF NOT EXISTS ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """
-    )
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
-    missing = [name for name in ("owner", "latest_note") if name not in columns]
-    if missing:
-        timestamp = utc_now().strftime("%Y%m%dT%H%M%S%fZ")
-        backup = sqlite3.connect(
-            path.with_name(f"tasks.pre-migration-{timestamp}.sqlite3")
-        )
-        try:
-            connection.backup(backup)
-        finally:
-            backup.close()
-        connection.execute("BEGIN IMMEDIATE")
+        for statement in statements.split(';'):
+            if statement.strip():
+                connection.execute(statement)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
-        for name in missing:
+        for name in ("owner", "latest_note"):
             if name not in columns:
                 connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} TEXT")
+        connection.execute("""CREATE TABLE IF NOT EXISTS task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
+            occurred_at TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT, status TEXT, note TEXT,
+            details_json TEXT NOT NULL DEFAULT '{}')""")
+        connection.execute("CREATE INDEX IF NOT EXISTS task_events_task_time ON task_events(task_id,occurred_at,id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status)")
+        messages.schema(connection)
+        # Older cooperating binaries insert tasks without auth. Triggers queue
+        # those IDs; modern starts remove them when inserting their credentials.
+        connection.execute("""CREATE TRIGGER IF NOT EXISTS tasks_auth_pending_insert AFTER INSERT ON tasks
+            WHEN NEW.status IN ('active','waiting') AND NOT EXISTS (SELECT 1 FROM task_auth WHERE task_id=NEW.id)
+            BEGIN INSERT OR IGNORE INTO legacy_auth_pending VALUES(NEW.id); END""")
+        connection.execute("""CREATE TRIGGER IF NOT EXISTS tasks_auth_pending_update AFTER UPDATE OF status ON tasks
+            WHEN NEW.status IN ('active','waiting') AND NOT EXISTS (SELECT 1 FROM task_auth WHERE task_id=NEW.id)
+            BEGIN INSERT OR IGNORE INTO legacy_auth_pending VALUES(NEW.id); END""")
+        connection.execute("""CREATE TRIGGER IF NOT EXISTS tasks_auth_pending_clear AFTER INSERT ON task_auth
+            BEGIN DELETE FROM legacy_auth_pending WHERE task_id=NEW.task_id; END""")
+        connection.execute("""CREATE TRIGGER IF NOT EXISTS tasks_auth_pending_inactive AFTER UPDATE OF status ON tasks
+            WHEN NEW.status NOT IN ('active','waiting')
+            BEGIN DELETE FROM legacy_auth_pending WHERE task_id=NEW.id; END""")
+        connection.execute("""INSERT OR IGNORE INTO legacy_auth_pending
+            SELECT t.id FROM tasks t LEFT JOIN task_auth a ON a.task_id=t.id
+            WHERE a.task_id IS NULL AND t.status IN ('active','waiting')""")
+        messages.provision_legacy(sys.modules[__name__], connection, in_transaction=True)
+        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS task_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id TEXT NOT NULL REFERENCES tasks(id),
-            occurred_at TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            actor TEXT,
-            status TEXT,
-            note TEXT,
-            details_json TEXT NOT NULL DEFAULT '{}'
-        )
-        """
-    )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS task_events_task_time "
-        "ON task_events(task_id, occurred_at, id)"
-    )
-    connection.commit()
-    return connection
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+@lru_cache(maxsize=1)
+def boot_session():
+    if sys.platform == "linux":
+        try:
+            identity = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            match = re.search(r"^btime ([0-9]+)$", Path("/proc/stat").read_text(), re.M)
+            started = dt.datetime.fromtimestamp(int(match[1]), dt.UTC) if match else None
+            return identity or None, started
+        except OSError:
+            return None, None
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"],
+                                    text=True, capture_output=True, check=False)
+        except OSError:
+            return None, None
+        match = re.search(r"sec = ([0-9]+), usec = ([0-9]+)", result.stdout)
+        if result.returncode == 0 and match:
+            return match[0], dt.datetime.fromtimestamp(int(match[1]), dt.UTC)
+    return None, None
+
+
+def expire_claims(connection):
+    """Recheck under the writer lock so a concurrent heartbeat can renew claims."""
+    boot_id, boot_started = boot_session()
+    current = utc_now()
+    cutoff = iso_time(current - dt.timedelta(hours=CLAIM_IDLE_HOURS))
+
+    def candidates():
+        previous = connection.execute("SELECT value FROM ledger_meta WHERE key='boot_id'").fetchone()
+        reboot = bool(boot_id and previous and previous[0] != boot_id)
+        first_boot = iso_time(boot_started) if boot_id and not previous and boot_started else None
+        rows = connection.execute("""SELECT *, (? OR julianday(started_at)<julianday(?)) AS previous_boot
+            FROM tasks WHERE status IN ('active','waiting')
+            AND (? OR (julianday(started_at)<julianday(?)) OR julianday(heartbeat_at)<=julianday(?))""",
+            (reboot, first_boot, reboot, first_boot, cutoff)).fetchall()
+        return previous, rows
+
+    previous, rows = candidates()
+    if not rows and (not boot_id or (previous and previous[0] == boot_id)):
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        previous, rows = candidates()
+        h = sys.modules[__name__]
+        owned = claims_by_task(connection, [row["id"] for row in rows])
+        expired = {row["id"]: row for row in rows}
+        for row in rows:
+            from_previous_boot = bool(row["previous_boot"])
+            reason = "reboot" if from_previous_boot else "heartbeat-timeout"
+            summary = "Claims cleared after reboot" if from_previous_boot else "Claims expired after six hours without a task heartbeat"
+            connection.execute("UPDATE tasks SET status='abandoned',summary=? WHERE id=?", (summary, row["id"]))
+            append_event(connection, row["id"], "claims-expired", iso_time(current),
+                         status="abandoned", note=summary,
+                         details={"reason": reason, "claims": owned[row["id"]]})
+        cancelled = []
+        for repo_id in sorted({row["repo_id"] for row in rows}):
+            requests = connection.execute("""SELECT * FROM claim_requests
+                WHERE repo_id=? AND status IN ('pending','needs-review')""", (repo_id,)).fetchall()
+            for request in requests:
+                participants = {request["requester"], *(item["task_id"] for item in json.loads(request["snapshot_json"]))}
+                affected = participants.intersection(expired)
+                if affected:
+                    connection.execute("UPDATE claim_requests SET status='cancelled' WHERE id=?", (request["id"],))
+                    cancelled.append((request["id"], expired[min(affected)]))
+        if cancelled:
+            view = messages.RequestView(h, connection, [identity for identity, _ in cancelled])
+            for identity, sender in cancelled:
+                messages.request_notice(h, connection, sender,
+                                        messages.request_record(h, connection, identity, view=view), "request-cancelled")
+        for row in rows:
+            for table in ("claims", "claim_exclusions", "work_sessions"):
+                connection.execute(f"DELETE FROM {table} WHERE task_id=?", (row["id"],))
+            messages.claim_notice(h, connection, row, owned[row["id"]], "claim-released")
+        if boot_id:
+            connection.execute("INSERT OR REPLACE INTO ledger_meta VALUES('boot_id',?)", (boot_id,))
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    if rows:
+        messages.wake(connection)
 
 
 def git_value(cwd, *arguments):
@@ -184,6 +298,8 @@ def normalize_claim(root, value):
 
 
 def claims_overlap(first, second):
+    if first.startswith("/") != second.startswith("/"):
+        return False
     if first == "." or second == ".":
         return True
     return (
@@ -275,7 +391,7 @@ def append_event(
     )
 
 
-def serialize_task(connection, row, claims=None):
+def serialize_task(connection, row, claims=None, *, attention_view=None):
     now = utc_now()
     deadline = dt.datetime.fromisoformat(row["deadline_at"].replace("Z", "+00:00"))
     return {
@@ -302,12 +418,19 @@ def serialize_task(connection, row, claims=None):
         "summary": row["summary"],
         "checks": json.loads(row["checks_json"]),
         "changed": json.loads(row["changed_json"]),
+        "credential_file": str(messages.credential_path(sys.modules[__name__], row["id"]))
+            if (row["id"] in attention_view.authenticated if attention_view is not None else
+                connection.execute("SELECT 1 FROM task_auth WHERE task_id=?", (row["id"],)).fetchone()) else None,
+        "claim_protocol": 2,
+        **messages.attention(sys.modules[__name__], connection, row, view=attention_view),
     }
 
 
 def serialize_tasks(connection, rows):
-    claims = claims_by_task(connection, [row["id"] for row in rows])
-    return [serialize_task(connection, row, claims[row["id"]]) for row in rows]
+    with messages.read_snapshot(connection):
+        claims = claims_by_task(connection, [row["id"] for row in rows])
+        attention_view = messages.AttentionView(sys.modules[__name__], connection, rows)
+        return [serialize_task(connection, row, claims[row["id"]], attention_view=attention_view) for row in rows]
 
 
 def serialize_event(row):
@@ -324,7 +447,9 @@ def serialize_event(row):
 
 
 def emit(value, as_json):
-    if as_json:
+    task_value = isinstance(value, dict) and "seconds_remaining" in value
+    task_list = isinstance(value, list) and (not value or "seconds_remaining" in value[0])
+    if as_json or not (task_value or task_list):
         print(json.dumps(value, indent=2, sort_keys=True))
         return
     if isinstance(value, list):
@@ -344,6 +469,12 @@ def emit(value, as_json):
         print(f"  note      {value['latest_note']}")
     if value["summary"]:
         print(f"  summary   {value['summary']}")
+    if value["exclusions"]:
+        print(f"  excludes  {json.dumps(value['exclusions'])}")
+    if value["paused_scopes"]:
+        print(f"  paused    {json.dumps(value['paused_scopes'])}")
+    if value["unread_messages"] or value["pending_requests"]:
+        print(f"  attention {value['unread_messages']} unread · {len(value['pending_requests'])} pending requests")
 
 
 def human_duration(seconds):
@@ -373,9 +504,13 @@ def emit_table(tasks):
         print(f"{task['id']:<31} {task['status']:<10} {left:>8}  {owner:<18} {scope}")
         if task["latest_note"]:
             print(f"  ↳ {task['latest_note']}")
+        if task["exclusions"] or task["paused_scopes"]:
+            print(f"  ↳ exclusions {json.dumps(task['exclusions'])} · paused {json.dumps(task['paused_scopes'])}")
+        if task["unread_messages"] or task["pending_requests"]:
+            print(f"  ↳ {task['unread_messages']} unread · {len(task['pending_requests'])} pending requests")
 
 
-def find_conflicts(connection, repo_id, claims, exclude_task=None):
+def find_conflicts(connection, repo_id, claims, exclude_task=None, *, ownership=None):
     placeholders = ",".join("?" for _ in ACTIVE_STATES)
     parameters = [repo_id, *ACTIVE_STATES]
     query = f"""
@@ -387,9 +522,13 @@ def find_conflicts(connection, repo_id, claims, exclude_task=None):
         query += " AND t.id != ?"
         parameters.append(exclude_task)
     conflicts = []
+    requested = messages.ScopeIndex(claims)
+    if ownership is None:
+        ownership = messages.ownership_exclusions(connection, repo_id, exclude_task)
     for row in connection.execute(query, parameters):
-        for claim in claims:
-            if claims_overlap(claim, row["path"]):
+        for index in requested.overlapping(row["path"]):
+            claim = claims[index]
+            if messages.overlaps(sys.modules[__name__], connection, row["id"], row["path"], claim, ownership=ownership):
                 conflicts.append(
                     {
                         "task_id": row["id"],
@@ -430,8 +569,10 @@ def board_rows(connection, arguments, states, *, bounded=True):
 
 
 def command_start(arguments, as_json):
+    if bool(arguments.client) != bool(arguments.session):
+        fail("--client and --session must be supplied together", 2)
     root, common, repo_id, branch = repository(arguments.worktree)
-    claims = sorted({normalize_claim(root, value) for value in arguments.scope})
+    claims = sorted({normalize_claim(root, value) for value in arguments.scope or []})
     duration = parse_duration(arguments.timebox)
     now = utc_now()
     task_id = f"{slug(arguments.task)}-{secrets.token_hex(3)}"
@@ -504,11 +645,20 @@ def command_start(arguments, as_json):
         status="active",
         details={"claims": claims, "worktree": str(Path(arguments.worktree).resolve())},
     )
+    token = secrets.token_hex(32)
+    connection.execute("INSERT INTO task_auth(task_id,token_hash) VALUES(?,?)", (task_id, messages.token_hash(token)))
+    messages.save_credential(sys.modules[__name__], task_id, token)
+    if arguments.client and arguments.session:
+        messages.register_session(sys.modules[__name__], connection, task_record(connection, task_id), arguments.client, arguments.session)
+    messages.claim_notice(sys.modules[__name__], connection, task_record(connection, task_id), claims)
     connection.commit()
+    messages.wake(connection)
     record = serialize_task(connection, task_record(connection, task_id))
+    record["task_token"] = token
     emit(record, as_json)
     if not as_json:
         print(f"{DIM}export AGENT_WORK_ID={task_id}{RESET}")
+        print(f"export AGENT_WORK_TOKEN={token}")
 
 
 def command_claim(arguments, as_json):
@@ -523,11 +673,13 @@ def command_claim(arguments, as_json):
             fail("claim requires TASK_ID and at least one path", 2)
         task_id, *paths = arguments.values
     row = task_record(connection, task_id)
+    messages.authorize(sys.modules[__name__], connection, row, legacy=True)
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
         fail(f"cannot add write scope to {row['status']} task {row['id']}", 2)
     root = Path(row["repo_root"])
     claims = sorted({normalize_claim(root, value) for value in paths})
+    messages.assert_not_paused(sys.modules[__name__], connection, task_id, claims)
     conflicts = find_conflicts(connection, row["repo_id"], claims, row["id"])
     if conflicts:
         connection.rollback()
@@ -539,6 +691,7 @@ def command_claim(arguments, as_json):
                         "claim_kind": "write",
                         "read_allowed": True,
                         "conflicts": conflicts,
+                        "next_action": f"agent-work request-claim {task_id} {' '.join(claims)} --message REASON",
                     },
                     indent=2,
                 )
@@ -551,10 +704,7 @@ def command_claim(arguments, as_json):
                     file=sys.stderr,
                 )
         raise SystemExit(3)
-    connection.executemany(
-        "INSERT OR IGNORE INTO claims (task_id, path) VALUES (?, ?)",
-        [(row["id"], claim) for claim in claims],
-    )
+    messages.grant_paths(connection, row["id"], claims)
     append_event(
         connection,
         row["id"],
@@ -564,7 +714,9 @@ def command_claim(arguments, as_json):
         status=row["status"],
         details={"claims": claims},
     )
+    messages.claim_notice(sys.modules[__name__], connection, row, claims)
     connection.commit()
+    messages.wake(connection)
     emit(serialize_task(connection, task_record(connection, row["id"])), as_json)
 
 
@@ -572,6 +724,7 @@ def command_heartbeat(arguments, as_json):
     connection = database()
     connection.execute("BEGIN IMMEDIATE")
     row = task_record(connection, task_id_from(arguments))
+    messages.authorize(sys.modules[__name__], connection, row, legacy=True)
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
         fail(f"cannot heartbeat {row['status']} task {row['id']}", 2)
@@ -603,6 +756,7 @@ def command_finish(arguments, as_json):
     connection = database()
     connection.execute("BEGIN IMMEDIATE")
     row = task_record(connection, task_id_from(arguments))
+    messages.authorize(sys.modules[__name__], connection, row, legacy=True)
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
         fail(f"task {row['id']} is already {row['status']}", 2)
@@ -632,38 +786,37 @@ def command_finish(arguments, as_json):
         note=arguments.summary,
         details={"checks": arguments.check, "changed": arguments.changed},
     )
+    messages.finish_requests(sys.modules[__name__], connection, row)
+    messages.claim_notice(sys.modules[__name__], connection, row,
+                          claims_by_task(connection, [row['id']])[row['id']], "claim-released")
     connection.commit()
+    messages.wake(connection)
     emit(serialize_task(connection, task_record(connection, row["id"])), as_json)
 
 
 def command_status(arguments, as_json):
     connection = database()
-    if arguments.task_id or arguments.task_option:
-        emit(
-            serialize_task(
-                connection, task_record(connection, task_id_from(arguments))
-            ),
-            as_json,
-        )
-        return
-    states = (*ACTIVE_STATES, *TERMINAL_STATES) if arguments.all else ACTIVE_STATES
-    emit(
-        serialize_tasks(connection, board_rows(connection, arguments, states)), as_json
-    )
+    with messages.read_snapshot(connection):
+        if arguments.task_id or arguments.task_option:
+            result = serialize_task(connection, task_record(connection, task_id_from(arguments)))
+        else:
+            states = (*ACTIVE_STATES, *TERMINAL_STATES) if arguments.all else ACTIVE_STATES
+            result = serialize_tasks(connection, board_rows(connection, arguments, states))
+    emit(result, as_json)
 
 
 def command_inspect(arguments, as_json):
     connection = database()
-    if arguments.task_id or arguments.task_option:
-        emit(
-            serialize_task(
-                connection, task_record(connection, task_id_from(arguments))
-            ),
-            as_json,
-        )
+    with messages.read_snapshot(connection):
+        if arguments.task_id or arguments.task_option:
+            record = serialize_task(connection, task_record(connection, task_id_from(arguments)))
+            tasks = None
+        else:
+            states = (*ACTIVE_STATES, *TERMINAL_STATES) if arguments.all else ACTIVE_STATES
+            tasks = serialize_tasks(connection, board_rows(connection, arguments, states))
+    if tasks is None:
+        emit(record, as_json)
         return
-    states = (*ACTIVE_STATES, *TERMINAL_STATES) if arguments.all else ACTIVE_STATES
-    tasks = serialize_tasks(connection, board_rows(connection, arguments, states))
     if as_json or not sys.stdout.isatty() or not shutil.which("fzf"):
         emit(tasks, as_json)
         return
@@ -706,19 +859,21 @@ def command_inspect(arguments, as_json):
     )
     if selected.returncode == 0 and selected.stdout.strip():
         task_id = selected.stdout.split("\t", 1)[0]
-        emit(serialize_task(connection, task_record(connection, task_id)), False)
+        with messages.read_snapshot(connection):
+            record = serialize_task(connection, task_record(connection, task_id))
+        emit(record, False)
 
 
 def command_stale(arguments, as_json):
     cutoff = utc_now() - dt.timedelta(seconds=parse_duration(arguments.after))
     connection = database()
-    rows = board_rows(connection, arguments, ACTIVE_STATES, bounded=False)
+    with messages.read_snapshot(connection):
+        records = serialize_tasks(connection, board_rows(connection, arguments, ACTIVE_STATES, bounded=False))
     stale = []
-    for row in rows:
+    for record in records:
         heartbeat = dt.datetime.fromisoformat(
-            row["heartbeat_at"].replace("Z", "+00:00")
+            record["heartbeat_at"].replace("Z", "+00:00")
         )
-        record = serialize_task(connection, row)
         reasons = []
         if heartbeat < cutoff:
             reasons.append("heartbeat")
@@ -807,16 +962,19 @@ def parser():
         "start", help="register a timeboxed task and atomically claim write scope"
     )
     start.add_argument("--task", required=True, metavar="DESCRIPTION")
-    start.add_argument(
+    scope = start.add_mutually_exclusive_group(required=True)
+    scope.add_argument(
         "--scope",
         action="append",
-        required=True,
         help="path reserved for writes; repeatable; reads never require a claim",
     )
+    scope.add_argument("--no-claims", action="store_true", help="register a task before negotiating its first write claim")
     start.add_argument("--timebox", default="1h")
     start.add_argument("--worktree", default=os.getcwd())
     start.add_argument("--pid", type=int)
     start.add_argument("--owner", metavar="AGENT", help="task owner label")
+    start.add_argument("--client", choices=("codex", "claude", "pi"))
+    start.add_argument("--session", help="bind delivery to this client session")
     add_json_option(start)
     start.set_defaults(handler=command_start)
 
@@ -882,6 +1040,7 @@ def parser():
     )
     add_json_option(history)
     history.set_defaults(handler=command_history)
+    messages.parser(sys.modules[__name__], commands)
     return root
 
 

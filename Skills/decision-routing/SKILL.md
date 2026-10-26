@@ -48,6 +48,12 @@ Read the needed versioned definition with `profiles`'s `profile` argument or
 | `performance-design/pattern` | `observation` | Select a cost investigation without claiming a bottleneck or improvement. |
 | `pr-writing/impact` | `change` | Group verified changes by audience; check compatibility candidates against actual interfaces. |
 
+All profiles require a JSON object with their documented state fields. The
+version 2 `skill`, `context`, `update`, and `research` contracts reject legacy
+free text, arrays, and missing fields before credential or provider access.
+Migrate callers to the table's field names; do not infer missing context or
+silently wrap a whole transcript into an evidence field.
+
 Evidence fields are nonempty text. `evidence_complete` is a boolean about the
 particular criterion. `bands` maps 2–8 stable IDs to exact descriptors, including
 source band names and score ranges. IDs start with a letter and contain letters,
@@ -56,6 +62,13 @@ digits, underscores, or hyphens, at most 64 characters; `insufficient` and
 and use one shared runtime.
 
 ## Apply daily decisions
+
+Read [daily-use packets and rollout](references/daily-use.md) when preparing
+evidence for test ordering, failure triage, requirement coverage, claims,
+research, or PR/dependency review, or when evaluating a profile for regular use.
+It provides caller triggers and small JSON examples; use only the relevant
+packet. There is no per-turn quota and no requirement to call Jev on an obvious
+choice.
 
 Use `test-relevance` when a change has several plausible candidate tests and the
 relationship is semantic. Supply the changed behavior and each test's actual
@@ -121,7 +134,9 @@ repository.
 ## Review before acting
 
 Labels are advisory. Initially cross-check semantic judgments against evidence;
-reduce review only on evaluated contracts. Always inspect uncertainty,
+reduce review only for a specific evaluated profile and workload after measuring
+usefulness, including review overhead and repairs. Do not turn a probability
+threshold or aggregate accuracy into automatic action. Always inspect uncertainty,
 contradictions, incomplete evidence, hard constraints, and consequential
 boundaries. `scope` carries `review_required: true` because it can confuse
 explicit requests with implied supporting steps, even at high confidence.
@@ -156,6 +171,11 @@ receipts produce an incomplete count; redirected or filtered output can escape
 observation. Counts cover the current agent's observed results, not a guaranteed
 total across delegated workers.
 
+Use the [client acceptance matrix](references/client-acceptance.md) after
+changing client wiring or upgrading a client. Offline event tests, live
+provider calls, and observed client displays are separate checks; passing one
+does not establish the others.
+
 ## Learn from real corrections
 
 When personalizing, read compact rules, scope, exceptions, and review status in
@@ -176,6 +196,17 @@ input exits 2. Keep tuning and held-out cases separate, preserve failures, and
 report denominators and uncertainty. Increment versions when rubric meaning
 changes. Synthetic accuracy does not establish calibrated confidence or useful
 automation: measure accepted outcomes, elapsed time, reasoning cost, and repairs.
+Follow the [staged advisory rollout](references/daily-use.md#staged-advisory-rollout)
+for representative paired trials. The offline `trial-report` workflow summarizes
+supplied measurements; it does not run tasks or validate outcome judgements.
+Keep trial model revisions, profile versions, rubric hashes, workload IDs,
+reasoning-model IDs, and nullable reasoning-token measurements in the paired
+records. Use `by_cohort` for comparisons; legacy records without provenance
+remain explicitly unattributed. The
+[trial acceptance record](references/daily-use.md#record-a-paired-trial)
+keeps source evidence and evaluation status separate from synthetic coverage.
+Use the [CLI documentation](../../Tools/README.md#agency-decide) for evaluation,
+dry-run, and trial-report formats and limits.
 
 No decision evidence or labels are saved automatically. The usage hooks retain
 only bounded counts, timestamps, and opaque IDs in a private runtime directory
