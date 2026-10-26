@@ -1,10 +1,12 @@
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +115,39 @@ print('status passed')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "status passed\n")
         self.assertEqual(result.stderr, "↳ Fixture\n")
+
+
+class WebCommandDiagnosticsTests(unittest.TestCase):
+    def helper(self):
+        module = runpy.run_path(str(ROOT / "Tests/test_web_research.py"))
+        return module["WebResearchTests"]()
+
+    def test_failed_command_keeps_exception_and_bounded_output_context(self):
+        helper = self.helper()
+        failure = subprocess.CalledProcessError(
+            9, ["fixture"], output="stdout-head" + "x" * 5000 + "stdout-tail",
+            stderr="stderr-head" + "y" * 5000 + "stderr-tail",
+        )
+        with patch.object(subprocess, "run", side_effect=failure):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                helper.run_tool("scrape", environment={"FIXTURE": "1"})
+        self.assertIs(raised.exception, failure)
+        notes = "\n".join(getattr(failure, "__notes__", []))
+        self.assertIn("stdout-tail", notes)
+        self.assertIn("stderr-tail", notes)
+        self.assertNotIn("stdout-head", notes)
+        self.assertNotIn("stderr-head", notes)
+        self.assertLess(len(notes), 8500)
+
+    def test_success_and_unchecked_failure_pass_through(self):
+        helper = self.helper()
+        for status, check in ((0, True), (1, False)):
+            with self.subTest(status=status, check=check):
+                result = subprocess.CompletedProcess(["fixture"], status, "body", "context")
+                with patch.object(subprocess, "run", return_value=result) as launch:
+                    actual = helper.run_tool("scrape", check=check, environment={"FIXTURE": "1"})
+                self.assertIs(actual, result)
+                self.assertEqual(launch.call_args.kwargs["check"], check)
 
 
 if __name__ == "__main__":
