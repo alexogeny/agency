@@ -190,19 +190,64 @@ class ProcessInspectionTests(unittest.TestCase):
         self.assertEqual(list(helper.mapped_paths(encoded)), ['/a\\040b (deleted)'])
         self.assertEqual(list(helper.mapped_paths(encoded, decode_escapes=True)), ['/a b (deleted)'])
 
-    def test_imports_and_readers_work_from_isolated_cwd(self):
-        command = '''import importlib.machinery,importlib.util,sys
-for index,path in enumerate(sys.argv[1:]):
+    def run_isolated_imports(self):
+        self.process(cwd=self.watched)
+        command = '''import importlib.machinery,importlib.util,os,sys
+from pathlib import Path
+from unittest.mock import patch
+proc=Path(sys.argv[1])
+watched=sys.argv[2]
+original_scandir=os.scandir
+def mapped_path(value):
+ return proc if str(value)=='/proc' else Path(value)
+def mapped_scandir(value):
+ return original_scandir(proc if str(value)=='/proc' else value)
+for index,path in enumerate(sys.argv[3:]):
  loader=importlib.machinery.SourceFileLoader('isolated'+str(index),path)
  spec=importlib.util.spec_from_loader(loader.name,loader)
  module=importlib.util.module_from_spec(spec)
  loader.exec_module(module)
- if hasattr(module,'active_users'): assert module.active_users([])==[]
- if hasattr(module,'inspect_processes'): assert module.inspect_processes([])=={'blocked':{},'uninspected_processes':0}
+ with patch.object(module,'Path',side_effect=mapped_path,create=True), patch.object(os,'scandir',side_effect=mapped_scandir), patch.object(os,'getpid',return_value=900), patch.object(sys,'argv',['-c']):
+  if hasattr(module,'active_users'): assert module.active_users([watched])==['11 fixture']
+  if hasattr(module,'inspect_processes'):
+   result=module.inspect_processes([watched])
+   assert watched in result['blocked'] and 'cwd' in result['blocked'][watched]
+   assert result['uninspected_processes']==0
+  if hasattr(module,'read_process_file'): assert module.read_process_file(proc/'11/comm',text=True).strip()=='fixture'
 print('isolated imports passed')
 '''
-        result = subprocess.run([sys.executable, '-I', '-B', '-c', command, str(ROOT / 'Tools/agency-storage'),
+        return subprocess.run([sys.executable, '-I', '-B', '-c', command, str(self.proc), self.watched,
+                                 str(ROOT / 'Tools/agency-storage'),
                                  str(ROOT / 'Tools/housekeeping_projects.py'), str(ROOT / 'Tools/agency_processes.py')],
                                 cwd=self.root, text=True, capture_output=True)
+
+    def test_imports_and_readers_work_from_isolated_cwd(self):
+        result = self.run_isolated_imports()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('isolated imports passed', result.stdout)
+
+    def test_isolated_import_check_never_reads_host_processes(self):
+        original_run = subprocess.run
+
+        def guarded_run(arguments, **options):
+            arguments = list(arguments)
+            source = arguments.index('-c') + 1
+            guard = '''import os,pathlib
+original_iterdir=pathlib.Path.iterdir
+original_scandir=os.scandir
+def guarded_iterdir(path, original_iterdir=original_iterdir):
+ if str(path)=='/proc': raise PermissionError('host proc must not be inspected')
+ return original_iterdir(path)
+def guarded_scandir(path, original_scandir=original_scandir):
+ if os.fspath(path)=='/proc': raise PermissionError('host proc must not be inspected')
+ return original_scandir(path)
+pathlib.Path.iterdir=guarded_iterdir
+os.scandir=guarded_scandir
+'''
+            arguments[source] = guard + arguments[source]
+            return original_run(arguments, **options)
+
+        with patch.object(subprocess, 'run', side_effect=guarded_run):
+            result = self.run_isolated_imports()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('isolated imports passed', result.stdout)
