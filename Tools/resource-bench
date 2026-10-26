@@ -224,23 +224,27 @@ def launch_and_observe(launch, cwd, environment, cpu, sample_memory, interval_ms
     )
     if not sample_memory:
         stdout, stderr = process.communicate()
-        return process.returncode, stdout, stderr, []
-    memory_samples = []
-    sample = process_tree_memory(process.pid)
-    if sample:
-        memory_samples.append(sample)
+        return process.returncode, stdout, stderr, None
+    memory = {"rss": 0, "pss": 0, "processes": 0, "samples": 0}
+
+    def observe():
+        sample = process_tree_memory(process.pid)
+        if sample:
+            for field in ("rss", "pss", "processes"):
+                value = sample[field]
+                if value > memory[field]:
+                    memory[field] = value
+            memory["samples"] += 1
+
+    observe()
     while True:
         try:
             stdout, stderr = process.communicate(timeout=interval_ms / 1000)
             break
         except subprocess.TimeoutExpired:
-            sample = process_tree_memory(process.pid)
-            if sample:
-                memory_samples.append(sample)
-    sample = process_tree_memory(process.pid)
-    if sample:
-        memory_samples.append(sample)
-    return process.returncode, stdout, stderr, memory_samples
+            observe()
+    observe()
+    return process.returncode, stdout, stderr, memory
 
 
 def run_command(arm, spec_root, cpu, metrics, measured, sample_interval_ms):
@@ -278,7 +282,7 @@ def run_command(arm, spec_root, cpu, metrics, measured, sample_interval_ms):
     else:
         launch = command
     try:
-        returncode, stdout, stderr, memory_samples = launch_and_observe(
+        returncode, stdout, stderr, memory = launch_and_observe(
             launch,
             cwd,
             environment,
@@ -308,19 +312,15 @@ def run_command(arm, spec_root, cpu, metrics, measured, sample_interval_ms):
         if measured and perf_metrics:
             values.update(parse_perf(perf_path, perf_metrics))
         if measured and procfs_metrics:
-            if not memory_samples:
+            if not memory or not memory["samples"]:
                 fail(
                     "procfs recorded no memory sample; increase the workload "
                     "duration or use a workload-produced metric"
                 )
-            if perf_metrics and not any(
-                sample["processes"] > 1 for sample in memory_samples
-            ):
+            if perf_metrics and memory["processes"] <= 1:
                 fail("procfs never observed the measured child process")
             for metric in procfs_metrics:
-                values[metric["name"]] = max(
-                    sample[metric["field"]] for sample in memory_samples
-                )
+                values[metric["name"]] = memory[metric["field"]]
         if measured:
             if metrics_path and file_revision(metrics_path) == metrics_revision:
                 fail(
@@ -334,8 +334,8 @@ def run_command(arm, spec_root, cpu, metrics, measured, sample_interval_ms):
             "output_bytes": len(evidence),
             "output_source": evidence_source,
         }
-        if memory_samples:
-            observation["procfs_samples"] = len(memory_samples)
+        if memory and memory["samples"]:
+            observation["procfs_samples"] = memory["samples"]
         return observation
     finally:
         if perf_path and perf_path.exists():

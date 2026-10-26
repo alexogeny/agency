@@ -2944,6 +2944,12 @@ class PdfImage:
         def read_row():
             nonlocal block
             remaining = stride + 1
+            if not block:
+                block = memoryview(next(blocks, b""))
+            if len(block) >= remaining:
+                row = block[:remaining]
+                block = block[remaining:]
+                return row
             parts = []
             while remaining:
                 if not block:
@@ -2962,6 +2968,11 @@ class PdfImage:
                 encoded = read_row()
                 filter_type = encoded[0]
                 source = memoryview(encoded)[1:]
+                # Alpha extraction below needs contiguous bytearray slices for extend.
+                if filter_type == 0 and colour_type in (0, 2, 3) and len(source) == stride:
+                    yield source
+                    previous = source
+                    continue
                 row = bytearray(stride)
                 if filter_type == 0:
                     row[:len(source)] = source

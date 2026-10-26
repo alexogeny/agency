@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -92,7 +93,12 @@ def repository_root(path):
     return Path(value).resolve() if value else candidate
 
 
-def visible_files(root):
+def visible_files(root, scopes=()):
+    pathspecs = (
+        ["--", *(f":(top,literal){scope}" for scope in scopes)]
+        if scopes and "." not in scopes
+        else []
+    )
     output = run_git(
         root,
         "ls-files",
@@ -100,6 +106,7 @@ def visible_files(root):
         "--cached",
         "--others",
         "--exclude-standard",
+        *pathspecs,
         binary=True,
     )
     if output is not None:
@@ -140,15 +147,66 @@ def in_scope(path, scopes):
     )
 
 
-def read_file(root, relative):
+def read_up_to(handle, limit):
+    data = handle.read(limit)
+    if len(data) == limit:
+        return data
+    chunks = [data]
+    remaining = limit - len(data)
+    while remaining:
+        chunk = handle.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def read_file(root, relative, max_bytes=None):
     path = root / relative
     if path.is_symlink():
         data = os.readlink(path).encode()
-        kind = "symlink"
-    else:
+        return relative.as_posix(), data, "symlink", hashlib.sha256(data).hexdigest(), len(data)
+    if max_bytes is None:
         data = path.read_bytes()
-        kind = "file"
-    return relative.as_posix(), data, kind, hashlib.sha256(data).hexdigest()
+        return relative.as_posix(), data, "file", hashlib.sha256(data).hexdigest(), len(data)
+    with path.open("rb", buffering=0) as handle:
+        limit = max_bytes + 1
+        status = os.fstat(handle.fileno())
+        probe = min(limit, status.st_size) if stat.S_ISREG(status.st_mode) else limit
+        data = read_up_to(handle, probe)
+        if len(data) == probe and probe < limit:
+            extra = handle.read(1)
+            if extra:
+                data += extra + read_up_to(handle, limit - len(data) - 1)
+        size = len(data)
+        digest = hashlib.sha256(data)
+        if size <= max_bytes:
+            return relative.as_posix(), data, "file", digest.hexdigest(), size
+        # Oversized files need only the first line for suffix-free shebang detection.
+        first_line = (
+            [data]
+            if relative.suffix.lower() not in SOURCE_SUFFIXES and data.startswith(b"#!")
+            else None
+        )
+        data = b""
+        if first_line is not None:
+            boundary = re.search(b"[\r\n]", first_line[0])
+            if boundary:
+                data = first_line[0][:boundary.start()]
+                first_line = None
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+            if first_line is not None:
+                boundary = re.search(b"[\r\n]", chunk)
+                first_line.append(chunk[:boundary.start()] if boundary else chunk)
+                if boundary:
+                    data = b"".join(first_line)
+                    first_line = None
+        if first_line is not None:
+            data = b"".join(first_line)
+    return relative.as_posix(), data, "file", digest.hexdigest(), size
 
 
 def cache_database():
@@ -400,13 +458,13 @@ def manifest_facts(path, text):
     return facts
 
 
-def parse_facts(path, data, kind, max_bytes):
+def parse_facts(path, data, kind, max_bytes, file_size=None):
     language = file_language(path, data)
     facts = {"language": language, "roles": file_roles(path, language)}
     if kind == "symlink":
         facts["symlink_target"] = data.decode(errors="replace")
         return facts
-    if len(data) > max_bytes:
+    if (len(data) if file_size is None else file_size) > max_bytes:
         facts["parse_skipped"] = "size"
         return facts
     text = text_content(data)
@@ -424,7 +482,7 @@ def parse_facts(path, data, kind, max_bytes):
     return facts
 
 
-def cached_facts(connection, path, data, kind, digest, max_bytes, use_cache):
+def cached_facts(connection, path, data, kind, digest, max_bytes, use_cache, file_size=None):
     cache_digest = hashlib.sha256(
         f"{path}\0{kind}\0{digest}\0{max_bytes}".encode()
     ).hexdigest()
@@ -435,7 +493,7 @@ def cached_facts(connection, path, data, kind, digest, max_bytes, use_cache):
         ).fetchone()
         if row:
             return json.loads(row[0])
-    facts = parse_facts(path, data, kind, max_bytes)
+    facts = parse_facts(path, data, kind, max_bytes, file_size)
     if use_cache:
         connection.execute(
             "INSERT OR REPLACE INTO facts (digest, parser_version, facts_json) VALUES (?, ?, ?)",
@@ -449,7 +507,8 @@ def cached_facts(connection, path, data, kind, digest, max_bytes, use_cache):
 
 
 def build_map(root, scopes, max_bytes, use_cache):
-    paths = [path for path in visible_files(root) if in_scope(path, scopes)]
+    visible = visible_files(root, scopes) if scopes else visible_files(root)
+    paths = [path for path in visible if in_scope(path, scopes)]
     workers = min(32, (os.cpu_count() or 1) + 4)
     connection = cache_database() if use_cache else None
     files = []
@@ -457,17 +516,17 @@ def build_map(root, scopes, max_bytes, use_cache):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             for start in range(0, len(paths), workers):
                 batch = paths[start : start + workers]
-                for path, data, kind, digest in pool.map(
-                    lambda path: read_file(root, path), batch
+                for path, data, kind, digest, file_size in pool.map(
+                    lambda path: read_file(root, path, max_bytes), batch
                 ):
                     facts = cached_facts(
-                        connection, path, data, kind, digest, max_bytes, use_cache
+                        connection, path, data, kind, digest, max_bytes, use_cache, file_size
                     )
                     files.append(
                         {
                             "path": path,
                             "kind": kind,
-                            "bytes": len(data),
+                            "bytes": file_size,
                             "sha256": digest,
                             **facts,
                         }

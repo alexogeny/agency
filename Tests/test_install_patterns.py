@@ -103,7 +103,7 @@ agency_as_root() {
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, '')
                     self.assertEqual((target.lstat().st_ino, target.lstat().st_mtime_ns), identity)
-                    self.assertEqual(commands, ['mkdir'] if kind == 'agency_link_as_root' else [])
+                    self.assertEqual(commands, [])
 
     def test_missing_link_source_does_not_touch_target_or_run_privileged_commands(self):
         for kind in ('agency_link', 'agency_link_as_root'):
@@ -116,3 +116,33 @@ agency_as_root() {
                 self.assertEqual(target.read_text(), 'preserve')
                 self.assertEqual(commands, [])
                 self.assertFalse(self.backups.exists())
+
+
+class ManagedLinkCostTests(unittest.TestCase):
+    def test_existing_same_inode_links_need_no_filesystem_helpers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'source'
+            source.write_text('managed')
+            for hardlink in (False, True):
+                target = root / ('hardlink' if hardlink else 'symlink')
+                if hardlink:
+                    target.hardlink_to(source)
+                else:
+                    target.symlink_to(source)
+                identity = target.lstat()
+                for runner in ('agency_link', 'agency_link_as_root'):
+                    with self.subTest(hardlink=hardlink, runner=runner):
+                        command = '''set -euo pipefail
+source "$1/scripts/lib.sh"
+mkdir() { printf 'unexpected mkdir\\n' >&2; return 97; }
+dirname() { printf 'unexpected dirname\\n' >&2; return 98; }
+agency_as_root() { printf 'unexpected root command\\n' >&2; return 99; }
+"$2" "$3" "$4"
+'''
+                        result = subprocess.run(['/bin/bash', '-c', command, 'test', str(ROOT),
+                                                 runner, str(source), str(target)],
+                                                text=True, capture_output=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout + result.stderr, '')
+                        self.assertEqual(target.lstat(), identity)

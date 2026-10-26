@@ -6120,10 +6120,11 @@ async function commandScrape(args: string[]) {
       const input = pageCaptures.get(extracted);
       if (!input) throw new Error("page capture state is unavailable");
       input.frames = frames;
-      extracted = fusePageCapture(input);
-      pageCaptures.set(extracted, input);
       if (options.capture) {
         extracted = storedCapture(extracted, browser, frames);
+      } else if (frames.length) {
+        extracted = fusePageCapture(input);
+        pageCaptures.set(extracted, input);
       }
       return extracted;
     });

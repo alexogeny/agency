@@ -88,9 +88,10 @@ def call_tool(name, arguments):
     if set(arguments) != {'profile', 'state'}:
         raise DecisionError('Classify requires exactly profile and state.')
     build_request(arguments['state'], arguments['profile'])
-    if not key_available():
-        raise DecisionError('OpenRouter credential is not configured securely.')
-    key = _read_key()
+    try:
+        key = _read_key()
+    except DecisionError:
+        raise DecisionError('OpenRouter credential is not configured securely.') from None
     global _classifier
     if _classifier is None or _classifier.cli != CLI:
         close_classifier()

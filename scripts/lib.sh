@@ -88,12 +88,12 @@ agency_link_with_prefix() {
     return 1
   fi
 
-  # Only filesystem writes use the optional prefix; backup planning stays local.
-  "$@" mkdir -p "$(dirname -- "$target")"
   if [[ -e $target && $source -ef $target ]]; then
     return
   fi
 
+  # Only filesystem writes use the optional prefix; backup planning stays local.
+  "$@" mkdir -p "$(dirname -- "$target")"
   if [[ -e $target && ! -L $target ]]; then
     local backup
     agency_ensure_backup_root

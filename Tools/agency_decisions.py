@@ -275,6 +275,10 @@ def _check_json(value, depth=0):
 
 
 def build_request(state, profile):
+    return _prepare_request(state, profile)[0]
+
+
+def _prepare_request(state, profile):
     if type(profile) is not str or profile not in PROFILES:
         raise DecisionError('Unknown decision profile.')
     if type(state) not in (str, dict, list) or not state or (type(state) is str and not state.strip()):
@@ -317,9 +321,10 @@ def build_request(state, profile):
         'type': 'choice', 'instructions': rubric['question'] + ' ' + ADVISORY_INSTRUCTION,
         'criteria': labels,
     }}}
-    if len(json.dumps(request, ensure_ascii=False, allow_nan=False).encode('utf-8')) > MAX_REQUEST_BYTES:
+    encoded_request = json.dumps(request, ensure_ascii=False, allow_nan=False).encode('utf-8')
+    if len(encoded_request) > MAX_REQUEST_BYTES:
         raise DecisionError('Request exceeds the size limit.')
-    return request
+    return request, encoded_request
 
 
 def _json_pairs(pairs):
@@ -400,11 +405,10 @@ def _validate_response(payload, profile, labels=None):
 
 
 def evaluate(state, profile, api_key=None, timeout=10):
-    payload = build_request(state, profile)
+    payload, data = _prepare_request(state, profile)
     if not _number(timeout, minimum=0.1, maximum=30):
         raise DecisionError('Timeout must be between 0.1 and 30 seconds.')
     key = _read_key(api_key)
-    data = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8')
     request = urllib.request.Request(ENDPOINT, data=data, method='POST', headers={
         'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'Accept': 'application/json',
     })

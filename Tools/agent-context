@@ -129,7 +129,7 @@ def hidden_headings(data, offset):
     position = 0
     for raw_line in data.splitlines(keepends=True):
         line_end = position + len(raw_line)
-        if line_end > offset:
+        if line_end > offset and raw_line.startswith(b"#"):
             line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
             if line.startswith("#") and line.lstrip("#").startswith(" "):
                 headings.append(line)
@@ -175,7 +175,7 @@ def audit(target, codex_home):
             truncation = {
                 "path": str(path),
                 "byte_offset": included,
-                "line": data[:included].count(b"\n") + 1,
+                "line": data.count(b"\n", 0, included) + 1,
                 "headings_hidden": hidden_headings(data, included),
             }
         remaining -= included
