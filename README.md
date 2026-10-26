@@ -17,6 +17,12 @@ safe path from request to checked result.
 - **The global policy stays small.** `Agents/AGENTS.md` has an enforced 8 KiB
   budget. General rules remain always available; detailed procedures live in
   skills and load only for matching work.
+- **Interfaces follow the task.** Shared policy requires
+  [`interface-design`](Skills/interface-design/SKILL.md) for UI work: declarative
+  labels and actions, useful state and recovery guidance, and no slogans or
+  narration of the app's premise. Removing a control leaves no replacement
+  explanation. New web interfaces default to React, Tailwind, and Radix, with
+  typography and layout chosen for the content and no prescribed accent colour.
 - **Checks leave evidence.** Sandboxes, task ledgers, document manifests,
   benchmark samples, and PR checks make it harder for warm caches or stale
   output to impersonate success.
@@ -70,18 +76,47 @@ handoffs.
 
 ```console
 agent-work --json start --task "repair the parser" --scope src/parser \
-  --timebox 45m --owner codex-root
+  --timebox 45m --owner codex-root \
+  --acceptance "Reported input parses and regression checks pass"
 AGENT_WORK_TOKEN_FILE=CREDENTIAL agent-work --json heartbeat TASK_ID --agent codex-root \
   --note "focused tests passed; preparing integration"
 agent-work --json status --repo "$PWD"
 agent-work --json history TASK_ID
+```
+
+Use the `credential_file` returned by `start` for `CREDENTIAL`; it stays in
+private machine-local state. Execution mutations and checklist execution links
+need that task credential. `start --acceptance` also returns the root `todo_id`.
+
+Multi-step work also gets a persistent checklist with `agent-work todo`.
+Execution claims expire; obligations remain until verified or explicitly
+cancelled. Read the board before starting or resuming, create a root outcome
+with acceptance criteria, and give each delegated worker its own child item.
+The parent remains responsible for reconciling every child and integration check.
+
+```console
+agent-work todo list
+agent-work todo add "Verify integration" --parent TODO_ID \
+  --acceptance "Final combined checks pass" --owner codex-root --json
+agent-work todo update CHILD_TODO_ID --revision 1 --status done --evidence "Integration checks passed"
+agent-work todo update TODO_ID --revision 1 --status done --evidence "Reported input and final checks verified"
+agent-work todo check TODO_ID
 AGENT_WORK_TOKEN_FILE=CREDENTIAL agent-work --json finish TASK_ID --status complete \
   --agent codex-root --summary "parser repair verified" \
   --changed src/parser --check "focused parser tests passed"
 ```
 
-Use the `credential_file` returned by `start` for `CREDENTIAL`; it stays in
-private machine-local state. Each mutating command needs that task credential.
+The private SQLite ledger stays outside the checkout, so there is no task file
+to accidentally commit or add to `.gitignore`. Linked Git worktrees and local
+Codex, Claude, and Pi agents share the board; separate clones and machines do
+not synchronise. Revisions prevent silent overwrites. Closing a parent requires
+closed children and fresh evidence; an empty checklist cannot pass `todo check`.
+Installed hooks restore the checklist and remind on changes. Codex/Claude stop
+checks request continuation for runnable obligations linked to that session;
+`finish --status complete` also rejects linked unfinished work. Guidance and
+hooks are backstops: agents still need to record the actual requested scope and
+verify their evidence. See the [checklist workflow](Skills/coordinate/SKILL.md#keep-a-durable-checklist)
+and [CLI reference](Tools/README.md#persistent-checklists).
 
 This unlocks massively parallel work. Agents do not need branch and worktree
 choreography for every task. Use a worktree for a separate branch history, an

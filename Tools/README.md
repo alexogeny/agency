@@ -690,6 +690,75 @@ workstations.
 
 ## `agent-work`
 
+### Persistent checklists
+
+`agent-work todo` records durable obligations separately from expiring execution
+records and write claims. It uses the same private SQLite ledger at
+`${AGENT_WORK_STATE_DIR:-${XDG_STATE_HOME:-~/.local/state}/agent-work}/tasks.sqlite3`.
+No task state is written to the checkout. The repository's common Git directory
+identifies its board, so local agents and linked worktrees share it. Separate
+clones, machines, or state-directory overrides have independent boards.
+
+```console
+agent-work todo list --repo "$PWD" --json
+AGENT_WORK_TOKEN_FILE=CREDENTIAL agent-work todo add "Deliver the requested outcome" \
+  --acceptance "Concrete verification for the complete request" --work-task WORK_ID --owner codex-root --json
+agent-work todo add "Verify the integrated result" --parent ROOT_TODO_ID \
+  --acceptance "Final integration checks pass" --owner claude-worker --json
+agent-work todo show TODO_ID --json
+agent-work todo update TODO_ID --revision 1 --status active --note "Running the regression check"
+agent-work todo update TODO_ID --revision 2 --status blocked \
+  --note "Required access unavailable" --next-step "User connects the test account"
+agent-work todo update TODO_ID --revision 3 --status done --evidence "Exact check and its passed result"
+agent-work todo check ROOT_TODO_ID --json
+```
+
+`add` requires a nonempty title and acceptance criterion. `--parent` links a
+child within the same repository; parents cannot be changed, avoiding cycles.
+For new multi-step work, `start --task TITLE --scope PATH --acceptance CRITERIA`
+creates an execution and its linked root obligation in one transaction and
+returns `todo_id` alongside the execution ID. On resume or worker assignment,
+omit `--acceptance` and relink the existing item instead of creating a duplicate.
+`--owner` is a descriptive agent label. `--work-task` binds responsibility to an
+active execution in that repository and requires its credential. To resume an
+obligation after expiry, use `update --work-task NEW_WORK_ID --revision N` with
+the new execution's credential. Existing history and todo IDs remain intact.
+Updates to titles, acceptance, assignment, notes, state, and evidence are atomic
+and require the current revision. Exit 3 on revision conflict means reread and
+reconcile. All successful revisions are retained in `show --json` history;
+`--limit` bounds displayed events and rows without changing completion counts.
+
+| State | Required information | Completion behaviour |
+| --- | --- | --- |
+| `pending` | Acceptance criteria | Open obligation |
+| `active` | Current stage in the note when useful | Open obligation |
+| `blocked` | Blocker in `--note` and executable `--next-step` | Open; permits a handoff when no runnable items remain in the session tree |
+| `done` | Fresh `--evidence` of verification | All descendants must already be closed |
+| `cancelled` | Fresh `--evidence` of the user's scope removal | All descendants must already be closed |
+
+Reopen a parent before reopening or adding children. A user's pause can be
+recorded as a blocker with the instruction and next step; agents may not infer
+permission to pause or cancel. `todo check [ROOT_TODO_ID]` exits 3 for any open
+item in the selected tree (or whole repository), including blocked items, and
+for an empty selection. Unknown or cross-repository IDs fail. Human-readable
+output is a Markdown checklist; `--all` also shows closed items. The ledger
+records supplied evidence; it does not execute or independently certify it.
+
+Codex/Claude hooks inject bounded checklist previews on `SessionStart` and
+`UserPromptSubmit`, then on `PostToolUse` when the board revision changes.
+Previews clip long fields while the ledger retains them. `Stop` asks for
+continuation when pending/active items remain in that session's linked trees,
+including children assigned to other agents. An unrelated session's work does
+not block stopping. `stop_hook_active` prevents recursive continuation loops.
+Pi restores context before prompts, after compaction, and on changes; at settled
+boundaries it displays outstanding work without creating an automatic turn loop.
+The CLI independently rejects `finish --status complete` for linked open trees.
+This does not revive or extend claims. Disabled/untrusted hooks and unlinked
+work cannot enforce tracking. See [coordinate](../Skills/coordinate/SKILL.md)
+for the required prompt and delegation workflow.
+
+### Execution and write claims
+
 Coordinates parallel work across a repository and its Git worktrees with an
 atomic SQLite ledger under `~/.local/state/agent-work`. It creates unique
 scratch directories, rejects overlapping hierarchical write-scope claims, tracks

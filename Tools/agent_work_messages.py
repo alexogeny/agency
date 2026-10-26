@@ -19,6 +19,7 @@ import select
 import signal
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -1044,59 +1045,66 @@ def read_hook_payload(stream):
             pass
 
 
-def hook_main():
-    arguments = argparse.ArgumentParser(description="Deliver registered task inboxes at agent lifecycle boundaries")
-    arguments.add_argument("--client", required=True, choices=("codex", "claude", "pi"))
-    args = arguments.parse_args()
-    try:
-        payload = read_hook_payload(sys.stdin)
-        h = load_core()
-        if not (h.state_root() / "tasks.sqlite3").exists():
-            print("{}")
-            return 0
-        session_id = payload.get("session_id")
-        if not isinstance(session_id, str) or not 1 <= len(session_id) <= 256:
-            print("{}")
-            return 0
-        needed, registered = hook_activity(h, h.state_root() / "tasks.sqlite3", args.client, session_id, payload)
-        if not needed:
-            if payload.get("hook_event_name") == "DeliveryReceipt":
-                print(json.dumps({"delivered": False}))
-            else:
-                print(json.dumps({"registered": registered}) if args.client == "pi" and not payload.get("stop_hook_active") else "{}")
-            return 0
-        connection = h.database()
+def inbox_hook(h, args, payload, receipts):
+    if not (h.state_root() / "tasks.sqlite3").exists():
+        return {}
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not 1 <= len(session_id) <= 256:
+        return {}
+    needed, registered = hook_activity(h, h.state_root() / "tasks.sqlite3", args.client, session_id, payload)
+    if not needed:
+        if payload.get("hook_event_name") == "DeliveryReceipt":
+            return {"delivered": False}
+        return {"registered": registered} if args.client == "pi" and not payload.get("stop_hook_active") else {}
+    with closing(h.database()) as connection:
         connection.execute("BEGIN IMMEDIATE")
         if payload.get("hook_event_name") == "DeliveryReceipt":
             result = confirm_batch(h, connection, payload.get("batch_id"), args.client, session_id)
             connection.commit()
-            print(json.dumps({"delivered": result}))
-            return 0
+            return {"delivered": result}
         bind_hook(h, connection, args.client, session_id, payload)
         connection.execute("UPDATE work_sessions SET heartbeat_at=? WHERE client=? AND session_id=?", (now(h), args.client, session_id))
         if payload.get("stop_hook_active"):
             connection.commit()
-            print("{}")
-            return 0
+            return {}
         batch = reserve_batch(h, connection, args.client, session_id)
         connection.commit()
         if not batch:
             registered = bool(connection.execute("SELECT 1 FROM work_sessions WHERE client=? AND session_id=?", (args.client, session_id)).fetchone())
-            print(json.dumps({"registered": registered}) if args.client == "pi" else "{}")
-            return 0
+            return {"registered": registered} if args.client == "pi" else {}
         if args.client == "pi":
             batch["registered"] = True
-            print(json.dumps(batch), flush=True)
-            return 0
+            return batch
         event = payload.get("hook_event_name", "PostToolUse")
         if event == "Stop":
             output = {"decision": "block", "reason": batch["context"]}
         else:
             output = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": batch["context"]}}
+        receipts.append(batch["id"])
+        return output
+
+
+def hook_main():
+    arguments = argparse.ArgumentParser(description="Deliver inboxes and durable checklists at agent lifecycle boundaries")
+    arguments.add_argument("--client", required=True, choices=("codex", "claude", "pi"))
+    args = arguments.parse_args()
+    try:
+        payload = read_hook_payload(sys.stdin)
+        h = load_core()
+        receipts = []
+        inbox = inbox_hook(h, args, payload, receipts)
+        try:
+            reminder = h.todos.hook(h, payload, args.client)
+            output = h.todos.merge_hook(inbox, reminder, args.client, payload.get("hook_event_name", "PostToolUse"))
+        except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as error:
+            output = {**inbox, "systemMessage": f"Agency checklist unavailable: {error}"}
         print(json.dumps(output), flush=True)
-        connection.execute("BEGIN IMMEDIATE")
-        confirm_batch(h, connection, batch["id"], args.client, session_id)
-        connection.commit()
+        if receipts:
+            with closing(h.database()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for identity in receipts:
+                    confirm_batch(h, connection, identity, args.client, payload["session_id"])
+                connection.commit()
         return 0
     except (OSError, ValueError, RecursionError, sqlite3.Error) as error:
         print(json.dumps({"systemMessage": f"Agency inbox unavailable: {error}"}))

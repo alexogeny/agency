@@ -38,7 +38,7 @@ Give each worker a complete, narrow remit before spawning it:
 ```text
 Outcome: one concrete result
 Scope: exact files, subsystem, question, or data
-Inputs: only the context and artifacts needed
+Inputs: only the context and artifacts needed, including parent and child todo IDs
 May change: explicit paths or none
 Must not: adjacent work, commits, delegation, destructive or external actions
 Verify: exact checks or evidence expected
@@ -52,6 +52,74 @@ another worker's writes, or is too coupled to produce an independent result.
 
 ## Register before working
 
+### Keep a durable checklist
+
+For multi-step work, use `agent-work todo` for obligations as well as `start`
+for the current execution and write claims. The checklist is the source of truth
+for what remains; memory, chat plans, and heartbeat notes do not replace it.
+It lives in the private machine-local ledger outside Git and survives execution
+completion, six-hour claim expiry, reboots, compaction, and new sessions. Linked
+Git worktrees share one board; separate clones and machines do not synchronise.
+
+At startup or resume, run `agent-work todo list --repo "$PWD"`, then `todo show
+TODO_ID --json` for the relevant tree and recent evidence. Do not adopt unrelated
+open work merely because it appears on the board. After registering the current
+execution below, record the requested outcome and acceptance criteria before
+implementation, and create independently checkable children. For a new outcome,
+prefer `start --acceptance "criteria"`: it creates the execution and linked root
+obligation atomically and returns `todo_id`. Use `todo add` below when an execution
+already exists, or when adding another explicitly requested outcome:
+
+```console
+AGENT_WORK_TOKEN_FILE=CREDENTIAL agent-work todo add "Deliver the requested parser repair" \
+  --acceptance "Reported input parses correctly and focused regression checks pass" \
+  --owner codex-root --work-task WORK_ID --json
+agent-work todo add "Verify parser integration" --parent ROOT_TODO_ID \
+  --acceptance "Integration checks pass on the final combined diff" --owner codex-root --json
+```
+
+Use `--work-task` on `todo update` to link an existing item to a fresh execution
+after resuming; this needs that execution's credential. It replaces the old
+execution link without reviving expired claims or creating duplicate obligations.
+An owner label is descriptive and does not bind a client session. Register the
+actual execution session as described below so stop checks apply to its tree.
+
+Update at meaningful stages, on changed requirements, before compaction, and
+before handing back work. Every update requires the current `revision`, returned
+by `add`, `update`, or `show`; exit 3 means another update won. Reread and reconcile
+instead of blindly retrying with a newer number. History retains every revision.
+
+```console
+agent-work todo update TODO_ID --revision 1 --status active --note "Implementing regression fix"
+agent-work todo update TODO_ID --revision 2 --status blocked \
+  --note "Test service credentials unavailable" --next-step "User connects the test account"
+agent-work todo update TODO_ID --revision 3 --status done \
+  --evidence "Focused regression and final integration checks passed; commands and results recorded"
+agent-work todo check ROOT_TODO_ID --json
+```
+
+`done` requires fresh verification evidence; `cancelled` requires evidence of
+the user's scope removal. Neither can close a parent with open descendants.
+Reopen a closed parent before adding or reopening a child. `blocked` requires a
+specific blocker and next executable step and remains unfinished. Do not use it
+because the work is hard or a turn is ending. Only the user can authorise a pause
+or cancellation; record that instruction in the note/evidence. `todo check` exits
+3 for open obligations or an empty selection; display limits cannot hide them.
+
+Before delegating, create the child obligation and give its ID and parent ID to
+the worker. The worker links its execution, updates that item, and returns its
+evidence; the parent checks every child and separately verifies integration.
+Do not mark a parent complete merely because workers returned or the context
+window is nearly full. Record added obligations before pursuing them.
+
+Installed Codex/Claude hooks restore the board on session/prompt boundaries,
+remind on changed revisions, and request continuation at Stop for runnable items
+in that session's linked trees. Unrelated agents' trees do not block a session.
+The recursion guard permits an already continued Stop to return; this is a
+backstop, not proof of compliance. `finish --status complete` independently
+rejects linked open items, including blocked descendants. Disabled/untrusted
+hooks, unlinked work, and ignored guidance cannot provide this protection.
+
 Inspect active work first:
 
 ```console
@@ -63,12 +131,16 @@ timebox:
 
 ```console
 agent-work --json start --task "describe the outcome" \
-  --scope path/or/subsystem --timebox 45m --owner AGENT_NAME
+  --scope path/or/subsystem --timebox 45m --owner AGENT_NAME \
+  --acceptance "specific evidence that the complete requested outcome is satisfied"
 ```
 
 Use the returned task ID for later commands and the returned scratch directory
 for every temporary or exploratory artifact. Do not invent another scratch
 name. Supply `--pid` only when the persistent worker PID is actually known.
+Use the returned `todo_id` as the root checklist item. When resuming an existing
+todo or taking an assigned child, omit `--acceptance` and link that item with
+`todo update --work-task` instead of creating a duplicate root.
 
 New tasks return `credential_file` and a one-time `task_token`. Prefix each
 mutating command with `AGENT_WORK_TOKEN_FILE=RETURNED_CREDENTIAL_PATH`, or pass

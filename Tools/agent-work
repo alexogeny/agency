@@ -18,6 +18,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_work_messages as messages
+import agent_work_todos as todos
 
 ACTIVE_STATES = ("active", "waiting")
 TERMINAL_STATES = ("complete", "failed", "abandoned", "superseded")
@@ -72,7 +73,7 @@ def state_root():
     return root
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CLAIM_IDLE_HOURS = 6
 
 
@@ -149,6 +150,7 @@ def migrate_database(connection, path):
         connection.execute("CREATE INDEX IF NOT EXISTS task_events_task_time ON task_events(task_id,occurred_at,id)")
         connection.execute("CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status)")
         messages.schema(connection)
+        todos.schema(connection)
         # Older cooperating binaries insert tasks without auth. Triggers queue
         # those IDs; modern starts remove them when inserting their credentials.
         connection.execute("""CREATE TRIGGER IF NOT EXISTS tasks_auth_pending_insert AFTER INSERT ON tasks
@@ -571,6 +573,13 @@ def board_rows(connection, arguments, states, *, bounded=True):
 def command_start(arguments, as_json):
     if bool(arguments.client) != bool(arguments.session):
         fail("--client and --session must be supplied together", 2)
+    try:
+        acceptance = todos.text(arguments.acceptance, "acceptance", required=True)
+        if acceptance is not None:
+            todos.text(arguments.task, "task", required=True, limit=512)
+            todos.text(arguments.owner, "owner", limit=256)
+    except ValueError as error:
+        fail(str(error), 2)
     root, common, repo_id, branch = repository(arguments.worktree)
     claims = sorted({normalize_claim(root, value) for value in arguments.scope or []})
     duration = parse_duration(arguments.timebox)
@@ -648,6 +657,8 @@ def command_start(arguments, as_json):
     token = secrets.token_hex(32)
     connection.execute("INSERT INTO task_auth(task_id,token_hash) VALUES(?,?)", (task_id, messages.token_hash(token)))
     messages.save_credential(sys.modules[__name__], task_id, token)
+    todo = todos.create(sys.modules[__name__], connection, repo_id, arguments.task, acceptance,
+                        owner=arguments.owner, work_task=task_id) if acceptance is not None else None
     if arguments.client and arguments.session:
         messages.register_session(sys.modules[__name__], connection, task_record(connection, task_id), arguments.client, arguments.session)
     messages.claim_notice(sys.modules[__name__], connection, task_record(connection, task_id), claims)
@@ -655,6 +666,8 @@ def command_start(arguments, as_json):
     messages.wake(connection)
     record = serialize_task(connection, task_record(connection, task_id))
     record["task_token"] = token
+    if todo:
+        record["todo_id"] = todo["id"]
     emit(record, as_json)
     if not as_json:
         print(f"{DIM}export AGENT_WORK_ID={task_id}{RESET}")
@@ -760,6 +773,8 @@ def command_finish(arguments, as_json):
     if row["status"] not in ACTIVE_STATES:
         connection.rollback()
         fail(f"task {row['id']} is already {row['status']}", 2)
+    if arguments.status == "complete":
+        todos.guard_finish(sys.modules[__name__], connection, row["id"])
     now = iso_time(utc_now())
     connection.execute(
         """
@@ -973,6 +988,7 @@ def parser():
     start.add_argument("--worktree", default=os.getcwd())
     start.add_argument("--pid", type=int)
     start.add_argument("--owner", metavar="AGENT", help="task owner label")
+    start.add_argument("--acceptance", help="atomically create a linked durable root todo with these acceptance criteria")
     start.add_argument("--client", choices=("codex", "claude", "pi"))
     start.add_argument("--session", help="bind delivery to this client session")
     add_json_option(start)
@@ -1041,6 +1057,7 @@ def parser():
     add_json_option(history)
     history.set_defaults(handler=command_history)
     messages.parser(sys.modules[__name__], commands)
+    todos.parser(sys.modules[__name__], commands)
     return root
 
 

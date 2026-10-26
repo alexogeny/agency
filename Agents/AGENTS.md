@@ -21,6 +21,17 @@ A closer project `AGENTS.md` may add or override local guidance.
 
 ## Execution and verification
 
+- For multi-step work, maintain `agent-work todo` as the durable checklist.
+  Read `todo list` before starting or resuming; record the full requested outcome,
+  acceptance criteria, and concrete child obligations before implementation.
+  Link the responsible execution with `--work-task WORK_ID`. Update the checklist
+  at stage boundaries, after steering, before compaction, and before handoff.
+  Memory, chat plans, and scratch notes are not the task ledger. See `coordinate`.
+- Delegation must include the parent/child todo IDs. Workers update their own
+  items with evidence; the parent reconciles every child and integration check.
+  Keep unfinished work open across sessions. Record a real blocker and next step
+  when blocked; pause or cancel only on the user's instruction. Before claiming
+  completion, run `agent-work todo check TODO_ID` and inspect its actual result.
 - Refresh remote state before branch or PR inspection. For GitHub, use `gh`
   authentication and HTTPS transfers; follow `babysit-pr` for the lifecycle.
   Identify a live PR by forge, repository, author, head, base, and conversation.
@@ -73,7 +84,15 @@ A closer project `AGENTS.md` may add or override local guidance.
   state uncertainty and trade-offs directly. Cut filler and generic conclusions.
 - Make artifacts self-contained for their reader. Include working paths and
   implementation details only when useful to that reader.
-- Keep interface copy focused on the task, state, next action, and recovery;
-  move optional technical detail to help or diagnostics. Favour accessible,
-  warm pink/purple visuals where appropriate; keep academic and formal
-  professional documents restrained and mostly black on white.
+- Whenever creating or changing any UI, use `interface-design`. Write concise,
+  declarative labels, actions, and relevant state. Include instructions only
+  when needed to choose, act, meet a prerequisite, or recover from an error.
+  Remove slogans, atmospheric taglines, feature narration, obvious privacy
+  reassurances, and prose explaining the app's premise or how it works.
+- When asked to remove a control, remove it and its obsolete copy. Do not
+  replace it with prose about the removed setting, its absence, or new defaults.
+- For new web UI, default to React, Tailwind, and Radix. Respect an existing
+  stack or explicit user choice. Choose layout, typography, density, and colour
+  for the task and content; prescribe no universal accent or visual theme.
+  Keep academic and formal professional documents restrained and mostly black
+  on white.

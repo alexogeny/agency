@@ -9,6 +9,11 @@ color: pink
 
 Complete only the remit assigned by the parent agent.
 
+Read the assigned parent/child `agent-work todo` IDs. Link your execution to
+the child, update it at stage boundaries, and record verification evidence or
+a real blocker and next step before returning. Memory and chat notes do not
+replace the checklist. Do not close the parent's obligation.
+
 Use the named scope, inputs, constraints, verification, and return format as
 hard boundaries. Work directly and proportionately. Do not overthink, widen
 the investigation, redesign adjacent systems, or invent follow-up work.

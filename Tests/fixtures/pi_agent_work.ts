@@ -13,7 +13,7 @@ extension({ on: (name: string, fn: Function) => handlers.set(name, fn),
     sendMessage: (message: any, options: any) => received.push({ message, options }) } as any);
 const fire = async (event: string, value = {}) => {
     assert.ok(handlers.has(event));
-    await handlers.get(event)!(value, ctx);
+    return await handlers.get(event)!(value, ctx);
 };
 const tool = resolve(import.meta.dir, "../../Tools/agent-work");
 function run(args: string[], token = "") {
@@ -34,6 +34,17 @@ while (!received.some(item => item.message.content.includes(request.id)) && Date
 assert.ok(received.some(item => item.message.content.includes(request.id)), "Watcher must wake an idle Pi session");
 assert.ok(received.every(item => item.options.triggerTurn === true && item.options.deliverAs === "steer"));
 assert.ok(received.every(item => item.message.customType === "agency-work"));
+const prompt = await fire("before_agent_start", { systemPrompt: "Fixture prompt" });
+assert.ok(prompt?.message.content.includes("agent-work todo"), "Prompt boundary must restore checklist guidance");
+const todo = run(["todo", "add", "Complete Pi validation", "--acceptance", "Fixture checks pass",
+    "--work-task", owner.id], owner.task_token);
+await fire("tool_result", { content: [{ type: "text", text: JSON.stringify(todo) }] });
+assert.ok(received.some(item => item.message.customType === "agency-tasks" && item.message.content.includes(todo.id)),
+    "Changed checklist must enter the active context");
+assert.ok(received.filter(item => item.message.customType === "agency-tasks").every(item => item.options.triggerTurn === false),
+    "Checklist context must not create an automatic turn loop");
+const restored = await fire("before_agent_start", { systemPrompt: "Fixture prompt" });
+assert.ok(restored?.message.content.includes(todo.id), "New prompt must restore the unfinished obligation");
 await fire("session_shutdown");
 const count = received.length;
 run(["broadcast", worker.id, "--message", "Old session must stay asleep"], worker.task_token);
