@@ -46,11 +46,16 @@ def with_report(value):
 def receipts(value):
     found = {}
     complete = True
-    pending = [(value, 0)]
+    pending = [(iter((value,)), 0)]
     visits = 0
     parsed_bytes = 0
     while pending:
-        item, depth = pending.pop()
+        children, depth = pending[-1]
+        try:
+            item = next(children)
+        except StopIteration:
+            pending.pop()
+            continue
         visits += 1
         if depth > 12 or visits > 4096:
             complete = False
@@ -69,9 +74,9 @@ def receipts(value):
                     complete = False
                 # A batch receipt already accounts for its nested worker results.
                 continue
-            pending.extend((child, depth + 1) for child in item.values())
+            pending.append((reversed(item.values()), depth + 1))
         elif isinstance(item, list):
-            pending.extend((child, depth + 1) for child in item)
+            pending.append((reversed(item), depth + 1))
         elif isinstance(item, str) and MARKER in item:
             parsed_bytes += len(item)
             if parsed_bytes > 4 * MAX_INPUT:
@@ -82,8 +87,9 @@ def receipts(value):
             except (ValueError, RecursionError):
                 decoded = None
             if decoded is not None:
-                pending.append((decoded, depth + 1))
+                pending.append((iter((decoded,)), depth + 1))
             else:
+                decoded_lines = []
                 for line in item.splitlines():
                     if MARKER not in line or not line.lstrip().startswith(('{', '[')):
                         continue
@@ -92,7 +98,8 @@ def receipts(value):
                     except (ValueError, RecursionError):
                         complete = False
                         continue
-                    pending.append((decoded, depth + 1))
+                    decoded_lines.append(decoded)
+                pending.append((reversed(decoded_lines), depth + 1))
     return found, complete
 
 

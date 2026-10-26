@@ -109,14 +109,21 @@ class WebResearchTests(unittest.TestCase):
         return environment
 
     def run_tool(self, *arguments, check=True, environment=None, input=None):
-        return subprocess.run(
-            [str(TOOL), *map(str, arguments)],
-            check=check,
-            text=True,
-            capture_output=True,
-            env=environment or self.environment(),
-            input=input,
-        )
+        try:
+            return subprocess.run(
+                [str(TOOL), *map(str, arguments)],
+                check=check,
+                text=True,
+                capture_output=True,
+                env=environment or self.environment(),
+                input=input,
+            )
+        except subprocess.CalledProcessError as error:
+            error.add_note(
+                f"Captured stdout (last 4096 characters):\n{(error.stdout or '')[-4096:]}\n"
+                f"Captured stderr (last 4096 characters):\n{(error.stderr or '')[-4096:]}"
+            )
+            raise
 
     def fake_firefox(self):
         return self.executable(

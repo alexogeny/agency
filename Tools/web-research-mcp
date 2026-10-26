@@ -934,23 +934,45 @@ async function performFind(
     pattern: checkedString(item.pattern, `find[${index}].pattern`, 500),
   }));
   const pages = await loadPages(requests.map((item) => item.refId), evidence, profile);
-  const lineCache = new Map<string, string[]>();
-  const records: JsonObject[] = [];
-  const rendered: string[] = [];
-  for (const [index, result] of pages.entries()) {
-    const page = requirePage(result);
-    const { pattern } = requests[index];
-    const needle = pattern.toLocaleLowerCase();
-    let lines = lineCache.get(page.ref_id);
-    if (!lines) { lines = pageLines(page); lineCache.set(page.ref_id, lines); }
-    const matches: { line: string; lineno: number }[] = [];
-    let matchCount = 0;
+  const searches = requests.map(({ pattern }, index) => ({
+    page: requirePage(pages[index]),
+    pattern,
+    needle: pattern.toLocaleLowerCase(),
+    matches: [] as { line: string; lineno: number }[],
+    matchCount: 0,
+    citation: undefined as ReturnType<typeof pageCitation> | undefined,
+  }));
+  const groups: typeof searches[] = [];
+  if (searches.length === 1) groups.push(searches);
+  else {
+    const grouped = new Map<string, typeof searches>();
+    for (const search of searches) {
+      let group = grouped.get(search.page.ref_id);
+      if (!group) { group = []; grouped.set(search.page.ref_id, group); }
+      group.push(search);
+    }
+    groups.push(...grouped.values());
+  }
+  for (const group of groups) {
+    const page = group[0].page;
+    const lines = pageLines(page);
     for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
       const line = lines[lineIndex];
-      if (!line.toLocaleLowerCase().includes(needle)) continue;
-      matchCount++;
-      if (matches.length < 50) matches.push({ line, lineno: lineIndex + 1 });
+      const folded = line.toLocaleLowerCase();
+      for (let searchIndex = 0; searchIndex < group.length; searchIndex++) {
+        const search = group[searchIndex];
+        if (!folded.includes(search.needle)) continue;
+        search.matchCount++;
+        const matches = search.matches;
+        if (matches.length < 50) matches.push({ line, lineno: lineIndex + 1 });
+      }
     }
+    const citation = pageCitation(page);
+    for (const search of group) search.citation = citation;
+  }
+  const records: JsonObject[] = [];
+  const rendered: string[] = [];
+  for (const { page, pattern, matches, matchCount, citation } of searches) {
     const evidenceLines = matches.map(({ lineno }) => lineno);
     records.push({
       type: "find",
@@ -959,7 +981,7 @@ async function performFind(
       matches: matchCount,
       lines: evidenceLines,
       citation: {
-        ...pageCitation(page),
+        ...citation!,
         evidence_lines: evidenceLines,
       },
     });

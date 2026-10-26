@@ -253,7 +253,7 @@ Capture retention remains the separate `capture-gc` command above.
 
 ## Direct HTTP evidence
 
-`retrieve` processes up to 100 URLs sequentially and returns the
+`retrieve` processes up to 100 URLs, with up to four URLs in flight, and returns the
 `agency/web-retrieval/1` contract. Each successful result records the requested
 and final URLs, every redirect, HTTP status, content type, response size and
 SHA-256 digest, retrieval timing, live/cache state, provider, and URL-safety

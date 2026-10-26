@@ -2,9 +2,7 @@
 import argparse
 import os
 import shutil
-import subprocess
 import sys
-import tempfile
 import time
 
 
@@ -98,6 +96,8 @@ def exit_status(returncode):
 
 
 def run_command(arguments):
+    import subprocess
+
     command = arguments.command
     if command and command[0] == "--":
         command = command[1:]
@@ -123,6 +123,8 @@ def run_command(arguments):
         else:
             emit("error", arguments.failure, arguments.indent, elapsed)
         return exit_status(result.returncode)
+
+    import tempfile
 
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:

@@ -39,11 +39,11 @@ format_age() {
   hours=$(((seconds % 86400) / 3600))
   minutes=$(((seconds % 3600) / 60))
   if (( days > 0 )); then
-    printf '%dd %02dh' "$days" "$hours"
+    printf -v formatted_age '%dd %02dh' "$days" "$hours"
   elif (( hours > 0 )); then
-    printf '%dh %02dm' "$hours" "$minutes"
+    printf -v formatted_age '%dh %02dm' "$hours" "$minutes"
   else
-    printf '%dm' "$minutes"
+    printf -v formatted_age '%dm' "$minutes"
   fi
 }
 
@@ -80,7 +80,9 @@ rows=()
 while read -r pid ppid elapsed cpu memory state command; do
   (( elapsed >= minimum_age )) || continue
   [[ -z ${protected[$pid]+x} ]] || continue
-  rows+=("$(printf '%-8s  %8s  %6s  %6s  %-5s  %s' "$pid" "$(format_age "$elapsed")" "$cpu%" "$memory%" "$state" "$command")")
+  format_age "$elapsed"
+  printf -v row '%-8s  %8s  %6s  %6s  %-5s  %s' "$pid" "$formatted_age" "$cpu%" "$memory%" "$state" "$command"
+  rows+=("$row")
 done < <(ps -u "$(id -u)" -o pid=,ppid=,etimes=,pcpu=,pmem=,stat=,args= --sort=-etimes)
 
 if (( ${#rows[@]} == 0 )); then

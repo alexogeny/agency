@@ -289,6 +289,10 @@ def message_record(connection, identity):
     row = connection.execute("SELECT * FROM work_messages WHERE id=?", (identity,)).fetchone()
     deliveries = [dict(item) for item in connection.execute(
         "SELECT task_id,state,delivered_at,acknowledged_at,attempts FROM message_deliveries WHERE message_id=? ORDER BY task_id", (identity,))]
+    return _message_record(row, deliveries)
+
+
+def _message_record(row, deliveries):
     return {"id": row["id"], "kind": row["kind"], "sender": row["sender"], "body": json.loads(row["body_json"]),
             "request_id": row["request_id"], "created_at": row["created_at"],
             "recipients": [item["task_id"] for item in deliveries], "deliveries": deliveries}
@@ -371,6 +375,9 @@ def cycle_members(edges):
 
 @contextmanager
 def read_snapshot(connection):
+    if connection.in_transaction:
+        yield
+        return
     connection.execute("SAVEPOINT agent_work_read_snapshot")
     try:
         yield
@@ -587,14 +594,35 @@ def attention(h, connection, task, *, view=None):
 
 def inbox(connection, task_id, limit=50, include_acknowledged=False):
     clause = "" if include_acknowledged else "AND d.state IN ('queued','delivered')"
-    rows = connection.execute(f"""SELECT m.id,d.state,d.delivered_at,d.acknowledged_at FROM work_messages m
-        JOIN message_deliveries d ON d.message_id=m.id WHERE d.task_id=? {clause} ORDER BY m.seq LIMIT ?""", (task_id, limit))
-    result = []
-    for row in rows:
-        item = message_record(connection, row["id"])
-        item.update({key: row[key] for key in ("state", "delivered_at", "acknowledged_at")})
-        result.append(item)
-    return result
+    with read_snapshot(connection):
+        rows = connection.execute(f"""SELECT m.*,d.state,d.delivered_at,d.acknowledged_at FROM work_messages m
+            JOIN message_deliveries d ON d.message_id=m.id WHERE d.task_id=? {clause}
+            ORDER BY m.seq LIMIT ?""", (task_id, limit)).fetchall()
+        if len(rows) == 1:
+            row = rows[0]
+            deliveries = [dict(item) for item in connection.execute(
+                "SELECT task_id,state,delivered_at,acknowledged_at,attempts FROM message_deliveries WHERE message_id=? ORDER BY task_id",
+                (row["id"],))]
+            item = _message_record(row, deliveries)
+            item.update({key: row[key] for key in ("state", "delivered_at", "acknowledged_at")})
+            return [item]
+        deliveries = {row["id"]: [] for row in rows}
+        identities = list(deliveries)
+        # Stay below SQLite's historical 999-variable limit for large inboxes.
+        for offset in range(0, len(identities), 900):
+            batch = identities[offset:offset + 900]
+            placeholders = ','.join('?' for _ in batch)
+            for delivery in connection.execute(f"""SELECT message_id,task_id,state,delivered_at,
+                    acknowledged_at,attempts FROM message_deliveries
+                    WHERE message_id IN ({placeholders}) ORDER BY message_id,task_id""", batch):
+                deliveries[delivery["message_id"]].append({key: delivery[key] for key in
+                    ("task_id", "state", "delivered_at", "acknowledged_at", "attempts")})
+        result = []
+        for row in rows:
+            item = _message_record(row, deliveries[row["id"]])
+            item.update({key: row[key] for key in ("state", "delivered_at", "acknowledged_at")})
+            result.append(item)
+        return result
 
 
 def register_session(h, connection, task, client, session_id, capability="boundary", endpoint=None):

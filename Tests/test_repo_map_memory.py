@@ -34,13 +34,13 @@ class RepoMapMemoryTests(unittest.TestCase):
         cached_facts = GLOBALS["cached_facts"]
         invoke_callbacks = concurrent.futures.Future._invoke_callbacks
 
-        def read_file(root, path):
+        def read_file(root, path, max_bytes):
             data = RawPayload(b"x" * (1024 * 1024))
             with lock:
                 references.append(weakref.ref(data))
             if path == paths[9]:
                 second_batch_ready.set()
-            return str(path), data, "file", hashlib.sha256(data).hexdigest()
+            return str(path), data, "file", hashlib.sha256(data).hexdigest(), len(data)
 
         def observe_facts(*args):
             nonlocal peak
@@ -144,11 +144,11 @@ class RepoMapMemoryTests(unittest.TestCase):
         connection = unittest.mock.Mock()
         connection.execute.return_value.fetchone.return_value = None
 
-        def read_file(root, path):
+        def read_file(root, path, max_bytes):
             if path == paths[7]:
                 raise FileNotFoundError("disappeared file007.py")
             data = b"import os\n"
-            return str(path), data, "file", hashlib.sha256(data).hexdigest()
+            return str(path), data, "file", hashlib.sha256(data).hexdigest(), len(data)
 
         with patch.dict(GLOBALS, visible_files=lambda root: paths, read_file=read_file,
                         cache_database=lambda: connection):

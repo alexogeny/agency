@@ -23,7 +23,7 @@ class RepoMapCacheLifecycleTests(unittest.TestCase):
                 with patch.dict(
                     GLOBALS,
                     visible_files=lambda root: paths,
-                    read_file=lambda root, path: (str(path), b"", "file", "digest"),
+                    read_file=lambda root, path, maximum: (str(path), b"", "file", "digest", 0),
                     cached_facts=lambda *args: {"roles": []},
                     cache_database=lambda: connection,
                 ):
@@ -36,7 +36,7 @@ class RepoMapCacheLifecycleTests(unittest.TestCase):
             with self.subTest(phase=phase):
                 connection = Mock()
                 error = RuntimeError(f"{phase} failed")
-                reader = Mock(return_value=("file.py", b"", "file", "digest"))
+                reader = Mock(return_value=("file.py", b"", "file", "digest", 0))
                 parser = Mock(return_value={"roles": []})
                 if phase == "read":
                     reader.side_effect = error
@@ -79,11 +79,11 @@ class RepoMapCacheLifecycleTests(unittest.TestCase):
             connection.set_trace_callback(statements.append)
             return connection
 
-        def read_file(root, path):
+        def read_file(root, path, max_bytes):
             if path.name == "file006.py":
                 raise FileNotFoundError(path)
             data = b"import os\n"
-            return str(path), data, "file", hashlib.sha256(data).hexdigest()
+            return str(path), data, "file", hashlib.sha256(data).hexdigest(), len(data)
 
         with tempfile.TemporaryDirectory() as temporary:
             cache = Path(temporary)
