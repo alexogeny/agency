@@ -156,11 +156,28 @@ class StorageInstallTests(unittest.TestCase):
         installer = (ROOT / 'install.sh').read_text()
         self.assertLess(installer.index('agency_configure_storage\n'),
                         installer.index('\nagency_prepare_scratch\n'))
-        self.assertIn('"$AGENCY_DIR/Tools/agency-storage" "$HOME/.local/bin/agency-storage"',
-                      installer)
         dry_run = (ROOT / 'scripts/install-dry-run.sh').read_text()
         self.assertIn('agency_configure_storage --dry-run', dry_run)
-        self.assertIn('    agency-storage\n', dry_run)
+        command = '''set -euo pipefail
+AGENCY_DIR=$1
+AGENCY_PLATFORM=$2
+source "$1/scripts/lib.sh"
+source "$1/scripts/install-dry-run.sh"
+agency_user_links apply
+agency_plan_user_links
+'''
+        for platform in ('linux', 'macos'):
+            home = self.home / platform
+            result = subprocess.run(['bash', '-c', command, 'test', str(ROOT), platform],
+                                    env=dict(self.env, HOME=str(home)), text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            link = home / '.local/bin/agency-storage'
+            if platform == 'linux':
+                self.assertEqual(link.resolve(), ROOT / 'Tools/agency-storage')
+                self.assertIn(f'{link} -> {ROOT}/Tools/agency-storage', result.stdout)
+            else:
+                self.assertFalse(link.exists())
+                self.assertNotIn(f'{link} ->', result.stdout)
 
 
 if __name__ == '__main__':

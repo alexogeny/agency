@@ -196,7 +196,7 @@ def _thumbnail_check(root):
             os.close(descriptor)
 
 
-def _checked(item, mounts):
+def _checked(item, mounts, retention=None):
     raw = item.get('path')
     if not isinstance(raw, str) or not raw.startswith('/') or '..' in Path(raw).parts or str(Path(raw)) != raw:
         raise RuntimeError('Application cleanup requires a normalized absolute path')
@@ -227,7 +227,19 @@ def _checked(item, mounts):
         if action == 'web-profile':
             _whole_profile_reason(profile)
     elif action == 'codex-release':
-        current, rollback, version, platform = _codex_retention(path.parent.parent)
+        parent = path.parent.parent
+        if retention is None:
+            state = _codex_retention(parent)
+        else:
+            if parent not in retention:
+                try:
+                    retention[parent] = _codex_retention(parent)
+                except (OSError, RuntimeError, ValueError) as error:
+                    retention[parent] = error
+            state = retention[parent]
+            if isinstance(state, Exception):
+                raise state
+        current, rollback, version, platform = state
         match = RELEASE_NAME.fullmatch(path.name)
         if not match or match[4] != platform:
             raise RuntimeError('Unrecognized release version or platform; preserve it')
@@ -292,9 +304,10 @@ def pacman_preview(item, keep=2):
 def report_actions(items, *, selection=True):
     blocked, roots = {}, {}
     mounts = projects.mount_paths()
+    retention = {}
     for item in items:
         try:
-            path = _checked(item, mounts)
+            path = _checked(item, mounts, retention)
             root = str(Path(item['profile'])) if item.get('profile') else str(path)
             roots.setdefault(root, []).append(item['path'])
         except (OSError, RuntimeError, ValueError) as error:

@@ -566,6 +566,12 @@ def choose_projects(candidates, *, colour=True, initial_selected=(), refresh=Non
         candidates, colour=colour, initial_selected=initial_selected, refresh=refresh, notice=notice)
 
 
+def print_cleanup_output(process):
+    for output in (process.stdout, process.stderr):
+        if output.strip():
+            print('\n'.join(safe(line) for line in output.rstrip().splitlines()))
+
+
 def apply_cleanup(plan, *, colour=True):
     actions = list(plan['actions'])
     candidates = [dict(item, label=os.path.relpath(item['path'], plan.get('root', str(Path.home()))))
@@ -598,10 +604,16 @@ def apply_cleanup(plan, *, colour=True):
         return report
 
     def available():
-        return [dict(item, selectable=False, reason=readiness['blocked'][item['path']])
-                if item['path'] in readiness['blocked'] else
-                dict(item, selectable=True, reason='Availability and retention rechecked; choose explicitly.')
-                if item.get('refreshable') else dict(item) for item in candidates]
+        rows = []
+        for item in candidates:
+            if item['path'] in readiness['blocked']:
+                rows.append(dict(item, selectable=False, reason=readiness['blocked'][item['path']]))
+                continue
+            if item.get('refreshable'):
+                rows.append(dict(item, selectable=True, reason='Availability and retention rechecked; choose explicitly.'))
+                continue
+            rows.append(dict(item))
+        return rows
 
     def refresh():
         inspect(eligible)
@@ -673,9 +685,7 @@ def apply_cleanup(plan, *, colour=True):
                     process = run_cleanup_command(item, arguments, {**os.environ, **overrides})
                 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                     raise RuntimeError(f'{item["action"]} cleanup could not start; {completed} prior commands completed: {error}') from error
-                for output in (process.stdout, process.stderr):
-                    if output.strip():
-                        print('\n'.join(safe(line) for line in output.rstrip().splitlines()))
+                print_cleanup_output(process)
                 if process.returncode:
                     raise RuntimeError(f'{item["action"]} cleanup failed ({process.returncode}); {completed} prior commands completed. Remaining actions were not run.')
                 completed += 1
@@ -692,9 +702,7 @@ def apply_cleanup(plan, *, colour=True):
                     mutation_started = True
                     if item.get('provider'):
                         process = provider_helpers().execute(item)
-                        for output in (process.stdout, process.stderr):
-                            if output.strip():
-                                print('\n'.join(safe(line) for line in output.rstrip().splitlines()))
+                        print_cleanup_output(process)
                         if process.returncode:
                             raise RuntimeError(f'{item["action"]} cleanup failed ({process.returncode})')
                     else:

@@ -119,10 +119,9 @@ class BatchTests(unittest.TestCase):
             with patch.object(d, 'CLI', worker), self.assertRaises(d.DecisionError):
                 d._run_decision_worker(item('a'), 'private-key', 0.1)
             self.assertLess(time.monotonic() - started, 2)
-        with patch.object(d.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps(result()), '')) as run:
+        with patch.object(d.DecisionWorker, 'classify', return_value=result()) as classify:
             d._run_decision_worker(item('a'), 'private-key', 1)
-        self.assertNotIn('private-key', str(run.call_args.args))
-        self.assertEqual(run.call_args.kwargs['env']['OPENROUTER_API_KEY'], 'private-key')
+        self.assertEqual(classify.call_args.args, (item('a')['state'], 'context', 'private-key', 1))
 
     def test_evaluation_does_not_count_errors_as_correct_and_has_no_empty_pass(self):
         cases = {'items': [{**item('a'), 'expected': 'relevant'}, {**item('b', 'new'), 'expected': 'irrelevant'}]}

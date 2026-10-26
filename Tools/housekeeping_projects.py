@@ -2,12 +2,15 @@
 import os
 from pathlib import Path
 import re
+import runpy
 import secrets
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+
+process_helpers = runpy.run_path(str(Path(__file__).resolve().with_name('agency_processes.py')))
 
 FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 MAX_ITEMS = 128
@@ -173,9 +176,7 @@ def _git_check(path, root_fd):
 def _matching_roots(value, roots):
     if not value.startswith('/'):
         return
-    if value.endswith(' (deleted)'):
-        value = value[:-10]
-    value = os.path.normpath(value)
+    value = process_helpers['normalize_path'](value, collapse_dots=True)
     while value and value != '/':
         if value in roots:
             yield value
@@ -183,11 +184,7 @@ def _matching_roots(value, roots):
 
 
 def _read_process_file(path):
-    with open(path, 'rb') as handle:
-        value = handle.read(PROC_LIMIT + 1)
-    if len(value) > PROC_LIMIT:
-        raise OSError('Process inspection size limit exceeded')
-    return value
+    return process_helpers['read_process_file'](path, limit=PROC_LIMIT)
 
 
 def inspect_processes(roots, *, ignore_own_arguments=False):
@@ -233,7 +230,7 @@ def inspect_processes(roots, *, ignore_own_arguments=False):
             executable_name = None
             for name in ('cwd', 'exe'):
                 try:
-                    linked = os.readlink(process / name)
+                    linked = process_helpers['read_link'](process / name)
                     if name == 'cwd':
                         process_cwd = linked
                     else:
@@ -255,7 +252,7 @@ def inspect_processes(roots, *, ignore_own_arguments=False):
                             incomplete = True
                             break
                         try:
-                            record(os.readlink(descriptor.path), entry.name, 'open file')
+                            record(process_helpers['read_link'](descriptor.path), entry.name, 'open file')
                         except FileNotFoundError:
                             pass
                         except OSError:
@@ -271,11 +268,8 @@ def inspect_processes(roots, *, ignore_own_arguments=False):
                 try:
                     content = _read_process_file(process / name)
                     if name == 'maps':
-                        for line in content.splitlines():
-                            fields = line.split(None, 5)
-                            if len(fields) == 6:
-                                mapped = re.sub(rb'\\([0-7]{3})', lambda match: bytes([int(match[1], 8)]), fields[5])
-                                record(os.fsdecode(mapped), entry.name, 'mapped file')
+                        for mapped in process_helpers['mapped_paths'](content, decode_escapes=True):
+                            record(mapped, entry.name, 'mapped file')
                     elif name == 'environ':
                         for value in content.split(b'\0'):
                             if value.startswith(b'VIRTUAL_ENV='):

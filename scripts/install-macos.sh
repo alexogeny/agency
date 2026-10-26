@@ -1,11 +1,33 @@
 #!/usr/bin/env bash
 
+agency_brew_inventory_has() {
+  local inventory=$1 name=${2##*/}
+  case $'\n'"$inventory"$'\n' in
+    *$'\n'"$name"$'\n'*|*$'\n'*"/$name"$'\n'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 agency_install_macos_packages() {
-  local update=$1 package
+  local update=$1 package formula_inventory cask_inventory status
+  if formula_inventory=$(brew list --formula); then
+    :
+  else
+    status=$?
+    printf 'Homebrew formula inventory failed; no packages were changed.\n' >&2
+    return "$status"
+  fi
+  if cask_inventory=$(brew list --cask); then
+    :
+  else
+    status=$?
+    printf 'Homebrew cask inventory failed; no packages were changed.\n' >&2
+    return "$status"
+  fi
   local -a missing=() installed=()
   while IFS= read -r package; do
     [[ -n $package && $package != \#* ]] || continue
-    if brew list --formula "${package##*/}" >/dev/null 2>&1; then
+    if agency_brew_inventory_has "$formula_inventory" "$package"; then
       installed+=("$package")
     else
       missing+=("$package")
@@ -23,7 +45,7 @@ agency_install_macos_packages() {
 
   local name app
   while IFS='|' read -r name app; do
-    if brew list --cask "$name" >/dev/null 2>&1; then
+    if agency_brew_inventory_has "$cask_inventory" "$name"; then
       if $update; then
         brew upgrade --cask "$name"
       else

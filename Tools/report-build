@@ -2897,10 +2897,11 @@ class PdfImage:
     def read_png(self, data):
         position = 8
         chunks = {}
+        view = memoryview(data)
         while position + 12 <= len(data):
             length = struct.unpack_from(">I", data, position)[0]
             kind = data[position + 4 : position + 8]
-            value = data[position + 8 : position + 8 + length]
+            value = view[position + 8 : position + 8 + length]
             chunks.setdefault(kind, []).append(value)
             position += length + 12
             if kind == b"IEND":
@@ -2918,17 +2919,49 @@ class PdfImage:
         channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(colour_type)
         if not channels:
             raise ValueError(f"unsupported PNG colour type: {self.path.name}")
-        compressed = b"".join(chunks.get(b"IDAT", []))
-        decoded = zlib.decompress(compressed)
         stride = self.width * channels
+
+        def decoded_blocks():
+            decoder = zlib.decompressobj()
+            for compressed in chunks.get(b"IDAT", []):
+                for start in range(0, len(compressed), 65536):
+                    pending = compressed[start : start + 65536]
+                    while True:
+                        block = decoder.decompress(pending, 65536)
+                        if block:
+                            yield block
+                        if decoder.eof:
+                            return
+                        pending = decoder.unconsumed_tail
+                        if not pending and len(block) < 65536:
+                            break
+            if not decoder.eof:
+                raise zlib.error("Error -5 while decompressing data: incomplete or truncated stream")
+
+        blocks = iter(decoded_blocks())
+        block = memoryview(b"")
+
+        def read_row():
+            nonlocal block
+            remaining = stride + 1
+            parts = []
+            while remaining:
+                if not block:
+                    block = memoryview(next(blocks, b""))
+                    if not block:
+                        break
+                taken = remaining if remaining <= len(block) else len(block)
+                parts.append(block[:taken])
+                block = block[taken:]
+                remaining -= taken
+            return b"".join(parts)
 
         def reconstructed_rows():
             previous = bytearray(stride)
-            offset = 0
             for _ in range(self.height):
-                filter_type = decoded[offset]
-                source = decoded[offset + 1 : offset + 1 + stride]
-                offset += stride + 1
+                encoded = read_row()
+                filter_type = encoded[0]
+                source = memoryview(encoded)[1:]
                 row = bytearray(stride)
                 if filter_type == 0:
                     row[:len(source)] = source
@@ -2967,7 +3000,26 @@ class PdfImage:
         transparency = b"".join(chunks.get(b"tRNS", []))
         rgb = bytearray()
         alpha = bytearray()
-        for row in reconstructed_rows():
+        rows = reconstructed_rows()
+        try:
+            self.read_png_rows(rows, colour_type, palette, transparency, rgb, alpha)
+        finally:
+            # zlib validates the complete stream before row errors in the original
+            # decoder, including streams with extra data beyond the declared rows.
+            for _ in blocks:
+                pass
+        self.colour_space = "/DeviceRGB"
+        self.bits = 8
+        self.data = rgb
+        self.alpha = (
+            alpha
+            if alpha and (alpha[0] != 255 or alpha.count(255) != len(alpha))
+            else b""
+        )
+        self.filter = "/FlateDecode"
+
+    def read_png_rows(self, rows, colour_type, palette, transparency, rgb, alpha):
+        for row in rows:
             if colour_type == 2:
                 rgb.extend(row)
                 continue
@@ -2996,15 +3048,6 @@ class PdfImage:
                     raise ValueError(f"invalid PNG palette: {self.path.name}")
                 rgb.extend(palette[palette_start : palette_start + 3])
                 alpha.append(transparency[index] if index < len(transparency) else 255)
-        self.colour_space = "/DeviceRGB"
-        self.bits = 8
-        self.data = bytes(rgb)
-        self.alpha = (
-            bytes(alpha)
-            if alpha and (alpha[0] != 255 or alpha.count(255) != len(alpha))
-            else b""
-        )
-        self.filter = "/FlateDecode"
 
     def read_jpeg(self, data):
         position = 2
@@ -3196,6 +3239,7 @@ class NativePdfRenderer:
 
     def compact_spans(self, spans):
         compact = []
+        fragments = []
         for span in spans:
             text = re.sub(r"\s+", " ", span["text"])
             if not text:
@@ -3205,9 +3249,14 @@ class NativePdfRenderer:
                 compact[-1].get(key) == value.get(key)
                 for key in ("style", "link")
             ):
-                compact[-1]["text"] += text
+                fragments.append(text)
             else:
+                if compact:
+                    compact[-1]["text"] = "".join(fragments)
                 compact.append(value)
+                fragments = [text]
+        if compact:
+            compact[-1]["text"] = "".join(fragments)
         return compact
 
     def span_units(self, spans):
@@ -3340,22 +3389,35 @@ class NativePdfRenderer:
         self.y -= after
 
     def inline_spans(self, node, style="regular", link=None):
-        spans = []
-        for child in node.children:
-            if isinstance(child, str):
-                spans.append({"text": child, "style": style, "link": link})
-                continue
-            child_style = style
-            if child.tag in {"strong", "b"}:
-                child_style = "bolditalic" if style == "italic" else "bold"
-            elif child.tag in {"em", "i"}:
-                child_style = "bolditalic" if style == "bold" else "italic"
-            child_link = child.attrs.get("href", link) if child.tag == "a" else link
-            if child.tag == "br":
-                spans.append({"text": " ", "style": style, "link": link})
-            else:
-                spans.extend(self.inline_spans(child, child_style, child_link))
-        return self.compact_spans(spans)
+        def leaves(child, parent_style, parent_link):
+            stack = [(child, parent_style, parent_link)]
+            while stack:
+                child, child_style, child_link = stack.pop()
+                if isinstance(child, str):
+                    yield {"text": child, "style": child_style, "link": child_link}
+                    continue
+                if child.tag == "br":
+                    yield {"text": " ", "style": child_style, "link": child_link}
+                    continue
+                if child.tag in {"strong", "b"}:
+                    child_style = "bolditalic" if child_style == "italic" else "bold"
+                elif child.tag in {"em", "i"}:
+                    child_style = "bolditalic" if child_style == "bold" else "italic"
+                if child.tag == "a":
+                    child_link = child.attrs.get("href", child_link)
+                stack.extend((value, child_style, child_link) for value in reversed(child.children))
+
+        def spans():
+            for child in node.children:
+                values = leaves(child, style, link)
+                # A parent's normalization collapses whitespace inside each child's
+                # runs, but preserves whitespace at boundaries between children.
+                if isinstance(child, str) or child.tag == "br":
+                    yield from values
+                else:
+                    yield from self.compact_spans(values)
+
+        return self.compact_spans(spans())
 
     def text_content(self, node):
         return "".join(
@@ -3517,6 +3579,42 @@ class NativePdfRenderer:
             found.extend(self.find_all(child, tag))
         return found
 
+    def render_heading(self, node, classes):
+        level = int(node.tag[1])
+        if "cover-title" in classes:
+            size = self.settings["title"]["size_pt"]
+            before = 0
+            after = self.base_size * 1.2
+            align = self.settings["title"]["alignment"]
+        elif "cover-label" in classes:
+            size = self.base_size
+            before = (
+                self.base_size * 6
+                if "cover-author-label" in classes
+                else self.base_size * 1.4
+            )
+            after = self.base_size * 0.4
+            align = "center"
+        else:
+            size = {
+                1: self.settings["title"]["size_pt"],
+                2: self.base_size * 1.36,
+                3: self.base_size * 1.18,
+                4: self.base_size * 1.09,
+            }.get(level, self.base_size)
+            before = self.settings["heading_spacing_pt"]["before"]
+            after = self.settings["heading_spacing_pt"]["after"]
+            align = "left"
+        self.write_spans(
+            self.inline_spans(node, "bold"),
+            size=size,
+            before=before,
+            after=after,
+            colour=(0, 0, 0),
+            destination=node.attrs.get("id"),
+            align=align,
+        )
+
     def render_node(self, node):
         if isinstance(node, str):
             return
@@ -3544,40 +3642,7 @@ class NativePdfRenderer:
         if node.tag == "section" and "page-break" in classes:
             self.page_break()
         if node.tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-            level = int(node.tag[1])
-            if "cover-title" in classes:
-                size = self.settings["title"]["size_pt"]
-                before = 0
-                after = self.base_size * 1.2
-                align = self.settings["title"]["alignment"]
-            elif "cover-label" in classes:
-                size = self.base_size
-                before = (
-                    self.base_size * 6
-                    if "cover-author-label" in classes
-                    else self.base_size * 1.4
-                )
-                after = self.base_size * 0.4
-                align = "center"
-            else:
-                size = {
-                    1: self.settings["title"]["size_pt"],
-                    2: self.base_size * 1.36,
-                    3: self.base_size * 1.18,
-                    4: self.base_size * 1.09,
-                }.get(level, self.base_size)
-                before = self.settings["heading_spacing_pt"]["before"]
-                after = self.settings["heading_spacing_pt"]["after"]
-                align = "left"
-            self.write_spans(
-                self.inline_spans(node, "bold"),
-                size=size,
-                before=before,
-                after=after,
-                colour=(0, 0, 0),
-                destination=node.attrs.get("id"),
-                align=align,
-            )
+            self.render_heading(node, classes)
             return
         if node.tag == "p":
             cover_text = bool(

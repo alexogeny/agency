@@ -2,10 +2,14 @@
 import json
 from pathlib import Path
 import subprocess
+import signal
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from agency_decisions import DecisionError, PROFILES, build_request, evaluate_batch, key_available
+from agency_decisions import (
+    DecisionError, DecisionTimeout, DecisionWorker, PROFILES,
+    _read_key, build_request, cancel_workers, evaluate_batch, key_available,
+)
 from agency_decision_usage import with_report
 
 
@@ -86,25 +90,25 @@ def call_tool(name, arguments):
     build_request(arguments['state'], arguments['profile'])
     if not key_available():
         raise DecisionError('OpenRouter credential is not configured securely.')
+    key = _read_key()
+    global _classifier
+    if _classifier is None or _classifier.cli != CLI:
+        close_classifier()
+        _classifier = DecisionWorker(CLI)
     try:
-        completed = subprocess.run(
-            [sys.executable, str(CLI), 'classify', '--profile', arguments['profile'], '--input', '-'],
-            input=json.dumps(arguments['state'], ensure_ascii=False, allow_nan=False),
-            text=True, capture_output=True, timeout=CLASSIFY_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
+        return _classifier.classify(arguments['state'], arguments['profile'], key, CLASSIFY_TIMEOUT)
+    except DecisionTimeout:
         raise DecisionError('Classification exceeded the 10 second deadline.') from None
-    except OSError:
-        raise DecisionError('Classification worker could not start.') from None
-    if completed.returncode:
-        raise DecisionError('Classification failed; check credential configuration and provider availability.')
-    try:
-        result = json.loads(completed.stdout)
-    except (ValueError, RecursionError):
-        raise DecisionError('Classification worker returned invalid JSON.') from None
-    if type(result) is not dict or result.get('advisory') is not True:
-        raise DecisionError('Classification worker returned an invalid result.')
-    return result
+
+
+_classifier = None
+
+
+def close_classifier():
+    global _classifier
+    if _classifier is not None:
+        _classifier.close(force=True)
+        _classifier = None
 
 
 def protocol_error(request_id, code, message):
@@ -168,7 +172,7 @@ def reject_constant(value):
     raise ValueError('Invalid number')
 
 
-def serve(source, destination):
+def _serve(source, destination):
     while True:
         line = source.readline(MAX_LINE_BYTES + 1)
         if not line:
@@ -194,7 +198,20 @@ def serve(source, destination):
             destination.flush()
 
 
+def serve(source, destination):
+    try:
+        return _serve(source, destination)
+    finally:
+        close_classifier()
+
+
+def terminate(_signum, _frame):
+    cancel_workers()
+    raise SystemExit(0)
+
+
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, terminate)
     try:
         serve(sys.stdin.buffer, sys.stdout)
     except (BrokenPipeError, KeyboardInterrupt):

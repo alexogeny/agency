@@ -116,66 +116,7 @@ agency_plan_git() {
 }
 
 agency_plan_user_links() {
-  local tool skill_dir skill_name
-  local -a tools=(
-    agency-ui
-    agency-browser
-    agency-decide
-    agency-decide-mcp
-    agency-decision-usage
-    agency-storage
-    housekeeping
-    git-get
-    long-processes
-    sandbox
-    agent-work
-    agent-context
-    comment-audit
-    docs-exec
-    document-inspect
-    evidence-review
-    instruction-bench
-    resource-bench
-    perf-diagnose
-    repo-map
-    repository-setup
-    report-build
-    system-context
-    sudo-gui
-    web-research
-    web-research-mcp
-  )
-
-  for tool in "${tools[@]}"; do
-    if [[ ${AGENCY_PLATFORM:-linux} == macos ]]; then
-      case $tool in
-        agency-storage|housekeeping|long-processes|instruction-bench|resource-bench|perf-diagnose) continue ;;
-      esac
-    fi
-    agency_plan_link "$AGENCY_DIR/Tools/$tool" "$HOME/.local/bin/$tool"
-  done
-  if [[ ${AGENCY_PLATFORM:-linux} == linux ]]; then
-    agency_plan_link "$AGENCY_DIR/Tools/housekeeping" "$HOME/.local/bin/cleanup"
-  fi
-  agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
-  agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.claude/CLAUDE.md"
-  agency_plan_link "$AGENCY_DIR/Agents/AGENTS.md" "$HOME/.pi/agent/AGENTS.md"
-  agency_plan_link "$AGENCY_DIR/Agents/pi/agency-web.ts" \
-    "$HOME/.pi/agent/extensions/agency-web.ts"
-  agency_plan_link "$AGENCY_DIR/Agents/pi/agency-decisions.ts" \
-    "$HOME/.pi/agent/extensions/agency-decisions.ts"
-  agency_plan_link "$AGENCY_DIR/Agents/codex/coordinated-worker.toml" \
-    "$HOME/.codex/agents/coordinated-worker.toml"
-  agency_plan_link "$AGENCY_DIR/Agents/claude/coordinated-worker.md" \
-    "$HOME/.claude/agents/coordinated-worker.md"
-
-  for skill_dir in "$AGENCY_DIR"/Skills/*; do
-    [[ -d $skill_dir ]] || continue
-    skill_name=${skill_dir##*/}
-    agency_plan_link "$skill_dir" "$HOME/.agents/skills/$skill_name"
-    agency_plan_link "$skill_dir" "$HOME/.claude/skills/$skill_name"
-    agency_plan_link "$skill_dir" "$HOME/.pi/agent/skills/$skill_name"
-  done
+  agency_user_links preview
 
   agency_plan_hook_merge "$AGENCY_DIR/config/codex/hooks.json" "$HOME/.codex/hooks.json"
   agency_plan_hook_merge "$AGENCY_DIR/config/claude/hooks.json" "$HOME/.claude/settings.json"

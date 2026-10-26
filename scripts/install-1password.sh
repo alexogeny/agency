@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+script_directory=${BASH_SOURCE[0]%/*}
+[[ $script_directory != "${BASH_SOURCE[0]}" ]] || script_directory=.
+source "$script_directory/lib.sh"
 
-update=false
 onepassword_revision=e323d0d1f8dea6b75bb651ce14acc73904cd0326
 onepassword_cli_revision=b0d208821677a5dbb883a8b92f06a5c92b9e861a
-case ${1:-} in
-  --update) update=true ;;
-  "") ;;
-  *)
-    printf 'Usage: %s [--update]\n' "${0##*/}" >&2
-    exit 2
-    ;;
-esac
-(( $# <= 1 )) || { printf 'Usage: %s [--update]\n' "${0##*/}" >&2; exit 2; }
+update=$(agency_install_update_mode "$@")
 
 as_root() {
   if sudo -n true 2>/dev/null; then
@@ -21,21 +15,6 @@ as_root() {
     printf 'The parent installer must establish sudo first.\n' >&2
     exit 1
   fi
-}
-
-clone_pinned_recipe() {
-  local package=$1 revision=$2 target=$3 actual
-  git clone --depth 1 "https://aur.archlinux.org/${package}.git" "$target"
-  git -C "$target" cat-file -e "${revision}^{commit}" || {
-    printf '%s AUR revision is no longer the fetched head; review and update the pin.\n' "$package" >&2
-    exit 1
-  }
-  actual=$(git -C "$target" rev-parse HEAD)
-  [[ $actual == "$revision" ]] || {
-    printf '%s AUR head %s does not match pinned revision %s.\n' \
-      "$package" "$actual" "$revision" >&2
-    exit 1
-  }
 }
 
 packages=()

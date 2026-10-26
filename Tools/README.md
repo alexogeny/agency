@@ -75,8 +75,10 @@ allow at most 32 calls, four workers, and 60 seconds. Up to 32 items and 256 KiB
 are accepted per batch; the minimum deadline is five seconds and each state is
 limited to 64 KiB. Item IDs contain letters, digits, periods, underscores, or
 hyphens, at most 80 characters. Identical requests reuse one result within the batch.
-Credentials resolve once and stay in process memory and worker environments.
-Each classification runs in a subprocess that is killed and reaped on timeout.
+Credentials resolve once per batch and stay in process memory and private
+worker stdin frames; worker environments omit `OPENROUTER_API_KEY`. Bounded
+subprocess workers are reused within the batch, then closed. Timeout kills and
+reaps the affected worker.
 
 Results retain input order and per-item errors. A partial batch exits 1 and
 preserves successful rows; invalid manifests exit 2 before credential access.
@@ -274,6 +276,13 @@ same implementation and credentials as the CLI. The installer registers
 `agency-decide` for Codex and Claude Code while preserving existing registrations.
 Restart the client to discover newly registered tools. Pi and shell workflows
 can use `agency-decide` directly.
+
+The server reuses one sequential classifier subprocess. Independent batches
+reuse at most the requested concurrency (up to four), then close their workers.
+Private bounded stdin/stdout frames carry requests; timeout or malformed frames
+terminate and reap the worker without retrying the uncertain call. Credentials
+refresh per single call and once per batch; workers retain no request history.
+EOF and process termination clean up owned workers.
 
 Single classification workers have a hard 10-second deadline. Batch workers
 share the batch deadline and each have at most 10 seconds; expired workers are
@@ -691,6 +700,19 @@ Claims reserve writes only: reading, searching, reviewing, or otherwise
 inspecting a claimed path remains allowed. `inspect TASK_ID` reads one exact
 record; `inspect` without an ID opens or emits the active board.
 
+Claims expire after **six hours without a task heartbeat**, independently of
+the task's timebox or PID. A heartbeat renews that window while the task is still
+active/waiting. Every CLI ledger access applies expiry before reading the board
+or checking conflicts; the session watcher also checks while running. On Linux
+and macOS, the next ledger access after a reboot clears all prior-boot claims
+across repositories. No startup service is needed. Expired tasks become
+`abandoned`; claims, exclusions, and session bindings are cleared, and their
+open negotiations are cancelled. History, credentials, scratch files, and
+repository files remain intact. Resuming work requires a new task; an expired
+task cannot regain ownership through a late heartbeat. `history TASK` records
+the expiry reason and released paths. If boot information is unavailable, the
+six-hour expiry still applies.
+
 `start --no-claims` registers a blocked task without inventing a reservation.
 New tasks return `task_token` once and a private `credential_file` outside the
 repository. Prefix mutating commands with `AGENT_WORK_TOKEN_FILE=PATH` (or
@@ -835,6 +857,11 @@ marks exact DOI or normalised-title duplicates, and audits decisions, exclusion
 reasons, identifiers, and duplicate links. It never makes substantive screening
 judgements.
 
+CSV and JSONL ingestion streams records while retaining deduplication indexes;
+JSON inputs remain whole to support nested record keys. A private temporary
+ledger is published atomically after all inputs succeed, without overwriting an
+existing destination.
+
 ## `perf-diagnose`
 
 Captures `perf stat` counters or `perf record` profiles with machine metadata
@@ -972,6 +999,31 @@ exact evidence lines in a deduplicated source ledger. Pi's installed
 `agency_web` extension speaks to the same server and retains those references
 for the life of its session.
 
+The default MCP backend keeps one Bun worker for its session. Compatible named
+or default persistent profiles reuse at most one Firefox process and validating
+proxy, with a fresh tab for each operation; the lease closes after 30 seconds
+idle. Profile, visibility, proxy-policy, or template changes replace the lease.
+Ephemeral profiles and temporary download preferences close any warm lease and
+run independently. Worker exit, operation failure, cancellation, and deadlines
+close the lease; custom `WEB_RESEARCH_COMMAND` backends keep the one-shot command
+interface. Backend requests have a 150-second deadline, with a bounded shutdown
+grace period. Pi cancellation closes its MCP session and rejects its pending work.
+
+MCP reference payload accounting is limited to 8 MiB, URL aliases to 64 KiB, and
+each cache to 4,096 entries. Eviction spills evidence into a private temporary
+session directory, so old source handles and citation lines can still reload.
+Small sessions stay in memory. This also applies to `evidence: transient`: the
+spill is temporary session evidence, separate from index or capture persistence,
+and is removed on normal exit. Abrupt process or machine termination can leave
+the temporary directory behind. The accounting budgets bound retained serialized
+payload weights, rather than promising an exact JavaScript heap size.
+
+Requests are read sequentially with stream backpressure and a 64 KiB frame limit;
+oversized frames are discarded through their newline. MCP responses are limited
+to 4 MiB, backend stdout to 16 MiB, and one-shot backend stderr to 64 KiB. Pi uses
+the same request/response limits and accepts at most 16 pending requests. These
+transport limits are separate from the smaller `response_length` display budget.
+
 Large MCP opens are divided into bounded four-page backend batches. A failed or
 login-gated page returns a typed per-page error while successful siblings remain
 available and citable. Extracted job cards are returned as structured records
@@ -998,6 +1050,18 @@ than a DOM exception or a successful blank record.
 Navigation timeouts retain usable DOM and bounded network evidence as an
 explicit partial result, including the failed stage and attempt count. Bounded
 retries are opt-in, and partial pages never enter the index.
+
+DOM discovery visits at most 50,000 elements across at most 64 open roots.
+Content ranking and access checks inspect rendered text for at most the first
+128 candidate containers in DOM order. Extraction copies a bounded subtree before
+markdown and HTML serialization: at most 50,000 nodes (also limited by the content
+budget), depth 256, 128 attributes per element, and twice the configured content
+character budget across copied text and attribute values. The normalized text
+prefix and unique-link prefix stop at their respective output budgets. Pages
+report `truncated.dom` and `truncated.ranking`; quality observations explain when
+ranking reached its candidate limit. Frame and scroll diagnostics expose
+`dom_truncated`, `ranking_truncated`, and frame `text_truncated` as applicable. Within those budgets,
+ranking retains rendered `innerText`, link penalties, and first-match tie order.
 
 Dynamic pages settle against observable URL, title, text, height, link, and
 open-shadow-root state after interactive readiness. Navigation, settling,

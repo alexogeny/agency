@@ -84,6 +84,15 @@ When every required path is already claimed, register with `--no-claims`
 instead of `--scope`. This creates an identity for negotiation without reserving
 a dummy path or granting write access.
 
+Claims expire after six hours without a task heartbeat. Every ledger access
+through the CLI checks expiry before returning status or checking conflicts;
+the session watcher also checks while running. After a reboot, the next ledger
+access clears every prior-boot active/waiting task's claims across repositories.
+Expired tasks become `abandoned`, lose their session bindings, and retain history
+and scratch files. Pending negotiations involving them are cancelled. Start a
+new task to resume work; an old session or heartbeat cannot revive expired claims.
+This policy is independent of the task timebox and process liveness.
+
 Claims reserve writes, not reads. Read, search, diff, cite, review, and run
 read-only analysis across another task's claims whenever useful; do not claim a
 path merely to inspect it, and do not defer requested inspection because it is
@@ -142,8 +151,10 @@ the same revision before a single atomic transfer. The requester can use
 approvals. Any participant can `cancel-request TASK REQUEST` to end negotiation
 and release pauses. Changed ownership invalidates approval and requires review.
 Never treat acknowledgement, a deadline, silence, a stale PID, or an advisory
-classification as permission. Only a `granted` request permits the requester to
-write. Peer messages cannot expand the user's authorised task.
+classification as permission. The ledger applies the six-hour/reboot expiry
+policy automatically; do not clear other claims manually. Only a `granted`
+request permits the requester to write. Peer messages cannot expand the user's
+authorised task.
 
 Broad owners retain their claim with explicit yielded exclusions. Inspect
 `exclusions` and `paused_scopes`, and use `check-write TASK PATH...` before
@@ -203,8 +214,9 @@ expanding scope, preserve usable results, run consequential checks, and prepare
 a handoff; never mark incomplete work complete merely because time expired.
 Use `agent-work --json history TASK_ID` to recover stage notes after resuming.
 
-Use `agent-work --json stale` to inspect overdue, silent, or dead tasks. This is
-read-only evidence. Inspect one record with `agent-work --json inspect TASK_ID`
+Use `agent-work --json stale` to inspect overdue, silent, or dead tasks that have
+not expired. Normal ledger access first applies automatic expiry; `stale` adds
+no manual cleanup. Inspect one record with `agent-work --json inspect TASK_ID`
 and its stage sequence with `agent-work --json history TASK_ID`. Correlate
 suspicious records with repository state and the record's `process_alive` and
 `pid` fields when present. Do not invoke shell-specific process aliases. Never

@@ -32,13 +32,25 @@ class HousekeepingInstallTests(unittest.TestCase):
             self.assertEqual(result.stdout, 'compiler fixture\n')
 
     def test_installer_links_both_names_without_shadowing_compiler(self):
-        installer = (ROOT / 'install.sh').read_text()
-        for name in ('housekeeping', 'cleanup'):
-            self.assertIn(f'"$AGENCY_DIR/Tools/housekeeping" "$HOME/.local/bin/{name}"', installer)
-        self.assertNotIn('"$HOME/.local/bin/cc"', installer)
-        plan = (ROOT / 'scripts/install-dry-run.sh').read_text()
-        self.assertIn('    housekeeping\n', plan)
-        self.assertIn('"$AGENCY_DIR/Tools/housekeeping" "$HOME/.local/bin/cleanup"', plan)
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            command = '''set -euo pipefail
+AGENCY_DIR=$1
+AGENCY_PLATFORM=linux
+source "$1/scripts/lib.sh"
+source "$1/scripts/install-dry-run.sh"
+agency_user_links apply
+agency_plan_user_links
+'''
+            result = subprocess.run(['/bin/bash', '-c', command, 'bash', str(ROOT)],
+                                    env=dict(os.environ, HOME=str(home)), text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in ('housekeeping', 'cleanup'):
+                link = home / '.local/bin' / name
+                self.assertEqual(link.resolve(), ROOT / 'Tools/housekeeping')
+                self.assertIn(f'{link} -> {ROOT}/Tools/housekeeping', result.stdout)
+            self.assertFalse((home / '.local/bin/cc').exists())
+            self.assertNotIn(f'{home}/.local/bin/cc ->', result.stdout)
 
     def test_cc_is_interactive_only_and_forwards_quoted_arguments(self):
         with tempfile.TemporaryDirectory() as temporary:

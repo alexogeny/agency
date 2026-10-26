@@ -2,6 +2,9 @@
 
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { once } from "node:events";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 type JsonObject = Record<string, any>;
 type SearchReference = {
@@ -42,8 +45,68 @@ type Reference = SearchReference | PageReference;
 
 const pageBatchSize = 4;
 const backend = process.env.WEB_RESEARCH_COMMAND || join(import.meta.dir, "web-research");
-const references = new Map<string, Reference>();
-const pageReferences = new Map<string, PageReference>();
+const referenceByteBudget = 8 * 1024 * 1024;
+let referenceDirectory = "";
+function referencePath(key: string) {
+  if (!referenceDirectory) referenceDirectory = mkdtempSync(join(tmpdir(), "agency-web-references-"));
+  return join(referenceDirectory, createHash("sha256").update(key).digest("hex"));
+}
+process.on("exit", () => { if (referenceDirectory) rmSync(referenceDirectory, { recursive: true, force: true }); });
+
+// Evicted handles remain reloadable for this MCP session, including transient evidence.
+class ReferenceStore<T> {
+  private entries = new Map<string, { value: T; bytes: number }>();
+  retainedBytes = 0;
+  constructor(private budget: number, private encode: (value: T) => unknown,
+    private decode: (value: any) => T, private prefix: string) {}
+  get size() { return this.entries.size; }
+  get(key: string): T | undefined {
+    const cached = this.entries.get(key);
+    if (cached) {
+      this.entries.delete(key);
+      this.entries.set(key, cached);
+      return cached.value;
+    }
+    if (!referenceDirectory) return undefined;
+    const path = referencePath(this.prefix + key);
+    if (!existsSync(path)) return undefined;
+    const serialized = readFileSync(path, "utf8");
+    const value = this.decode(JSON.parse(serialized));
+    this.retain(key, value, Buffer.byteLength(serialized) * 2 + Buffer.byteLength(key) * 2 + 512);
+    return value;
+  }
+  private retain(key: string, value: T, bytes: number) {
+    const previous = this.entries.get(key);
+    if (previous) { this.retainedBytes -= previous.bytes; this.entries.delete(key); }
+    if (bytes > this.budget) { this.spill(key, value); return; }
+    this.entries.set(key, { value, bytes });
+    this.retainedBytes += bytes;
+    while (this.retainedBytes > this.budget || this.entries.size > 4096) {
+      const oldest = this.entries.entries().next().value!;
+      this.spill(oldest[0], oldest[1].value);
+      this.retainedBytes -= oldest[1].bytes;
+      this.entries.delete(oldest[0]);
+    }
+  }
+  private spill(key: string, value: T) {
+    writeFileSync(referencePath(this.prefix + key), JSON.stringify(this.encode(value)), { mode: 0o600 });
+  }
+  set(key: string, value: T) {
+    const serialized = JSON.stringify(this.encode(value));
+    this.retain(key, value, Buffer.byteLength(serialized) * 2 + Buffer.byteLength(key) * 2 + 512);
+    return this;
+  }
+}
+const references = new ReferenceStore<Reference>(referenceByteBudget,
+  value => value.kind === "page" ? { ...value, evidence: [...value.evidence] } : value,
+  value => value.kind === "page" ? { ...value, evidence: new Set(value.evidence) } : value, "reference:");
+// Aliases store handles only, so pages are retained in just one cache.
+const pageAliases = new ReferenceStore<string>(64 * 1024, value => value, value => value, "url:");
+const pageReferences = {
+  get size() { return pageAliases.size; },
+  get(url: string) { const id = pageAliases.get(url); return id ? references.get(id) as PageReference : undefined; },
+  set(url: string, reference: PageReference) { pageAliases.set(url, reference.ref_id); },
+};
 let nextSearchReference = 1;
 let nextPageReference = 1;
 
@@ -249,30 +312,100 @@ function checkedProfile(value: unknown) {
   return profile;
 }
 
-async function invoke(arguments_: string[], input = "") {
-  const process_ = Bun.spawn([backend, ...arguments_], {
-    stdin: input ? "pipe" : "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: process.env,
-  });
-  if (input) {
-    process_.stdin.write(input);
-    process_.stdin.end();
-  }
-  const [stdout, stderr, status] = await Promise.all([
-    new Response(process_.stdout).text(),
-    new Response(process_.stderr).text(),
-    process_.exited,
-  ]);
-  if (status !== 0) {
-    throw new Error(stderr.trim() || `web-research exited with status ${status}`);
-  }
+const maximumRequestBytes = 64 * 1024;
+const maximumResponseBytes = 4 * 1024 * 1024;
+const maximumBackendBytes = 16 * 1024 * 1024;
+const maximumBackendErrorBytes = 64 * 1024;
+const maximumDiagnosticCharacters = 4000;
+const shutdownGraceMs = 5_000;
+const backendDeadlineMs = 150_000;
+let backendWorker: ReturnType<typeof Bun.spawn> | undefined;
+let backendReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+let workerErrors = "";
+
+async function boundedStream(stream: ReadableStream<Uint8Array>, maximum: number) {
+  const reader = stream.getReader();
+  const parts: Uint8Array[] = [];
+  let bytes = 0;
   try {
-    return JSON.parse(stdout) as JsonObject;
-  } catch {
-    throw new Error("web-research returned invalid JSON");
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maximum) throw new Error(`web-research output exceeds ${maximum} bytes`);
+      parts.push(value);
+    }
+    return Buffer.concat(parts).toString("utf8");
+  } finally { reader.releaseLock(); }
+}
+
+async function closeBackendWorker() {
+  const child = backendWorker;
+  backendWorker = undefined;
+  backendReader = undefined;
+  if (!child) return;
+  child.kill("SIGTERM");
+  const timer = setTimeout(() => child.kill("SIGKILL"), shutdownGraceMs);
+  try { await child.exited; } finally { clearTimeout(timer); }
+}
+
+async function invokeWorker(arguments_: string[], input: string) {
+  if (!backendWorker) {
+    workerErrors = "";
+    backendWorker = Bun.spawn([backend, "worker"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: process.env });
+    backendReader = backendWorker.stdout.getReader();
+    const stderr = backendWorker.stderr;
+    void (async () => {
+      const decoder = new TextDecoder();
+      for await (const chunk of stderr) workerErrors = (workerErrors + decoder.decode(chunk, { stream: true })).slice(-maximumDiagnosticCharacters);
+    })().catch(() => {});
   }
+  const frame = JSON.stringify({ args: arguments_, input }) + "\n";
+  if (Buffer.byteLength(frame) > maximumRequestBytes) throw new Error("web-research worker request exceeds 64 KiB");
+  backendWorker.stdin.write(frame);
+  await backendWorker.stdin.flush();
+  const parts: Uint8Array[] = [];
+  let bytes = 0;
+  while (true) {
+    const { value, done } = await backendReader!.read();
+    if (done) throw new Error(workerErrors.trim() || "web-research worker closed before its response");
+    bytes += value.byteLength;
+    if (bytes > maximumBackendBytes) throw new Error("web-research output exceeds 16 MiB");
+    parts.push(value);
+    if (value.includes(10)) break;
+  }
+  const message = JSON.parse(Buffer.concat(parts).toString("utf8"));
+  if (typeof message.error === "string") throw new Error(message.error);
+  if (!isObject(message.result)) throw new Error("web-research worker returned invalid JSON");
+  return message.result;
+}
+
+async function invoke(arguments_: string[], input = "") {
+  let child: ReturnType<typeof Bun.spawn> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const operation = async () => {
+    // Custom backends retain the established one-command stdin/stdout interface.
+    if (!process.env.WEB_RESEARCH_COMMAND) return invokeWorker(arguments_, input);
+    child = Bun.spawn([backend, ...arguments_], {
+      stdin: input ? "pipe" : "ignore", stdout: "pipe", stderr: "pipe", env: process.env,
+    });
+    if (input) { child.stdin.write(input); child.stdin.end(); }
+    const [stdout, stderr, status] = await Promise.all([
+      boundedStream(child.stdout, maximumBackendBytes), boundedStream(child.stderr, maximumBackendErrorBytes), child.exited,
+    ]);
+    if (status !== 0) throw new Error(stderr.trim() || `web-research exited with status ${status}`);
+    try { return JSON.parse(stdout) as JsonObject; }
+    catch { throw new Error("web-research returned invalid JSON"); }
+  };
+  try {
+    return await Promise.race([operation(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("web-research request deadline exceeded")), backendDeadlineMs);
+    })]);
+  } catch (error) {
+    if (child && child.exitCode === null) { child.kill("SIGKILL"); await child.exited; }
+    await closeBackendWorker();
+    throw error;
+  } finally { clearTimeout(timer); }
 }
 
 function addSearchReference(result: JsonObject) {
@@ -311,6 +444,7 @@ function addPageReference(page: JsonObject, evidence = "transient") {
     cached.page = page;
     cached.title = String(page.title || url);
     cached.evidence.add(evidence);
+    references.set(cached.ref_id, cached);
     return cached;
   }
   const ref_id = `agency_page_${nextPageReference++}`;
@@ -800,13 +934,15 @@ async function performFind(
     pattern: checkedString(item.pattern, `find[${index}].pattern`, 500),
   }));
   const pages = await loadPages(requests.map((item) => item.refId), evidence, profile);
+  const lineCache = new Map<string, string[]>();
   const records: JsonObject[] = [];
   const rendered: string[] = [];
   for (const [index, result] of pages.entries()) {
     const page = requirePage(result);
     const { pattern } = requests[index];
     const needle = pattern.toLocaleLowerCase();
-    const lines = pageLines(page);
+    let lines = lineCache.get(page.ref_id);
+    if (!lines) { lines = pageLines(page); lineCache.set(page.ref_id, lines); }
     const matches: { line: string; lineno: number }[] = [];
     let matchCount = 0;
     for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
@@ -1009,7 +1145,15 @@ async function callRun(arguments_: unknown) {
 }
 
 function write(message: JsonObject) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  const serialized = JSON.stringify(message);
+  if (Buffer.byteLength(serialized) > maximumResponseBytes) {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null,
+      error: { code: -32603, message: "Response exceeds 4 MiB" } }) + "\n");
+  } else process.stdout.write(serialized + "\n");
+}
+
+async function drainOutput() {
+  if (process.stdout.writableNeedDrain) await once(process.stdout, "drain");
 }
 
 function protocolError(id: unknown, code: number, message: string) {
@@ -1068,23 +1212,47 @@ async function handle(message: unknown) {
   protocolError(message.id, -32601, "Method not found");
 }
 
+process.once("SIGTERM", () => { void closeBackendWorker().finally(() => process.exit(0)); });
+process.once("SIGINT", () => { void closeBackendWorker().finally(() => process.exit(0)); });
+
 let inputBuffer = "";
-let processing = Promise.resolve();
+let inputParts: string[] = [];
+let inputBytes = 0;
+let discardingFrame = false;
 process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk: string) => {
-  inputBuffer += chunk;
-  while (inputBuffer.includes("\n")) {
-    const separator = inputBuffer.indexOf("\n");
-    const line = inputBuffer.slice(0, separator).trim();
-    inputBuffer = inputBuffer.slice(separator + 1);
-    if (!line) continue;
-    processing = processing.then(async () => {
-      try {
-        await handle(JSON.parse(line));
-      } catch {
-        protocolError(null, -32700, "Parse error");
+// Await each frame before reading more: the stream high-water mark provides backpressure.
+try {
+  for await (const chunk of process.stdin as AsyncIterable<string>) {
+    let start = 0;
+    while (start < chunk.length) {
+      const separator = chunk.indexOf("\n", start);
+      const end = separator < 0 ? chunk.length : separator;
+      const part = chunk.slice(start, end);
+      if (!discardingFrame) {
+        inputBytes += Buffer.byteLength(part);
+        if (inputBytes > maximumRequestBytes) {
+          inputParts = [];
+          discardingFrame = true;
+          protocolError(null, -32600, "Request frame exceeds 65536 bytes");
+        } else inputParts.push(part);
       }
-    });
+      if (separator < 0) break;
+      if (!discardingFrame) {
+        inputBuffer = inputParts.join("").trim();
+        if (inputBuffer) {
+          try { await handle(JSON.parse(inputBuffer)); }
+          catch { protocolError(null, -32700, "Parse error"); }
+        }
+      }
+      await drainOutput();
+      inputBuffer = "";
+      inputParts = [];
+      inputBytes = 0;
+      discardingFrame = false;
+      start = separator + 1;
+    }
   }
-});
-process.stdin.resume();
+  if (inputBytes && !discardingFrame) protocolError(null, -32700, "Incomplete request frame");
+  await drainOutput();
+
+} finally { await closeBackendWorker(); }

@@ -23,6 +23,13 @@ def required_command(name: str) -> str:
     return path
 
 
+def checked_output(command: list[str], failure_message: str) -> str:
+    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    if result.returncode:
+        fail(result.stderr.strip() or failure_message)
+    return result.stdout
+
+
 def digest(path: Path) -> str:
     value = hashlib.sha256()
     with path.open("rb") as handle:
@@ -45,16 +52,11 @@ def page_selection(value: str | None, total: int) -> tuple[int, int]:
 
 
 def pdf_metadata(path: Path) -> dict[str, str | int]:
-    result = subprocess.run(
-        [required_command("pdfinfo"), str(path)],
-        check=False,
-        text=True,
-        capture_output=True,
+    output = checked_output(
+        [required_command("pdfinfo"), str(path)], "pdfinfo could not read the document"
     )
-    if result.returncode:
-        fail(result.stderr.strip() or "pdfinfo could not read the document")
     metadata: dict[str, str | int] = {}
-    for line in result.stdout.splitlines():
+    for line in output.splitlines():
         key, separator, value = line.partition(":")
         if separator:
             metadata[key.strip().lower().replace(" ", "_")] = value.strip()
@@ -80,7 +82,7 @@ def render_pages(
     pages = output / "pages"
     pages.mkdir()
     prefix = pages / "page"
-    result = subprocess.run(
+    checked_output(
         [
             required_command("pdftoppm"),
             "-png",
@@ -93,12 +95,8 @@ def render_pages(
             str(document),
             str(prefix),
         ],
-        check=False,
-        text=True,
-        capture_output=True,
+        "pdftoppm could not render the document",
     )
-    if result.returncode:
-        fail(result.stderr.strip() or "pdftoppm could not render the document")
     found = []
     for path in pages.glob("page-*.png"):
         match = re.fullmatch(r"page-([0-9]+)\.png", path.name)
@@ -117,7 +115,7 @@ def render_pages(
 
 
 def extract_text(document: Path, destination: Path, first: int, last: int) -> None:
-    result = subprocess.run(
+    checked_output(
         [
             required_command("pdftotext"),
             "-f",
@@ -128,16 +126,12 @@ def extract_text(document: Path, destination: Path, first: int, last: int) -> No
             str(document),
             str(destination),
         ],
-        check=False,
-        text=True,
-        capture_output=True,
+        "pdftotext could not extract the document",
     )
-    if result.returncode:
-        fail(result.stderr.strip() or "pdftotext could not extract the document")
 
 
 def make_contact_sheet(pages: list[tuple[int, Path]], destination: Path) -> None:
-    result = subprocess.run(
+    checked_output(
         [
             required_command("montage"),
             *[str(path) for _, path in pages],
@@ -149,12 +143,8 @@ def make_contact_sheet(pages: list[tuple[int, Path]], destination: Path) -> None
             "+12+12",
             str(destination),
         ],
-        check=False,
-        text=True,
-        capture_output=True,
+        "montage could not build the contact sheet",
     )
-    if result.returncode:
-        fail(result.stderr.strip() or "montage could not build the contact sheet")
 
 
 def extract_ocr(
@@ -163,15 +153,11 @@ def extract_ocr(
     command = required_command("tesseract")
     page_text = []
     for number, page in pages:
-        result = subprocess.run(
+        text = checked_output(
             [command, str(page), "stdout", "-l", language],
-            check=False,
-            text=True,
-            capture_output=True,
+            f"tesseract failed on page {number}",
         )
-        if result.returncode:
-            fail(result.stderr.strip() or f"tesseract failed on page {number}")
-        page_text.append(result.stdout.rstrip())
+        page_text.append(text.rstrip())
     destination.write_text("\n\f\n".join(page_text) + "\n")
 
 

@@ -15,13 +15,7 @@ HOOK = ROOT / "Tools/agent-work-hook"
 WATCH = ROOT / "Tools/agent-work-watch"
 
 
-class DeliveryTests(unittest.TestCase):
-    setUp = base.AgentWorkTests.setUp
-    tearDown = base.AgentWorkTests.tearDown
-    git = base.AgentWorkTests.git
-    run_tool = base.AgentWorkTests.run_tool
-    start = base.AgentWorkTests.start
-
+class DeliveryTests(base.AgentWorkFixture, unittest.TestCase):
     def bind(self, task, client, session):
         return self.run_tool("session", task["id"], "--client", client, "--session", session, "--json")
 
@@ -152,8 +146,35 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(len(groups), 1)
                 self.assertNotIn("matcher", groups[0])
         source = (ROOT / "install.sh").read_text()
-        for path in ("Tools/agent-work-hook", "Tools/agent-work-watch", "Agents/pi/agency-work.ts"):
-            self.assertIn(path, source)
+        user_setup = source.split('agency_prepare_scratch\n', 1)[1].split(
+            'if [[ $platform == linux ]]; then\n  mapfile -t packages', 1)[0]
+        for platform in ("linux", "macos"):
+            home = self.workspace / f"install-{platform}"
+            command = '''set -euo pipefail
+AGENCY_DIR=$1
+AGENCY_PLATFORM=$2
+platform=$2
+source "$1/scripts/lib.sh"
+'''
+            result = subprocess.run(["/bin/bash", "-c", command + user_setup, "bash", str(ROOT), platform],
+                                    env={**os.environ, "HOME": str(home)}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            preview = subprocess.run(["/bin/bash", str(ROOT / "install.sh"), "--platform", platform, "--dry-run"],
+                                     env={**os.environ, "HOME": str(home)}, capture_output=True, text=True)
+            self.assertEqual(preview.returncode, 0, preview.stderr)
+            links = {f".local/bin/{name}": f"Tools/{name}" for name in (
+                "agent-work-hook", "agent-work-watch", "agent-work-bridge")}
+            links[".pi/agent/extensions/agency-work.ts"] = "Agents/pi/agency-work.ts"
+            for target, managed_source in links.items():
+                self.assertEqual((home / target).resolve(), ROOT / managed_source)
+                self.assertIn(f"{home / target} -> {ROOT / managed_source}", preview.stdout)
+            for target in (".codex/hooks.json", ".claude/settings.json"):
+                hooks = json.loads((home / target).read_text())["hooks"]
+                for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"):
+                    groups = [group for group in hooks[event] if any(
+                        "agent-work-hook" in item["command"] for item in group["hooks"])]
+                    self.assertEqual(len(groups), 1)
+                    self.assertNotIn("matcher", groups[0])
 
     def test_pi_extension_wakes_idle_session_and_stops_on_session_change(self):
         result = subprocess.run(["bun", ROOT / "Tests/fixtures/pi_agent_work.ts"],

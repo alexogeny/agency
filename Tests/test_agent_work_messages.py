@@ -8,13 +8,7 @@ import unittest
 from Tests import test_agent_work as base
 
 
-class MessagingTests(unittest.TestCase):
-    setUp = base.AgentWorkTests.setUp
-    tearDown = base.AgentWorkTests.tearDown
-    git = base.AgentWorkTests.git
-    run_tool = base.AgentWorkTests.run_tool
-    start = base.AgentWorkTests.start
-
+class MessagingTests(base.AgentWorkFixture, unittest.TestCase):
     def empty_task(self, name="Requester"):
         return json.loads(self.run_tool("start", "--task", name, "--no-claims", "--json").stdout)
 

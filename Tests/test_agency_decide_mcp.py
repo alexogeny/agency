@@ -70,17 +70,16 @@ class DecisionMCPTests(unittest.TestCase):
 
     def test_classify_subprocess_has_hard_timeout_and_no_secret_argv(self):
         payload = {'advisory': True, 'decision': 'none', 'confidence': 0.5}
-        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), '')
-        with patch.object(mcp, 'key_available', return_value=True), patch.object(mcp.subprocess, 'run', return_value=completed) as run:
+        expected = dict(payload)
+        with patch.object(mcp, 'key_available', return_value=True), patch.object(mcp, '_read_key', return_value='test-key'), \
+             patch.object(mcp.DecisionWorker, 'classify', return_value=payload) as run:
             result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': {'task': 'hello'}}}))['result']
         counted = dict(result['structuredContent'])
         report = counted.pop('_agency_decisions')
-        self.assertEqual(counted, payload)
+        self.assertEqual(counted, expected)
         self.assertEqual(report['decisions'], 1)
         self.assertEqual(report['errors'], 0)
-        self.assertEqual(run.call_args.kwargs['timeout'], 10)
-        self.assertEqual(json.loads(run.call_args.kwargs['input']), {'task': 'hello'})
-        self.assertEqual(run.call_args.args[0][-5:], ['classify', '--profile', 'skill', '--input', '-'])
+        self.assertEqual(run.call_args.args, ({'task': 'hello'}, 'skill', 'test-key', 10))
         self.assertFalse(result.get('isError', False))
 
     def test_invalid_args_and_missing_credential_are_tool_errors(self):
@@ -96,23 +95,18 @@ class DecisionMCPTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_worker_errors_timeout_and_stderr_never_leak(self):
-        outcomes = [subprocess.CompletedProcess([], 2, '', 'secret-value'),
-                    subprocess.CompletedProcess([], 0, 'secret-value', ''),
-                    subprocess.TimeoutExpired(['secret-value'], 10), OSError('secret-value')]
-        for outcome in outcomes:
-            with self.subTest(outcome=type(outcome)):
-                kwargs = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
-                with patch.object(mcp, 'key_available', return_value=True), patch.object(mcp.subprocess, 'run', **kwargs):
-                    result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': {'task': 'x'}}}))['result']
-                self.assertTrue(result['isError'])
-                self.assertNotIn('secret-value', json.dumps(result))
+        with patch.object(mcp, 'key_available', return_value=True), patch.object(mcp, '_read_key', return_value='test-key'), \
+             patch.object(mcp.DecisionWorker, '_start', side_effect=OSError('secret-value')):
+            result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': {'task': 'x'}}}))['result']
+        self.assertTrue(result['isError'])
+        self.assertNotIn('secret-value', json.dumps(result))
 
     def test_real_worker_timeout_recovers_for_next_request(self):
         with tempfile.TemporaryDirectory() as directory:
             worker = Path(directory) / 'slow.py'
             worker.write_text('import time\ntime.sleep(20)\n')
             started = time.monotonic()
-            with patch.object(mcp, 'CLI', worker), patch.object(mcp, 'CLASSIFY_TIMEOUT', 0.1), patch.object(mcp, 'key_available', return_value=True):
+            with patch.object(mcp, 'CLI', worker), patch.object(mcp, 'CLASSIFY_TIMEOUT', 0.1), patch.object(mcp, 'key_available', return_value=True), patch.object(mcp, '_read_key', return_value='test-key'):
                 result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': {'profile': 'skill', 'state': {'task': 'x'}}}))
             self.assertTrue(result['result']['isError'])
             self.assertLess(time.monotonic() - started, 2)

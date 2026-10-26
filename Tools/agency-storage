@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import re
+import runpy
 import shutil
 import stat
 import subprocess
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+process_helpers = runpy.run_path(str(Path(__file__).resolve().with_name('agency_processes.py')))
 
 FSTAB_PATH = Path('/etc/fstab')
 FOLDERS = {'cache': '.cache', 'scratch': 'Scratch', 'containers': '.local/share/containers'}
@@ -330,18 +333,16 @@ def active_users(paths, all_users=False):
         try:
             if not all_users and process.stat().st_uid != os.getuid():
                 continue
-            name = (process / 'comm').read_text().strip()
+            name = process_helpers['read_process_file'](process / 'comm', text=True).strip()
             targets = []
             for entry in [process / 'cwd', *list((process / 'fd').iterdir())]:
                 try:
-                    targets.append(os.readlink(entry))
+                    targets.append(process_helpers['read_link'](entry))
                 except FileNotFoundError:
                     continue
-            for row in (process / 'maps').read_text().splitlines():
-                fields = row.split(maxsplit=5)
-                if len(fields) == 6:
-                    targets.append(fields[5])
-            if any(target.removesuffix(' (deleted)') in exact or target.startswith(roots) for target in targets):
+            targets.extend(process_helpers['mapped_paths'](
+                process_helpers['read_process_file'](process / 'maps', text=True)))
+            if any(process_helpers['normalize_path'](target) in exact or target.startswith(roots) for target in targets):
                 blockers.append(f'{process.name} {name}')
         except (FileNotFoundError, ProcessLookupError):
             continue
