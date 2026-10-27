@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-type Batch = { event?: string; id?: string; context?: string; registered?: boolean; systemMessage?: string };
+type Batch = { event?: string; id?: string; context?: string; task_context?: string; registered?: boolean; systemMessage?: string };
 
 export default function agencyWork(pi: ExtensionAPI) {
     let session: string | undefined;
@@ -82,16 +82,21 @@ export default function agencyWork(pi: ExtensionAPI) {
         });
     };
 
-    const boundary = async (ctx: ExtensionContext, event: string, response?: unknown) => {
+    const boundary = async (ctx: ExtensionContext, event: string, response?: unknown, deferTasks = false) => {
         const expected = generation;
         const current = ctx.sessionManager.getSessionId();
         const batch = await helper({ session_id: current, cwd: ctx.cwd, hook_event_name: event, tool_response: response });
         if (expected !== generation || current !== session) return;
         if (batch.systemMessage) show(ctx, batch.systemMessage);
+        if (batch.task_context && !deferTasks) {
+            pi.sendMessage({ customType: "agency-tasks", content: batch.task_context, display: true },
+                { triggerTurn: false, deliverAs: "steer" });
+        }
         try {
             if (accept(batch, ctx)) await helper({ session_id: current, hook_event_name: "DeliveryReceipt", batch_id: batch.id });
         } catch { show(ctx, "Agency inbox delivery failed; messages will retry"); }
         if (batch.registered) watch(ctx);
+        return batch;
     };
 
     pi.on("session_start", async (_event, ctx) => {
@@ -100,8 +105,16 @@ export default function agencyWork(pi: ExtensionAPI) {
         watcher = undefined;
         delivered.clear();
         session = ctx.sessionManager.getSessionId();
-        await boundary(ctx, "SessionStart");
+        await boundary(ctx, "SessionStart", undefined, true);
     });
+    pi.on("before_agent_start", async (_event, ctx) => {
+        const batch = await boundary(ctx, "UserPromptSubmit", undefined, true);
+        if (batch?.task_context) {
+            return { message: { customType: "agency-tasks", content: batch.task_context, display: true } };
+        }
+    });
+    pi.on("session_compact", async (_event, ctx) => { await boundary(ctx, "SessionStart"); });
+    pi.on("agent_settled", async (_event, ctx) => { await boundary(ctx, "Stop"); });
     pi.on("tool_result", async (event, ctx) => {
         await boundary(ctx, "PostToolUse", event.content);
     });

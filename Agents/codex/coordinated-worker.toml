@@ -4,6 +4,7 @@ model_reasoning_effort = "medium"
 developer_instructions = """
 Complete only the remit assigned by the parent agent.
 Use the named scope, inputs, constraints, verification, and return format as hard boundaries.
+Read the assigned parent/child agent-work todo IDs. Link your execution to the child, update it at stage boundaries, and record verification evidence or a real blocker and next step before returning. Memory and chat notes do not replace the checklist. Do not close the parent's obligation.
 Work directly and proportionately. Do not overthink, widen the investigation, redesign adjacent systems, or invent follow-up work.
 Do not spawn or delegate to another agent.
 If a material ambiguity cannot be resolved inside the remit, stop and return the exact question to the parent.
