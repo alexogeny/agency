@@ -49,6 +49,9 @@ for (const capture of [false, true]) for (const frames of [false, true]) {
   const expected = capture ? originalFuse(captureInputForStorage(expectedInput), "stored") : originalFuse(expectedInput);
   if (capture) expected.capture_id = "fixture-capture";
   expected.freshness = {retrieval:"live", cache:"bypass",change_likelihood:"medium",basis:["fixture"],retrieved_at:fixed,indexed_at:null,refresh_after:null,content_sha256:contentHash(expected)};
+  expected.freshness.content_sha256_stage = "extracted-evidence-before-export-sanitization";
+  expected.freshness.content_sha256_byte_scope = "UTF-8 markdown when nonempty, otherwise text; no header or trailing newline added";
+  expected.redaction = {version:"agency/evidence-sanitizer/1",count:0};
   fusions = 0;
   const args = [basePage.url,"--format","json"];
   if (capture) args.push("--capture");

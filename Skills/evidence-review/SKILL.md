@@ -45,3 +45,23 @@ judgment groups records for review rather than silently deleting them.
 Audit before synthesis. Report databases and queries, dates, records found,
 duplicates, screened and pending counts, exclusions by reason, unresolved
 records, and retained ledger/audit paths.
+
+## Reconcile retained corpus evidence
+
+Use [research-corpus](../research-corpus/SKILL.md) for durable discovery and opened
+source artifacts. Reconcile a new output by stable source ID rather than importing
+over an existing human ledger:
+
+```console
+research-corpus screening reconcile CORPUS --ledger screening-old.csv --output screening-new.csv
+evidence-review audit screening-new.csv --output audit-new.json --json
+```
+
+For a first ledger, create a CSV with only a `source_id` header. Reconciliation
+preserves manual decisions, reasons, pending full text, and custom reviewer columns.
+Exact URL/title/DOI duplicate candidates stay traceable; they are not discarded.
+Raw extracted byline/date and field provenance remain separate from verified
+bibliographic authors/year. A parsed year does not verify the source date, and
+related-content authors, reviewers, or contact names must remain unverified.
+Audit the corpus separately for sibling hashes, checkpoints, coverage and software
+provenance. A screening audit alone does not verify opened full-text evidence.

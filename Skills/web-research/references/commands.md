@@ -349,3 +349,32 @@ personal data or secrets in profile names.
   tables, footnotes, interactive figures, and unusually structured sites.
 - Firefox PDF viewer pages may need a direct PDF-specific tool for complete
   text and layout inspection.
+
+## Durable corpus workflow
+
+Use [research-corpus](../../research-corpus/SKILL.md) for committed evidence,
+recipes/software identity, offline reproduction and screening. Installed commands:
+
+```console
+research-corpus init CORPUS --protocol protocol.json
+research-corpus discover CORPUS --query "EXACT QUERY" --profile TASK --operation-id search-01
+research-corpus open CORPUS --source-id SOURCE_ID --profile TASK
+research-corpus export CORPUS --source-id SOURCE_ID --from-index --format all
+research-corpus resume CORPUS
+research-corpus index build CORPUS --db "$HOME/Scratch/TASK/corpus.sqlite"
+research-corpus index query CORPUS "EXPRESSION" --db "$HOME/Scratch/TASK/corpus.sqlite" --kind source --limit 20
+research-corpus screening reconcile CORPUS --ledger old.csv --output new.csv
+research-corpus audit CORPUS --json
+research-corpus reproduce CORPUS --offline --output REPRODUCED
+research-corpus rerun CORPUS --from RUN_ID --profile TASK
+research-corpus compare CORPUS --old RUN_ID --new NEW_RUN_ID
+```
+
+The corpus CLI and MCP `corpus` command adapter share this state machine. The
+index-only export refuses missing/stale/legacy cache evidence without opening a
+browser. Source queries exclude discovery snippets by default; use `--kind` to
+navigate other kinds explicitly. Preserve matched path/line and coverage/access
+when citing a hit. Run audit after resume and before handoff. Keep generated SQLite
+databases outside the corpus and checkout. The skill documents owned profile
+creation, close, exact authorization and cleanup receipts; ordinary profile age
+or lifecycle eligibility cannot grant deletion permission.

@@ -17,6 +17,7 @@ all	Tools/comment-audit	.local/bin/comment-audit
 all	Tools/docs-exec	.local/bin/docs-exec
 all	Tools/document-inspect	.local/bin/document-inspect
 all	Tools/evidence-review	.local/bin/evidence-review
+all	Tools/research-corpus	.local/bin/research-corpus
 all	Tools/repo-map	.local/bin/repo-map
 all	Tools/repository-setup	.local/bin/repository-setup
 all	Tools/report-build	.local/bin/report-build
