@@ -151,6 +151,9 @@ def selected(request, data_root, allow_missing=False):
         fail('profile-identity-mismatch', 'Task lifecycle metadata is unavailable')
     if metadata.get('owned_profile') != handle:
         fail('profile-identity-mismatch', 'Profile nonce or lifecycle identity does not match')
+    if exists and metadata.get('cleanup_started'):
+        # A deleted inode can be reused immediately; equality cannot prove continuity.
+        fail('profile-identity-mismatch', 'Cleanup already started; an existing directory requires manual review')
     if not exists and metadata.get('cleanup_started') != cleanup_marker(handle):
         fail('profile-identity-mismatch', 'Missing profile has no matching cleanup checkpoint')
     return root, handle

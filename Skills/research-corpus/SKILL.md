@@ -170,9 +170,10 @@ returns `unsupported-profile-mode`; use persistent owned profiles with exact
 authorized cleanup. Never delete another profile or shared captures/indexes.
 For partial cleanup, inspect the receipt before retrying with a new receipt path.
 When the directory was removed but metadata remains, a matching durable cleanup
-checkpoint permits metadata-only recovery. A replacement directory or missing
-checkpoint is refused. Keep the same owner, authorization, and private handle
-until both removal postchecks pass.
+checkpoint permits metadata-only recovery. Any directory present after cleanup
+started requires manual review, even when its inode matches: deleted inodes can
+be reused. A missing checkpoint is refused. Keep the same owner, authorization,
+and private handle until both removal postchecks pass.
 
 ## Verify without live research
 

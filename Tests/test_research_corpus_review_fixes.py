@@ -83,6 +83,7 @@ class CorpusReviewFixesTests(unittest.TestCase):
             'owner_execution': 'fixture-owner', 'purpose': 'Temporary fixture',
             'mode': 'persistent', 'authorization': auth}, data)
         request = {'handle': handle, 'owner_execution': 'fixture-owner', 'authorization': auth}
+        original_stat = Path(handle['canonical_path']).stat()
         metadata = Path(handle['canonical_path'] + '.agency.json')
         unlink = Path.unlink
         def fail_metadata(path, *args, **kwargs):
@@ -96,6 +97,13 @@ class CorpusReviewFixesTests(unittest.TestCase):
         replacement = Path(handle['canonical_path'])
         replacement.mkdir()
         (replacement / 'preserve').write_text('Foreign directory')
+        stat = Path.stat
+        def reused_inode(path, *args, **kwargs):
+            if path == replacement and kwargs.get('follow_symlinks', True):
+                return original_stat
+            return stat(path, *args, **kwargs)
+        with patch.object(Path, 'stat', reused_inode), self.assertRaises(profiles.ProfileError):
+            profiles.selected(request, data, allow_missing=True)
         with self.assertRaises(profiles.ProfileError):
             profiles.operate('profile-cleanup', request, data)
         self.assertTrue((replacement / 'preserve').is_file())
@@ -132,7 +140,9 @@ class CorpusReviewFixesTests(unittest.TestCase):
         script.write_text('#!' + sys.executable + '\n'
             'import json,os,subprocess,sys,time\nfrom pathlib import Path\n'
             'child=subprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"])\n'
-            'Path(os.environ["CORPUS_CHILD_MARKER"]).write_text(json.dumps({"backend":os.getpid(),"child":child.pid,"group":os.getpgrp(),"supervisor":os.getppid()}))\n'
+            'supervisor=os.getppid()\n'
+            'cli=int(Path("/proc",str(supervisor),"stat").read_text().rsplit(") ",1)[1].split()[1])\n'
+            'Path(os.environ["CORPUS_CHILD_MARKER"]).write_text(json.dumps({"backend":os.getpid(),"child":child.pid,"group":os.getpgrp(),"supervisor":supervisor,"cli":cli}))\n'
             'time.sleep(30)\nprint(json.dumps({"results":[]}))\n')
         script.chmod(0o700)
         return marker, dict(self.env, RESEARCH_CORPUS_WEB_COMMAND=str(script),
@@ -146,12 +156,13 @@ class CorpusReviewFixesTests(unittest.TestCase):
         return json.loads(marker.read_text())
 
     def verify_stopped(self, pids):
+        owned = {name: pids[name] for name in ('backend', 'child', 'supervisor', 'cli')
+                 if pids[name] != os.getpid()}
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and any(self.running(pids[k]) for k in ('backend', 'child', 'supervisor')):
+        while time.monotonic() < deadline and any(self.running(pid) for pid in owned.values()):
             time.sleep(.025)
-        self.assertFalse(self.running(pids['backend']), 'Owned backend survived cancellation')
-        self.assertFalse(self.running(pids['child']), 'Owned descendant survived cancellation')
-        self.assertFalse(self.running(pids['supervisor']), 'Owned supervisor survived cancellation')
+        for name, pid in owned.items():
+            self.assertFalse(self.running(pid), f'Owned {name} survived cancellation')
 
     def cleanup_processes(self, process, pids):
         if process.poll() is None:

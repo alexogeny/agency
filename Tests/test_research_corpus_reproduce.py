@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -12,6 +13,12 @@ import research_corpus_reproduce as replay
 
 
 class ReproduceTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, PATH=str(Path(__file__).resolve().parents[1] / 'Tools')
+                                 + os.pathsep + os.environ.get('PATH', ''))
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_archived_software_identity_metadata_must_match_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

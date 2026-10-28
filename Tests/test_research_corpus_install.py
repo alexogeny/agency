@@ -5,11 +5,18 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class ResearchCorpusInstallTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, PATH=str(ROOT / 'Tools')
+                                 + os.pathsep + os.environ.get('PATH', ''))
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_managed_entrypoint_resolves_modules_via_installed_symlink(self):
         manifest = (ROOT / 'scripts/managed-user-links.tsv').read_text()
         self.assertIn('all\tTools/research-corpus\t.local/bin/research-corpus\n', manifest)

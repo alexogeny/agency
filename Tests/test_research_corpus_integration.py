@@ -53,6 +53,7 @@ class ResearchCorpusIntegrationTests(unittest.TestCase):
         self.backend.write_text('#!' + sys.executable + '\n' + BACKEND)
         self.backend.chmod(0o700)
         self.environment = dict(os.environ, RESEARCH_CORPUS_WEB_COMMAND=str(self.backend),
+                                PATH=str(ROOT / 'Tools') + os.pathsep + os.environ.get('PATH', ''),
                                 CORPUS_FIXTURE_LOG=str(self.log), PYTHONDONTWRITEBYTECODE='1')
         self.protocol = self.base / 'protocol.json'
         self.protocol.write_text(json.dumps({
