@@ -919,6 +919,41 @@ extracted-file hashes, bounded output, truncation state, and status. The
 `docs-verification` skill defines how to rehearse reader-visible instructions
 safely.
 
+## `research-corpus`
+
+Python standard-library durable research evidence workflow. The adjacent
+`research_corpus_core.py`, `research_corpus_services.py`, and
+`research_corpus_reproduce.py` modules resolve beside the real executable, so the
+managed `~/.local/bin/research-corpus` symlink works without a Python package install.
+The [research-corpus skill](../Skills/research-corpus/SKILL.md) contains protocol,
+collection, resume, index/query, audit, screening, six-month offline reproduction,
+live rerun comparison, and exact authorized profile cleanup commands.
+
+Committed JSON/text/Markdown siblings are immutable sanitized evidence. Indexes
+and sidecars stay outside repositories and the corpus; queries open SQLite read-only and default
+to source evidence. Rebuilds validate all inputs before publication, remove stale
+rows, preserve the prior generation after failure, and detect database/sidecar
+mismatch. Query results retain source URL/ID, record, file, matched line range,
+coverage and access. Screening reconciliation writes only a new output and keeps
+human decisions and duplicate candidates. Empty selections cannot pass audit.
+`retain CORPUS FILE --kind protocol|screening|synthesis --operation-id ID`
+commits local UTF-8 documents through the same sanitized pipeline. Query/source
+ceilings in the protocol are enforced; `stop CORPUS --reason TEXT` records a
+researcher's stopping decision and prevents further live collection in that run.
+
+Offline reproducibility requires the retained sanitized inputs and archived
+processing code; live reruns capture changing access, rankings, bodies and software.
+Live reruns bypass cached source reads. Backend lifetime supervision stops owned
+descendants after cancellation or MCP termination, retaining interrupted intent
+for `resume` when the CLI cannot commit a result.
+Neither a complete audit nor a long extraction establishes unavailable full text.
+Profile cleanup requires explicit permission and matching task-owned identity;
+eligibility alone never authorizes deletion. Synthetic end-to-end verification:
+
+```console
+python3 Skills/research-corpus/examples/offline-demo.py "$HOME/Scratch/corpus-offline-example"
+```
+
 ## `evidence-review`
 
 Normalises CSV, JSON, and JSONL evidence exports into a stable screening ledger,

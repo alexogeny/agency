@@ -1,10 +1,19 @@
 #!/usr/bin/env bun
 
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { once } from "node:events";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
+
+let sharedEvidenceSanitizer: any;
+function sanitizeMcp<T>(value: T): T {
+  const adjacent = join(dirname(realpathSync(Bun.argv[1])), "web_research_evidence.ts");
+  const module = basename(realpathSync(Bun.argv[1])) === "web-research-mcp" || existsSync(adjacent)
+    ? adjacent : join(process.cwd(), "Tools/web_research_evidence.ts");
+  sharedEvidenceSanitizer ||= require(module);
+  return sharedEvidenceSanitizer.sanitizeEvidence(value).value;
+}
 
 type JsonObject = Record<string, any>;
 type SearchReference = {
@@ -167,6 +176,7 @@ const runTool = {
           properties: {
             ref_id: { type: "string", minLength: 1, maxLength: 8192 },
             lineno: { type: "integer", minimum: 1 },
+            character_offset: { type: "integer", minimum: 0 },
           },
         },
       },
@@ -375,9 +385,9 @@ async function invokeWorker(arguments_: string[], input: string) {
     if (value.includes(10)) break;
   }
   const message = JSON.parse(Buffer.concat(parts).toString("utf8"));
-  if (typeof message.error === "string") throw new Error(message.error);
+  if (typeof message.error === "string") throw Object.assign(new Error(message.error), {backendCommandFailure: true});
   if (!isObject(message.result)) throw new Error("web-research worker returned invalid JSON");
-  return message.result;
+  return sanitizeMcp(message.result);
 }
 
 async function invoke(arguments_: string[], input = "") {
@@ -394,7 +404,7 @@ async function invoke(arguments_: string[], input = "") {
       boundedStream(child.stdout, maximumBackendBytes), boundedStream(child.stderr, maximumBackendErrorBytes), child.exited,
     ]);
     if (status !== 0) throw new Error(stderr.trim() || `web-research exited with status ${status}`);
-    try { return JSON.parse(stdout) as JsonObject; }
+    try { return sanitizeMcp(JSON.parse(stdout)) as JsonObject; }
     catch { throw new Error("web-research returned invalid JSON"); }
   };
   try {
@@ -403,7 +413,7 @@ async function invoke(arguments_: string[], input = "") {
     })]);
   } catch (error) {
     if (child && child.exitCode === null) { child.kill("SIGKILL"); await child.exited; }
-    await closeBackendWorker();
+    if (!(arguments_[0] === "profile-close" && (error as any)?.backendCommandFailure)) await closeBackendWorker();
     throw error;
   } finally { clearTimeout(timer); }
 }
@@ -438,6 +448,7 @@ function addSearchReference(result: JsonObject) {
 }
 
 function addPageReference(page: JsonObject, evidence = "transient") {
+  page = sanitizeMcp(page);
   const url = String(page.canonicalUrl || page.url || "");
   const cached = pageReferences.get(url);
   if (cached) {
@@ -658,6 +669,10 @@ function pageRecord(reference: PageReference) {
     links: links.length,
     ...(jobs.length ? { jobs } : {}),
     sources: Array.isArray(reference.page.sources) ? reference.page.sources : [],
+    access: reference.page.access || {state: "unknown"},
+    extraction: {coverage: reference.page.coverage || "unknown", truncated_fields: reference.page.truncated || null,
+      quality: reference.page.quality || [], provenance: reference.page.provenance || {}},
+    redaction: reference.page.redaction || null,
     ...(reference.page.capture_id ? { capture_id: reference.page.capture_id } : {}),
   };
 }
@@ -677,6 +692,8 @@ function pageCitation(reference: PageReference) {
       freshness.content_sha256 ||
         createHash("sha256").update(content).digest("hex"),
     ),
+    ...(freshness.content_sha256_stage ? {content_sha256_stage: String(freshness.content_sha256_stage)} : {}),
+    ...(freshness.content_sha256_byte_scope ? {content_sha256_byte_scope: String(freshness.content_sha256_byte_scope)} : {}),
     change_likelihood: String(freshness.change_likelihood || "unknown"),
     refresh_after:
       freshness.refresh_after === null
@@ -686,7 +703,8 @@ function pageCitation(reference: PageReference) {
   };
 }
 
-function renderPage(reference: PageReference, lineno: number, budget: number) {
+function renderPage(reference: PageReference, lineno: number, budget: number, characterOffset = 0) {
+  const bodyRanges: JsonObject[] = [];
   const marker = "\n\n[truncated to response_length; use open with lineno to continue]";
   const maximum = Math.max(0, budget - marker.length);
   let rendered = "";
@@ -738,22 +756,33 @@ function renderPage(reference: PageReference, lineno: number, budget: number) {
     cursor = separator < 0 ? content.length : separator + 1;
     currentLine += 1;
   }
+  cursor = Math.min(content.length, cursor + characterOffset);
+  let sourceOffset = characterOffset;
   while (!truncated && cursor <= content.length) {
     const separator = content.indexOf("\n", cursor);
     const end = separator < 0 ? content.length : separator;
     const clippedEnd = Math.min(end, cursor + maximum - rendered.length);
+    const start = rendered.length + `${currentLine}: `.length;
     const complete = append(`${currentLine}: ${content.slice(cursor, clippedEnd)}\n`);
+    const delivered = Math.max(0, Math.min(clippedEnd - cursor, rendered.length - start));
+    bodyRanges.push({line: currentLine, start, end: start + delivered, source_offset: sourceOffset,
+      source_length: end - cursor + sourceOffset, complete: complete && clippedEnd === end});
+    sourceOffset = 0;
     lastLine = currentLine;
     if (!complete) break;
     if (separator < 0) break;
     cursor = separator + 1;
     currentLine += 1;
   }
-  return {
+  const retainedBodyEnd = rendered.trimEnd().length;
+  for (const range of bodyRanges) {
+    if (range.end > retainedBodyEnd) { range.end = Math.max(range.start, retainedBodyEnd); range.complete = false; }
+  }
+  return Object.defineProperty({
     text: truncated ? `${rendered.trimEnd()}${marker}` : rendered.trimEnd(),
     lineStart: lastLine ? lineno : 0,
     lineEnd: lastLine,
-  };
+  }, "bodyRanges", {value: bodyRanges}) as {text: string; lineStart: number; lineEnd: number; bodyRanges: JsonObject[]};
 }
 
 async function performSearch(
@@ -880,13 +909,15 @@ async function performOpen(
     if (!Number.isInteger(lineno) || lineno < 1) {
       throw new Error(`open[${index}].lineno must be a positive integer`);
     }
-    return { refId, lineno };
+    const characterOffset = item.character_offset === undefined ? 0 : Number(item.character_offset);
+    if (!Number.isSafeInteger(characterOffset) || characterOffset < 0) throw new Error("open character_offset must be a nonnegative integer");
+    return { refId, lineno, characterOffset };
   });
   const pages = await loadPages(requests.map((item) => item.refId), evidence, profile);
   const records: JsonObject[] = [];
   const rendered: string[] = [];
   for (const [index, page] of pages.entries()) {
-    const { lineno } = requests[index];
+    const { lineno, characterOffset } = requests[index];
     if (page.kind === "error") {
       records.push({
         type: "page_error",
@@ -910,9 +941,11 @@ async function performOpen(
       rendered.push(lines.filter(Boolean).join("\n"));
       continue;
     }
-    const view = renderPage(page, lineno, budget);
+    const view = renderPage(page, lineno, budget, characterOffset);
     records.push({
       ...pageRecord(page),
+      _body_ranges: view.bodyRanges,
+      _requested_line: view.lineStart || 1,
       citation: {
         ...pageCitation(page),
         line_start: view.lineStart,
@@ -1021,6 +1054,8 @@ async function performClick(
     const view = renderPage(page, 1, budget);
     records.push({
       ...pageRecord(page),
+      _body_ranges: view.bodyRanges,
+      _requested_line: view.lineStart || 1,
       citation: {
         ...pageCitation(page),
         line_start: view.lineStart,
@@ -1044,6 +1079,8 @@ async function performReplay(items: JsonObject[], budget: number) {
     const view = renderPage(page, 1, budget);
     records.push({
       ...pageRecord(page),
+      _body_ranges: view.bodyRanges,
+      _requested_line: view.lineStart || 1,
       citation: {
         ...pageCitation(page),
         line_start: view.lineStart,
@@ -1073,6 +1110,66 @@ function sourceLedger(records: JsonObject[]) {
     if (id) sources.set(id, source);
   }
   return [...sources.values()];
+}
+
+function finalDelivery(records: JsonObject[], rendered: string[], budget: number) {
+  const combined = rendered.join("\n\n");
+  const marker = "\n\n[truncated to response_length; use open with lineno to continue]";
+  const text = compactText(combined, budget);
+  const deliveredEnd = combined.length <= budget ? combined.length : combined.slice(0, Math.max(0, budget - marker.length)).trimEnd().length;
+  let sectionStart = 0;
+  const findLines = new Map<string, string[]>();
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    const section = rendered[index] || "";
+    const sectionDelivered = Math.max(0, Math.min(section.length, deliveredEnd - sectionStart));
+    if (isObject(record.citation)) {
+      const reference = references.get(String(record.ref_id));
+      const ranges = (record._body_ranges || []) as JsonObject[];
+      const delivered: JsonObject[] = [];
+      for (const range of ranges) {
+        const end = Math.min(range.end, sectionDelivered);
+        if (end > range.start) delivered.push({line: range.line, character_start: range.source_offset,
+          character_end: range.source_offset + end - range.start,
+          complete: range.complete && end === range.end && range.source_offset === 0});
+      }
+      // Find renders sparse numbered lines; only complete visible lines earn citations.
+      if (record.type === "find") {
+        for (const match of section.slice(0, sectionDelivered).matchAll(/(?:^|\n)(\d+): ([^\n]*)/g)) {
+          const lineEnd = match.index! + match[0].length;
+          if (reference?.kind !== "page") continue;
+          let lines = findLines.get(reference.ref_id);
+          if (!lines) { lines = pageLines(reference); findLines.set(reference.ref_id, lines); }
+          const sourceLine = lines[Number(match[1]) - 1];
+          if (typeof sourceLine === "string" && sourceLine.startsWith(match[2])) {
+            const complete = (lineEnd < sectionDelivered || sectionDelivered === section.length) && sourceLine === match[2];
+            delivered.push({line: Number(match[1]), character_start: 0, character_end: match[2].length, complete});
+          }
+        }
+      }
+      const completeLines = delivered.filter(range => range.complete).map(range => range.line);
+      let continuation: JsonObject | null = null;
+      const last = delivered[delivered.length - 1];
+      const limited = sectionDelivered < section.length || section.includes(marker) || (record.type === "find" && record.matches > delivered.length);
+      if (limited) continuation = {ref_id: record.ref_id, lineno: last ? last.line : record._requested_line || 1,
+        character_offset: last ? last.character_end : 0};
+      if (last?.complete && continuation) { continuation.lineno++; continuation.character_offset = 0; }
+      record.delivery = {citation_metadata_present: true, evidence_text_present: delivered.some(range => range.character_end > range.character_start),
+        transport_truncated: limited, character_offset_unit: "utf16-code-units", delivered_ranges: delivered, continuation,
+        export: reference?.kind === "page" ? {command: ["scrape", reference.url, "--format", "json", "--from-index"]} : null};
+      if (record.type === "find") { record.citation.evidence_lines = completeLines; record.lines = completeLines; }
+      else { record.citation.line_start = completeLines[0] || 0; record.citation.line_end = completeLines[completeLines.length - 1] || 0; }
+      record.citation.delivery = record.delivery;
+      if (reference?.kind === "page") {
+        record.extract_truncated = reference.page.truncated ? Object.values(reference.page.truncated).some(Boolean) : null;
+        record.coverage = reference.page.coverage || "unknown";
+      }
+    }
+    delete record._body_ranges;
+    delete record._requested_line;
+    sectionStart += section.length + 2;
+  }
+  return {text, records};
 }
 
 async function callRun(arguments_: unknown) {
@@ -1156,18 +1253,19 @@ async function callRun(arguments_: unknown) {
   if (!records.length) {
     throw new Error("run requires search_query, local_query, open, find, click, or replay");
   }
-  return {
-    content: [{ type: "text", text: compactText(rendered.join("\n\n"), budget) }],
+  const delivered = finalDelivery(records, rendered, budget);
+  return sanitizeMcp({
+    content: [{ type: "text", text: delivered.text }],
     structuredContent: {
       schema: "agency/web-tool-result/1",
       results: records,
       sources: sourceLedger(records),
     },
-  };
+  });
 }
 
 function write(message: JsonObject) {
-  const serialized = JSON.stringify(message);
+  const serialized = JSON.stringify(sanitizeMcp(message));
   if (Buffer.byteLength(serialized) > maximumResponseBytes) {
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null,
       error: { code: -32603, message: "Response exceeds 4 MiB" } }) + "\n");
@@ -1180,6 +1278,62 @@ async function drainOutput() {
 
 function protocolError(id: unknown, code: number, message: string) {
   write({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
+}
+
+const corpusTool = {
+  name: "corpus", title: "Research corpus",
+  description: "Run the durable research-corpus CLI. Command is an argument vector; no shell is used. Returns committed artifact identities and honest access/coverage state.",
+  inputSchema: {type: "object", additionalProperties: false, required: ["command"],
+    properties: {command: {type: "array", minItems: 1, maxItems: 128, items: {type: "string", maxLength: 8192}}}},
+};
+async function invokeCorpusCommand(command: string[], input?: string) {
+  const tool = join(dirname(realpathSync(Bun.argv[1])), "research-corpus");
+  const child = Bun.spawn([tool, ...command], {stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    env: {...process.env, RESEARCH_CORPUS_PARENT_PIPE: input === undefined ? "1" : "0"}});
+  if (input !== undefined) { child.stdin.write(input); child.stdin.end(); }
+  let stopping: Promise<void> | undefined;
+  const stop = () => stopping ||= (async () => {
+    child.stdin.end();
+    if (child.exitCode !== null) return;
+    if (input !== undefined) child.kill("SIGTERM");
+    let grace: ReturnType<typeof setTimeout> | undefined;
+    try { await Promise.race([child.exited, new Promise(resolve => { grace = setTimeout(resolve, 3_000); })]); }
+    finally { clearTimeout(grace); }
+    if (child.exitCode === null) { child.kill("SIGKILL"); await child.exited; }
+  })();
+  const timer = setTimeout(() => { void stop(); }, backendDeadlineMs);
+  try {
+    const [stdout, stderr, status] = await Promise.all([boundedStream(child.stdout, maximumBackendBytes),
+      boundedStream(child.stderr, maximumBackendErrorBytes), child.exited]);
+    let result: JsonObject;
+    try { result = JSON.parse(stdout); }
+    catch { throw new Error(status !== 0 ? sanitizeMcp(stderr.slice(0, 2000)) || "research-corpus failed" : "research-corpus returned invalid JSON"); }
+    return {result, status};
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null || stopping) await stop();
+  }
+}
+async function callCorpus(arguments_: unknown) {
+  if (!isObject(arguments_) || Object.keys(arguments_).some(key => key !== "command") ||
+      !Array.isArray(arguments_.command) || !arguments_.command.length || arguments_.command.length > 128 ||
+      arguments_.command.some(value => typeof value !== "string" || value.length > 8192 || value.includes("\0"))) {
+    throw new Error("corpus requires a bounded command string array");
+  }
+  const command = arguments_.command as string[];
+  if (command[0] === "--mcp-plan") throw new Error("MCP planning is internal IPC only");
+  if (command[0] === "profiles" && command[1] === "handles") throw new Error("Profile handle enumeration is internal IPC only");
+  if (command[0] === "profiles") {
+    const plan = await invokeCorpusCommand(["--mcp-plan"], JSON.stringify({command}));
+    if (plan.status !== 0) throw new Error("Could not validate selected profile operation");
+    if (plan.result.schema !== "agency/corpus-mcp-plan/1" || !Array.isArray(plan.result.profile_requests)) throw new Error("Invalid private profile plan");
+    // Reuse this MCP client's worker so it can release its own exact tracked lease.
+    // Foreign clients retain their locks and return a conflict through normal close validation.
+    for (const request of plan.result.profile_requests) await invoke(["profile-close"], JSON.stringify(request));
+  }
+  const {result, status} = await invokeCorpusCommand(command);
+  const sanitized = sanitizeMcp(result);
+  return {content: [{type: "text", text: JSON.stringify(sanitized)}], structuredContent: sanitized, ...(status !== 0 ? {isError: true} : {})};
 }
 
 async function handle(message: unknown) {
@@ -1208,16 +1362,16 @@ async function handle(message: unknown) {
     return;
   }
   if (message.method === "tools/list") {
-    write({ jsonrpc: "2.0", id: message.id, result: { tools: [runTool] } });
+    write({ jsonrpc: "2.0", id: message.id, result: { tools: [runTool, corpusTool] } });
     return;
   }
   if (message.method === "tools/call") {
-    if (!isObject(message.params) || message.params.name !== "run") {
+    if (!isObject(message.params) || !["run", "corpus"].includes(message.params.name)) {
       protocolError(message.id, -32602, "Unknown tool");
       return;
     }
     try {
-      const result = await callRun(message.params.arguments);
+      const result = message.params.name === "corpus" ? await callCorpus(message.params.arguments) : await callRun(message.params.arguments);
       write({ jsonrpc: "2.0", id: message.id, result });
     } catch (error) {
       write({

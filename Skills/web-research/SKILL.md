@@ -5,6 +5,13 @@ description: Search, read, map, crawl, or download from the live web with federa
 
 # Research through local Firefox
 
+For durable multi-search collection, use [research-corpus](../research-corpus/SKILL.md).
+It commits sanitized discovery and opened-source siblings before the next search,
+records exact run recipes/software, and supports relocated offline reproduction,
+source-only FTS queries, screening reconciliation, audit, and exact authorized
+owned-profile cleanup. Ordinary browser profiles and caches remain outside the
+portable corpus. A citation ledger is not proof that source body text was delivered.
+
 Prefer the installed `agency-web` agent tool when it is available. Its
 `search_query`, `open`, `find`, and `click` operations provide compact stable
 references, freshness-aware URL preflight, and citation-ready evidence while

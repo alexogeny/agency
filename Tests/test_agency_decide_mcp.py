@@ -86,13 +86,16 @@ class DecisionMCPTests(unittest.TestCase):
         arguments = [{}, {'profile': 'unknown', 'state': 'x'}, {'profile': 'skill', 'state': ''},
                      {'profile': 'skill', 'state': {'task': 'x'}, 'api_key': 'secret'},
                      {'profile': 'skill', 'state': True}, {'profile': 'skill', 'state': {'task': 'x'}}]
-        with patch.object(mcp, 'key_available', return_value=False), patch.object(mcp.subprocess, 'run') as run:
+        with patch.object(mcp, '_read_key', side_effect=mcp.DecisionError('No fixture credential')), \
+             patch.object(mcp.DecisionWorker, 'classify') as classify, \
+             patch.object(mcp.subprocess, 'run') as run:
             for args in arguments:
                 with self.subTest(args=args):
                     result = mcp.handle(message('tools/call', {'name': 'classify', 'arguments': args}))['result']
                     self.assertTrue(result['isError'])
                     self.assertNotIn('secret', json.dumps(result))
         run.assert_not_called()
+        classify.assert_not_called()
 
     def test_worker_errors_timeout_and_stderr_never_leak(self):
         with patch.object(mcp, 'key_available', return_value=True), patch.object(mcp, '_read_key', return_value='test-key'), \

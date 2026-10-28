@@ -364,6 +364,14 @@ confirmed release.
 
 ### Turn the live web into durable evidence
 
+[`research-corpus`](Skills/research-corpus/SKILL.md) retains portable sanitized
+search and source evidence with immutable sibling exports, explicit access and
+coverage, source-only local queries, screening reconciliation, and audit. It
+archives exact run recipes and processing code for relocated offline reproduction;
+live reruns report changes without promising identical future web results.
+Generated databases and browser state remain outside the corpus. The skill
+includes an executable synthetic workflow and exact authorized profile cleanup.
+
 [`web-research`](Skills/web-research/SKILL.md) is Agency's local research
 system for the parts of the web that ordinary HTTP clients cannot reliably
 read. It starts with the cheapest useful path, escalates to the installed

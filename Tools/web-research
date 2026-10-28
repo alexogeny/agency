@@ -95,6 +95,8 @@ type PageFreshness = {
   indexed_at: string | null;
   refresh_after: string | null;
   content_sha256: string;
+  content_sha256_stage?: string;
+  content_sha256_byte_scope?: string;
   changed?: boolean;
 };
 type PageAccessState = "public" | "soft-login" | "soft-challenge";
@@ -237,12 +239,12 @@ function terminalText(value: unknown) {
 
 function fail(message: string): never {
   if (workerMode) throw new Error(message);
-  process.stderr.write(`${red}error:${reset} ${terminalText(message)}\n`);
+  process.stderr.write(`${red}error:${reset} ${terminalText(sanitizeEvidenceValue(message))}\n`);
   process.exit(1);
 }
 
 function info(message: string) {
-  process.stderr.write(`${purple}◇${reset} ${terminalText(message)}\n`);
+  process.stderr.write(`${purple}◇${reset} ${terminalText(sanitizeEvidenceValue(message))}\n`);
 }
 
 function takeOption(args: string[], name: string, fallback = "") {
@@ -311,11 +313,37 @@ function checkedUrl(value: string) {
   return url;
 }
 
+function evidenceLibrary(name: string) {
+  const adjacent = join(dirname(realpathSync(Bun.argv[1])), name);
+  // Source-prefix fixtures run from scratch while retaining the repository cwd.
+  return basename(realpathSync(Bun.argv[1])) === "web-research" || existsSync(adjacent)
+    ? adjacent : join(process.cwd(), "Tools", name);
+}
+
+let sharedEvidenceSanitizer: any;
+function evidenceSanitizer() {
+  return sharedEvidenceSanitizer ||= require(evidenceLibrary("web_research_evidence.ts"));
+}
+function sanitizeEvidenceValue<T>(value: T): T {
+  return evidenceSanitizer().sanitizeEvidence(value).value;
+}
+
+function evidenceJson(value: unknown, replacer?: any, space?: number) {
+  return JSON.stringify(sanitizeEvidenceValue(value), replacer, space);
+}
+
+function sanitizedPage<T>(value: T): T {
+  const result = evidenceSanitizer().sanitizeEvidence(value);
+  const prior = (value as any)?.redaction;
+  const count = prior?.version === result.redaction.version && Number.isSafeInteger(prior.count) ? prior.count : 0;
+  return { ...result.value, redaction: {...result.redaction, count: count + result.redaction.count} };
+}
+
 function sensitiveQueryParameter(name: string) {
   const normalized = name.toLowerCase();
   return (
     /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(normalized) ||
-    /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|solution)(?:$|[_-])/.test(
+    /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|sig|solution)(?:$|[_-])/.test(
       normalized,
     ) ||
     /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(normalized)
@@ -2477,7 +2505,7 @@ function extractionExpression(options: BrowserOptions) {
   ${domQueryHelpers}
   const discoveryTruncated = domTruncated
   const first = selector => queryAll(selector)[0] || null
-  const sensitive = name => /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(name) || /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|solution)(?:$|[_-])/.test(name) || /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(name)
+  const sensitive = name => /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(name) || /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|sig|solution)(?:$|[_-])/.test(name) || /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(name)
   const absolute = value => {
     try {
       const url = new URL(value, location.href)
@@ -3548,9 +3576,10 @@ function captureDirectories() {
 }
 
 function captureInputForStorage(input: PageCaptureInput): PageCaptureInput {
+  input = sanitizedPage(input);
   const sanitizeHtml = (value: string) =>
     value.replace(/https?:\/\/[^\s"'<>]+/gi, (url) => redactedOutputUrl(url));
-  return {
+  return sanitizedPage({
     ...input,
     requested_url: redactedOutputUrl(input.requested_url),
     captures: input.captures.map((capture) => ({
@@ -3587,7 +3616,7 @@ function captureInputForStorage(input: PageCaptureInput): PageCaptureInput {
       ...(frame.title ? { title: terminalText(frame.title) } : {}),
       ...(frame.text ? { text: terminalText(frame.text) } : {}),
     })),
-  };
+  });
 }
 
 function storedCapture(
@@ -3599,7 +3628,7 @@ function storedCapture(
   if (!input) throw new Error("page capture state is unavailable");
   input.frames = frames;
   const storedInput = captureInputForStorage(input);
-  const serialized = `${JSON.stringify(storedInput)}\n`;
+  const serialized = `${evidenceJson(storedInput)}\n`;
   const objectSha256 = createHash("sha256").update(serialized).digest("hex");
   const directories = captureDirectories();
   const objectPath = join(directories.objects, `${objectSha256}.json`);
@@ -3629,13 +3658,13 @@ function storedCapture(
   let manifestPath = "";
   do {
     id = createHash("sha256")
-      .update(`${JSON.stringify(core)}\n${suffix}`)
+      .update(`${evidenceJson(core)}\n${suffix}`)
       .digest("hex");
     manifestPath = join(directories.manifests, `${id}.json`);
     suffix += 1;
   } while (existsSync(manifestPath));
   const manifest: CaptureManifest = { ...core, id };
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
+  writeFileSync(manifestPath, `${evidenceJson(manifest, null, 2)}\n`, {
     flag: "wx",
     mode: 0o600,
   });
@@ -3822,9 +3851,9 @@ function searchUrl(engine: string, query: string) {
 function searchExpression(engine: string, limit: number) {
   return String.raw`(() => {
     const limit = ${limit}
-    const engine = ${JSON.stringify(engine)}
+    const engine = ${evidenceJson(engine)}
     const absolute = value => { try { return new URL(value, location.href) } catch { return null } }
-    const sensitive = name => /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(name) || /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|solution)(?:$|[_-])/.test(name) || /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(name)
+    const sensitive = name => /(^|[_-])(?:access|auth|id|refresh)?[_-]?token($|[_-])/.test(name) || /(^|[_-])(?:api[_-]?key|captcha|challenge|credential|secret|signature|sig|solution)(?:$|[_-])/.test(name) || /^(?:authorization|bearer|cf_chl_|jsc_|session|trkinfo)/.test(name)
     const sanitized = url => {
       url.username = ""
       url.password = ""
@@ -4184,6 +4213,7 @@ function database() {
       ["freshness_basis", "TEXT NOT NULL DEFAULT '[\"legacy-index-entry\"]'"],
       ["refresh_after", "TEXT"],
       ["content_sha256", "TEXT NOT NULL DEFAULT ''"],
+      ["evidence_json", "TEXT NOT NULL DEFAULT '{}'"],
     ];
     for (const [name, definition] of migrations) {
       if (!columns.has(name)) {
@@ -4215,7 +4245,7 @@ function database() {
 
 function normalizedPageUrl(value: string) {
   try {
-    const url = new URL(redactedOutputUrl(value) || value);
+    const url = new URL(redactedOutputUrl(sanitizeEvidenceValue(value)) || sanitizeEvidenceValue(value));
     url.hash = "";
     return url.href;
   } catch {
@@ -4473,8 +4503,19 @@ function parsedJobCards(value: unknown) {
   }
 }
 
-function cachedPageReader() {
-  const db = database();
+function cachedPageReader(strict = false) {
+  let db: Database;
+  if (strict) {
+    const path = join(dataRoot, "index.sqlite");
+    if (!existsSync(path)) throw Object.assign(new Error("Local index is unavailable; request a scoped live refresh"), {code: "index-unavailable"});
+    db = new Database(path, { readonly: true });
+    try {
+      const columns = new Set((db.query("PRAGMA table_info(pages)").all() as any[]).map(column => column.name));
+      if (!["evidence_json", "refresh_after", "change_likelihood"].every(name => columns.has(name))) {
+        throw Object.assign(new Error("Legacy index requires a scoped live refresh"), {code: "index-legacy"});
+      }
+    } catch (error) { db.close(); throw error; }
+  } else db = database();
   try {
     const lookup = db.query(
       "SELECT pages.* FROM pages WHERE pages.url = COALESCE((SELECT page_url FROM page_aliases WHERE request_url = ?), ?) LIMIT 1",
@@ -4489,6 +4530,10 @@ function cachedPageReader() {
         )
           ? (row.change_likelihood as ChangeLikelihood)
           : "medium";
+        const metadata = JSON.parse(row.evidence_json || '{}');
+        if (strict && metadata.evidence_metadata_version !== "agency/web-index-evidence/1") {
+          throw Object.assign(new Error("Legacy cached evidence metadata requires a scoped live refresh"), {code: "index-legacy"});
+        }
         const immutable = likelihood === "immutable";
         const fresh =
           immutable ||
@@ -4507,6 +4552,7 @@ function cachedPageReader() {
           links: parsedArray(row.links_json),
           jobs: parsedJobCards(row.jobs_json),
           sources: [...new Set([...parsedArray(row.sources_json), "local-index"])],
+          ...metadata,
           freshness: {
             retrieval: "local-index",
             cache: immutable ? "immutable" : "fresh",
@@ -4517,6 +4563,8 @@ function cachedPageReader() {
             refresh_after:
               row.refresh_after === null ? null : String(row.refresh_after),
             content_sha256: String(row.content_sha256 || contentHash(row)),
+            content_sha256_stage: metadata.evidence_metadata_version === "agency/web-index-evidence/1" ? "sanitized-extract" : "unknown-historical",
+            content_sha256_byte_scope: "UTF-8 markdown when nonempty, otherwise text; no header or trailing newline added",
           },
         };
         return { cache: page.freshness!.cache, page };
@@ -4529,8 +4577,8 @@ function cachedPageReader() {
   }
 }
 
-function cachedPage(url: string) {
-  const reader = cachedPageReader();
+function cachedPage(url: string, strict = false) {
+  const reader = cachedPageReader(strict);
   try {
     return reader.get(url);
   } finally {
@@ -4542,7 +4590,7 @@ function pageIndexer() {
   const db = database();
   try {
     const upsert = db.query(
-      "INSERT INTO pages (url, title, text, markdown, fetched_at, published, byline, links_json, jobs_json, sources_json, change_likelihood, freshness_basis, refresh_after, content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at, published=excluded.published, byline=excluded.byline, links_json=excluded.links_json, jobs_json=excluded.jobs_json, sources_json=excluded.sources_json, change_likelihood=excluded.change_likelihood, freshness_basis=excluded.freshness_basis, refresh_after=excluded.refresh_after, content_sha256=excluded.content_sha256",
+      "INSERT INTO pages (url, title, text, markdown, fetched_at, published, byline, links_json, jobs_json, sources_json, change_likelihood, freshness_basis, refresh_after, content_sha256, evidence_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET title=excluded.title, text=excluded.text, markdown=excluded.markdown, fetched_at=excluded.fetched_at, published=excluded.published, byline=excluded.byline, links_json=excluded.links_json, jobs_json=excluded.jobs_json, sources_json=excluded.sources_json, change_likelihood=excluded.change_likelihood, freshness_basis=excluded.freshness_basis, refresh_after=excluded.refresh_after, content_sha256=excluded.content_sha256, evidence_json=excluded.evidence_json",
     );
     const prior = db.query(
       "SELECT content_sha256, CAST(fts_rowid AS TEXT) AS fts_rowid, title = ? AND text = ? AS search_unchanged FROM pages WHERE url = ?",
@@ -4558,11 +4606,17 @@ function pageIndexer() {
     );
     const write = db.transaction(
       (page: Page, requestedUrl = "", cache = "bypass") => {
+        Object.assign(page, sanitizedPage(page));
         const url = pageIndexUrl(page);
         const indexedAt = new Date().toISOString();
         const policy = freshnessPolicy(page, indexedAt);
         const hash = contentHash(page);
         const previous = prior.get(page.title, page.text, url) as any;
+        const evidence: JsonObject = {evidence_metadata_version: "agency/web-index-evidence/1"};
+        for (const field of ["access", "state", "provenance", "quality", "truncated", "outcome", "constraint", "failed_stage", "navigation_attempts", "redaction", "canonicalUrl"]) {
+          if ((page as any)[field] !== undefined) evidence[field] = (page as any)[field];
+        }
+        evidence.coverage = "unknown";
         upsert.run(
           url,
           page.title,
@@ -4578,6 +4632,7 @@ function pageIndexer() {
           JSON.stringify(policy.basis),
           policy.refreshAfter,
           hash,
+          JSON.stringify(evidence),
         );
         for (const alias of new Set(
           [url, page.url, page.canonicalUrl, requestedUrl]
@@ -4601,6 +4656,8 @@ function pageIndexer() {
           indexed_at: indexedAt,
           refresh_after: policy.refreshAfter,
           content_sha256: hash,
+          content_sha256_stage: "sanitized-extract",
+          content_sha256_byte_scope: "UTF-8 markdown when nonempty, otherwise text; no header or trailing newline added",
           ...(previous?.content_sha256
             ? { changed: previous.content_sha256 !== hash }
             : {}),
@@ -4973,7 +5030,7 @@ class HealthCheckpoint {
       retry_after_seconds: boundedRetryAfter,
       ...(failedStage ? { failed_stage: failedStage } : {}),
     };
-    writeFileSync(this.path, `${JSON.stringify(event)}\n`, { flag: "a" });
+    writeFileSync(this.path, `${evidenceJson(event)}\n`, { flag: "a" });
     this.events.set(this.eventKey(scope, key), event);
     return event;
   }
@@ -5006,7 +5063,7 @@ function healthCheckpoint(
       input_bytes: inputBytes,
       created_at: new Date().toISOString(),
     };
-    writeFileSync(path, `${JSON.stringify(run)}\n`, {
+    writeFileSync(path, `${evidenceJson(run)}\n`, {
       flag: "wx",
       mode: 0o600,
     });
@@ -5143,7 +5200,7 @@ function healthCheckpoint(
   }
   writeFileSync(
     path,
-    `${JSON.stringify({
+    `${evidenceJson({
       schema: "agency/web-health-input/1",
       previous_sha256: acceptedInputSha256,
       previous_bytes: acceptedInputBytes,
@@ -5318,7 +5375,7 @@ async function commandSearchBatch(args: string[]) {
             );
         writeFileSync(
           output,
-          `${JSON.stringify({
+          `${evidenceJson({
             schema: "agency/web-search-result/1",
             query,
             outcome: "searched",
@@ -5336,7 +5393,7 @@ async function commandSearchBatch(args: string[]) {
         const message = error instanceof Error ? error.message : String(error);
         writeFileSync(
           output,
-          `${JSON.stringify({
+          `${evidenceJson({
             schema: "agency/web-search-result/1",
             query,
             outcome: "failed",
@@ -5663,7 +5720,7 @@ async function commandScrapeBatch(args: string[]) {
           if (!partial) indexer?.write(page);
           writeFileSync(
             output,
-            `${JSON.stringify({
+            `${evidenceJson({
               schema: "agency/web-page-result/1",
               requested_url: requestedUrl,
               outcome: partial ? "partial" : "scraped",
@@ -5710,7 +5767,7 @@ async function commandScrapeBatch(args: string[]) {
           if (hardGate && retainedEvidence.length) {
             writeFileSync(
               output,
-              `${JSON.stringify({
+              `${evidenceJson({
                 schema: "agency/web-page-result/1",
                 requested_url: requestedUrl,
                 outcome: "partial",
@@ -5724,7 +5781,7 @@ async function commandScrapeBatch(args: string[]) {
           } else {
             writeFileSync(
               output,
-              `${JSON.stringify({
+              `${evidenceJson({
                 schema: "agency/web-page-result/1",
                 requested_url: requestedUrl,
                 outcome: "failed",
@@ -6072,6 +6129,7 @@ async function commandScrape(args: string[]) {
   const output = takeOption(args, "--output");
   const shouldIndex = takeFlag(args, "--index");
   const shouldPreflight = takeFlag(args, "--preflight");
+  const fromIndex = takeFlag(args, "--from-index");
   const includeFrames = takeFlag(args, "--include-frames");
   const frameOrigins = takeOptions(args, "--frame-origin").map(
     (value) => checkedUrl(value).origin,
@@ -6089,6 +6147,19 @@ async function commandScrape(args: string[]) {
   }
   if (args.length !== 1) fail("scrape requires one URL");
   const url = checkedUrl(args[0]);
+  if (fromIndex) {
+    if (format !== "json" || shouldIndex || includeFrames || options.capture || options.captureNetworkJson || options.scrollSteps || options.interactionSteps) {
+      throw Object.assign(new Error("--from-index requires --format json and no live/index mutation options"), {code: "invalid-index-request"});
+    }
+    let cached: ReturnType<typeof cachedPage>;
+    try { cached = cachedPage(url.href, true); }
+    catch (error) { throw Object.assign(error as Error, {code: (error as any).code || "index-unavailable"}); }
+    if (!cached.page) throw Object.assign(new Error(`Index entry is ${cached.cache}; request an explicit live refresh`), {code: cached.cache === "stale" ? "index-stale" : "index-miss"});
+    const exported = JSON.stringify(sanitizedPage(cached.page), null, 2);
+    if (output) await Bun.write(resolve(output), exported + "\n");
+    else console.log(exported);
+    return;
+  }
   explicitNetworkTarget(url, options.allowPrivate);
   const cacheEligible =
     shouldPreflight &&
@@ -6142,9 +6213,12 @@ async function commandScrape(args: string[]) {
         indexed_at: null,
         refresh_after: policy.refreshAfter,
         content_sha256: contentHash(page),
+        content_sha256_stage: "extracted-evidence-before-export-sanitization",
+        content_sha256_byte_scope: "UTF-8 markdown when nonempty, otherwise text; no header or trailing newline added",
       };
     }
   }
+  page = sanitizedPage(page);
   const content =
     format === "json"
       ? JSON.stringify(page, null, 2)
@@ -6472,7 +6546,7 @@ async function commandCrawl(args: string[]) {
       );
       let rules: string[] = [];
       if (!ignoreRobots) {
-        const expression = `fetch(${JSON.stringify(`${root.origin}/robots.txt`)}, { credentials: "include" }).then(response => response.ok ? response.text() : "").catch(() => "")`;
+        const expression = `fetch(${evidenceJson(`${root.origin}/robots.txt`)}, { credentials: "include" }).then(response => response.ok ? response.text() : "").catch(() => "")`;
         rules = parseRobots(
           String(await browser.bidi.evaluate(browser.context, expression)),
         );
@@ -6673,6 +6747,38 @@ async function commandBrowser(args: string[]) {
   }
 }
 
+let privateLifecycleOutput = false;
+async function commandOwnedProfile(command: string, args: string[]) {
+  if (args.length) throw new Error("Profile lifecycle operations accept JSON on stdin only");
+  const input = workerInput === undefined ? await Bun.stdin.text() : workerInput;
+  if (command === "profile-close" && workerBrowser) {
+    const request = JSON.parse(input);
+    // The Python validator does no lock or process mutation. Close only our exact validated lease.
+    const validator = Bun.spawn(["python3", evidenceLibrary("web_research_owned_profiles.py"), "profile-validate"], {
+      stdin: "pipe", stdout: "pipe", stderr: "pipe", env: {...process.env, PYTHONDONTWRITEBYTECODE: "1"},
+    });
+    validator.stdin.write(input); validator.stdin.end();
+    const [validation, validationErrors, status] = await Promise.all([new Response(validator.stdout).text(), new Response(validator.stderr).text(), validator.exited]);
+    if (status !== 0) throw new Error(validation.trim() || validationErrors.slice(0, 2000) || "Profile validation failed");
+    if (workerBrowser.browser.root === request.handle.canonical_path) await closeWorkerBrowser();
+  }
+  const child = Bun.spawn(["python3", evidenceLibrary("web_research_owned_profiles.py"), command], {
+    stdin: "pipe", stdout: "pipe", stderr: "pipe", env: {...process.env, PYTHONDONTWRITEBYTECODE: "1"},
+  });
+  child.stdin.write(input); child.stdin.end();
+  const [stdout, stderr, status] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  if (stdout) {
+    privateLifecycleOutput = true;
+    try { console.log(stdout.trim()); }
+    finally { privateLifecycleOutput = false; }
+  }
+  if (status !== 0) {
+    if (workerMode) throw new Error(stdout.trim() || "Owned profile operation failed");
+    if (stderr) info(stderr.slice(0, 2000));
+    process.exitCode = status;
+  }
+}
+
 function commandProfileState(args: string[]) {
   const profile = checkedProfile(takeOption(args, "--profile", "default"));
   const purpose = takeOption(args, "--purpose", "");
@@ -6710,6 +6816,8 @@ Usage:
   web-research retrieve URL... [--json] [--max-bytes N] [--timeout-ms N]
   web-research download URL --output PATH --output-root PATH [--expected-type TYPE]
   web-research scrape URL [--format markdown|text|html|json] [--preflight] [--include-frames]
+  web-research scrape URL --format json --from-index
+  web-research profile-create|profile-close|profile-cleanup < REQUEST.json
   web-research replay CAPTURE_ID [--json]
   web-research capture-gc --max-manifests N [--apply] [--json]
   web-research map URL [--limit N] [--json]
@@ -6807,6 +6915,7 @@ async function dispatchWebCommand(command: string | undefined, args: string[]) {
   else if (command === "replay") commandReplay(args);
   else if (command === "capture-gc") commandCaptureGc(args);
   else if (command === "profile-state") commandProfileState(args);
+  else if (["profile-create", "profile-close", "profile-cleanup"].includes(command || "")) await commandOwnedProfile(command!, args);
   else if (command === "map") await commandMap(args);
   else if (command === "snapshot") await commandSnapshot(args);
   else if (command === "crawl") await commandCrawl(args);
@@ -6848,12 +6957,14 @@ async function commandWorker() {
         parts = []; bytes = 0; start = separator + 1;
         if (!line.trim()) continue;
         let result: unknown;
+        let requestCommand = "";
         try {
           const request = JSON.parse(line);
           if (!Array.isArray(request.args) || !request.args.every((arg: unknown) => typeof arg === "string") ||
-              typeof request.input !== "string" || !new Set(["search-many", "scrape", "scrape-many", "local", "replay"]).has(request.args[0])) {
+              typeof request.input !== "string" || !new Set(["search-many", "scrape", "scrape-many", "local", "replay", "profile-close"]).has(request.args[0])) {
             throw new Error("invalid worker request");
           }
+          requestCommand = request.args[0];
           workerInput = request.input;
           let serialized = "";
           console.log = (...values: unknown[]) => {
@@ -6865,7 +6976,7 @@ async function commandWorker() {
           await dispatchWebCommand(args.shift(), args);
           result = { result: JSON.parse(serialized) };
         } catch (error) {
-          await closeWorkerBrowser();
+          if (requestCommand !== "profile-close") await closeWorkerBrowser();
           result = { error: error instanceof Error ? error.message : String(error) };
         } finally { console.log = output; workerInput = undefined; }
         await new Promise<void>((resolve, reject) => {
@@ -6876,11 +6987,23 @@ async function commandWorker() {
   } finally { console.log = output; await close(); }
 }
 
+const originalConsoleLog = console.log;
+const originalConsoleError = console.error;
+console.error = (...values: unknown[]) => originalConsoleError(...values.map(value => sanitizeEvidenceValue(value instanceof Error ? value.message : value)));
+console.log = (...values: unknown[]) => originalConsoleLog(...values.map(value => {
+  if (privateLifecycleOutput) return value;
+  if (typeof value !== "string") return sanitizeEvidenceValue(value);
+  try { return JSON.stringify(sanitizeEvidenceValue(JSON.parse(value)), null, 2); }
+  catch { return sanitizeEvidenceValue(value); }
+}));
 const args = Bun.argv.slice(2);
 const command = args.shift();
 try {
   if (command === "worker") await commandWorker();
   else await dispatchWebCommand(command, args);
 } catch (error) {
-  fail(error instanceof Error ? error.message : String(error));
+  if (command === "scrape" && args.includes("--from-index") || (error as any)?.code?.startsWith("index-")) {
+    console.log(JSON.stringify({error: {code: (error as any).code || "index-unavailable", message: error instanceof Error ? error.message : String(error), stage: "index-export", retriable: false, next_action: "Request an explicit scoped live refresh"}}));
+    process.exitCode = 1;
+  } else fail(sanitizeEvidenceValue(error instanceof Error ? error.message : String(error)));
 }

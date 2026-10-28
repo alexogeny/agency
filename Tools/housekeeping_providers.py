@@ -365,7 +365,7 @@ def plan(proposals, *, pacman_keep=2):
 
 
 @contextmanager
-def _profile_guard(profile):
+def _profile_guard(profile, *, allow_missing=False, identity=None):
     lock = str(profile) + '.lock'
     try:
         stale = _lock_owner(lock)
@@ -382,11 +382,19 @@ def _profile_guard(profile):
     native = root = None
     try:
         os.write(descriptor, str(os.getpid()).encode())
-        root = projects._open_path(profile)
-        native = os.open('.parentlock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=root)
-        if not stat.S_ISREG(os.fstat(native).st_mode):
-            raise RuntimeError('Firefox native lock is not a regular file')
-        fcntl.lockf(native, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            root = projects._open_path(profile)
+        except FileNotFoundError:
+            if not allow_missing:
+                raise
+        if root is not None:
+            info = os.fstat(root)
+            if identity is not None and identity != {'device': info.st_dev, 'inode': info.st_ino}:
+                raise RuntimeError('Profile directory identity changed before locking')
+            native = os.open('.parentlock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=root)
+            if not stat.S_ISREG(os.fstat(native).st_mode):
+                raise RuntimeError('Firefox native lock is not a regular file')
+            fcntl.lockf(native, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
     finally:
         if native is not None:
