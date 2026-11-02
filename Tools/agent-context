@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import tomllib
 from collections import defaultdict
@@ -75,12 +76,120 @@ def project_trust(values, root):
     return trust
 
 
+class InstructionDocument:
+    def __init__(self, path):
+        self.path = path
+        self.identity = self.signature()
+        self.size = 0
+        digest = hashlib.sha256()
+        self.nonempty = False
+        with path.open('rb') as stream:
+            while block := stream.read(65536):
+                self.size += len(block)
+                digest.update(block)
+                self.nonempty = self.nonempty or bool(block.strip())
+        self.sha256 = digest.hexdigest()
+        self.check()
+
+    def signature(self):
+        info = self.path.stat()
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+    def check(self):
+        if self.signature() != self.identity:
+            raise ValueError(f'instruction document changed while auditing: {self.path}')
+
+    def __len__(self):
+        return self.size
+
+    def strip(self):
+        return self.nonempty
+
+    def __hash__(self):
+        return hash((self.size, self.sha256))
+
+    def __eq__(self, other):
+        if not isinstance(other, InstructionDocument) or (self.size, self.sha256) != (other.size, other.sha256):
+            return False
+        self.check()
+        other.check()
+        with self.path.open('rb') as first, other.path.open('rb') as second:
+            while True:
+                left, right = first.read(65536), second.read(65536)
+                if left != right:
+                    return False
+                if not left:
+                    self.check()
+                    other.check()
+                    return True
+
+    def count(self, value, start, end):
+        self.check()
+        total = 0
+        with self.path.open('rb') as stream:
+            stream.seek(start)
+            remaining = end - start
+            while remaining:
+                block = stream.read(min(65536, remaining))
+                if not block:
+                    break
+                total += block.count(value)
+                remaining -= len(block)
+        self.check()
+        return total
+
+    def hidden_headings(self, offset):
+        self.check()
+        headings = []
+        position = 0
+        beginning = True
+        fragments = None
+        carry = b''
+        with self.path.open('rb') as stream:
+            while True:
+                chunk = stream.read(65536)
+                data = carry + chunk
+                carry = b''
+                if chunk and data.endswith(b'\r'):
+                    data, carry = data[:-1], b'\r'
+                start = 0
+                for boundary in re.finditer(rb'\r\n|\r|\n', data):
+                    fragment = data[start:boundary.end()]
+                    if beginning:
+                        fragments = [] if fragment.startswith(b'#') else None
+                    if fragments is not None:
+                        fragments.append(fragment)
+                    position += len(fragment)
+                    if fragments is not None and position > offset:
+                        line = b''.join(fragments).decode('utf-8', errors='replace').rstrip('\r\n')
+                        if line.lstrip('#').startswith(' '):
+                            headings.append(line)
+                    beginning, fragments = True, None
+                    start = boundary.end()
+                fragment = data[start:]
+                if fragment:
+                    if beginning:
+                        fragments = [] if fragment.startswith(b'#') else None
+                    if fragments is not None:
+                        fragments.append(fragment)
+                    beginning = False
+                    position += len(fragment)
+                if not chunk:
+                    if fragments is not None and position > offset:
+                        line = b''.join(fragments).decode('utf-8', errors='replace').rstrip('\r\n')
+                        if line.lstrip('#').startswith(' '):
+                            headings.append(line)
+                    break
+        self.check()
+        return headings
+
+
 def first_nonempty(directory, filenames):
     for filename in filenames:
         path = directory / filename
         if not path.is_file():
             continue
-        data = path.read_bytes()
+        data = InstructionDocument(path)
         if data.strip():
             return path.absolute(), data
     return None
@@ -91,7 +200,7 @@ def first_project_document(directory, filenames):
         path = directory / filename
         if not path.is_file():
             continue
-        data = path.read_bytes()
+        data = InstructionDocument(path)
         return (path.absolute(), data) if data.strip() else None
     return None
 
@@ -116,7 +225,7 @@ def metadata(path, data, included_bytes=None):
     item = {
         "path": str(path),
         "bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
+        "sha256": data.sha256 if isinstance(data, InstructionDocument) else hashlib.sha256(data).hexdigest(),
     }
     if included_bytes is not None:
         item["included_bytes"] = included_bytes
@@ -125,6 +234,8 @@ def metadata(path, data, included_bytes=None):
 
 
 def hidden_headings(data, offset):
+    if isinstance(data, InstructionDocument):
+        return data.hidden_headings(offset)
     headings = []
     position = 0
     for raw_line in data.splitlines(keepends=True):

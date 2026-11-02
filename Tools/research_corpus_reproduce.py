@@ -47,6 +47,37 @@ def _verify(root, manifest):
     return len(manifest['records'])
 
 
+def _copy_manifest_storage(root, output):
+    raw = safe_path(root, 'manifest.json').read_bytes()
+    manifest = json.loads(raw)
+    head = manifest.get('publication_head')
+    if manifest.get('publication_base'):
+        relative = manifest['publication_base']
+        data = safe_path(root, relative).read_bytes()
+        _atomic_bytes(safe_path(output, relative), data)
+        for sid in json.loads(data).get('sources', {}):
+            identity = 'source-identities/' + sha256(sid.encode()) + '.json'
+            source = safe_path(root, identity)
+            if source.exists():
+                _atomic_bytes(safe_path(output, identity), source.read_bytes())
+    seen = set()
+    while head:
+        if head in seen:
+            raise CorpusError('invalid-checkpoint', 'Publication history contains a cycle', 'reproduce')
+        seen.add(head)
+        relative = 'publications/' + head + '.json'
+        data = safe_path(root, relative).read_bytes()
+        _atomic_bytes(safe_path(output, relative), data)
+        commit = json.loads(data)
+        for sid in commit.get('sources', {}):
+            identity = 'source-identities/' + sha256(sid.encode()) + '.json'
+            source = safe_path(root, identity)
+            if source.exists():
+                _atomic_bytes(safe_path(output, identity), source.read_bytes())
+        head = commit.get('previous')
+    _atomic_bytes(safe_path(output, 'manifest.json'), raw)
+
+
 def _worker(root, output, selected_software=None):
     """This function is executed from the retained package inside the OS sandbox."""
     def deny_network(event, args):
@@ -57,9 +88,10 @@ def _worker(root, output, selected_software=None):
     manifest = read_manifest(root)
     _verify(root, manifest)
     selected_count = 0
+    run_software = {run['run_id']: run['software'] for run in manifest['runs']}
     for entry in manifest['records']:
         record = load_record(root, entry)
-        software = record.get('software') or next(run['software'] for run in manifest['runs'] if run['run_id'] == record['run_id'])
+        software = record.get('software') or run_software[record['run_id']]
         if selected_software and software['path'] != selected_software:
             continue
         selected_count += 1
@@ -79,7 +111,7 @@ def _worker(root, output, selected_software=None):
         for name in [*software['hashes'], 'software.json']:
             relative = software['path'] + '/' + name
             _atomic_bytes(safe_path(output, relative), safe_path(root, relative).read_bytes())
-    atomic_json(safe_path(output, 'manifest.json'), manifest)
+    _copy_manifest_storage(root, output)
     print(json.dumps({'verified_records': selected_count, 'processor': 'archived', 'network': 'disabled', 'status': 'reproduced'}))
 
 
@@ -99,13 +131,22 @@ def reproduce(root, output):
         references = _software_refs(root, manifest)
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix='.reproduce-', dir=output.parent))
+        view = None
         try:
+            descriptor, view_name = tempfile.mkstemp(prefix='.reproduce-manifest-', suffix='.json', dir=output.parent)
+            view = Path(view_name)
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(canonical_bytes(manifest))
+                stream.flush()
+                os.fsync(stream.fileno())
             verified_count = 0
             executed = []
             for software in references:
                 package = safe_path(root, software['path'])
-                invocation = 'import sys; sys.path.insert(0,sys.argv[1]); import research_corpus_reproduce as r; r._worker(sys.argv[2],sys.argv[3],sys.argv[4])'
-                command = [sandbox, '--workspace', str(root), '--workspace-ro', '--rw', str(temporary), '--', sys.executable, '-I', '-B', '-c', invocation, str(package), str(root), str(temporary), software['path']]
+                # Older archived processors read a flat manifest. Supply the
+                # verified logical view read-only without rewriting the input.
+                invocation = 'import json,sys; sys.path.insert(0,sys.argv[1]); import research_corpus_reproduce as r; manifest=json.load(open(sys.argv[5],encoding="utf-8")); r.read_manifest=lambda root: manifest; r._worker(sys.argv[2],sys.argv[3],sys.argv[4])'
+                command = [sandbox, '--workspace', str(root), '--workspace-ro', '--rw', str(temporary), '--ro', str(view), '--', sys.executable, '-I', '-B', '-c', invocation, str(package), str(root), str(temporary), software['path'], str(view)]
                 completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin')})
                 if completed.returncode:
                     raise CorpusError('offline-processing-failed', 'Archived processor failed inside offline sandbox', 'reproduce', next_action='Verify archived runtime compatibility and sandbox availability', detail=completed.stderr.decode(errors='replace')[-2000:])
@@ -113,6 +154,7 @@ def reproduce(root, output):
                 verified_count += result['verified_records']
                 executed.append(software['path'])
             result = {'verified_records': verified_count, 'processor': 'archived', 'processors': executed, 'network': 'disabled', 'status': 'reproduced'}
+            _copy_manifest_storage(root, temporary)
             _verify(temporary, read_manifest(temporary))
             if result['verified_records'] != count:
                 raise CorpusError('reproduction-mismatch', 'Archived processor returned inconsistent count', 'reproduce')
@@ -122,5 +164,7 @@ def reproduce(root, output):
         except subprocess.TimeoutExpired as exc:
             raise CorpusError('offline-processing-timeout', 'Archived processing exceeded bounded duration', 'reproduce') from exc
         finally:
+            if view is not None:
+                view.unlink(missing_ok=True)
             if temporary.exists():
                 shutil.rmtree(temporary)

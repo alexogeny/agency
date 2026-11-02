@@ -73,7 +73,7 @@ def state_root():
     return root
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 CLAIM_IDLE_HOURS = 6
 
 
@@ -260,13 +260,17 @@ def expire_claims(connection):
 
 
 def git_value(cwd, *arguments):
-    result = subprocess.run(
-        ["git", "-C", str(cwd), *arguments],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *arguments],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        fail("Git repository inspection timed out; retry when Git is responsive")
     return result.stdout.strip() if result.returncode == 0 else None
 
 

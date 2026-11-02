@@ -173,14 +173,33 @@ def _git_check(path, root_fd):
         raise RuntimeError('Git tracked-file inspection unavailable; refusing removal') from error
 
 
+class _RootSet(set):
+    def __init__(self, roots):
+        super().__init__(roots)
+        self.tree = {}
+        for root in self:
+            if root == '/':
+                continue
+            node = self.tree
+            for part in root.split('/'):
+                node = node.setdefault(part, {})
+            node[None] = root
+
+
 def _matching_roots(value, roots):
     if not value.startswith('/'):
         return
     value = process_helpers['normalize_path'](value, collapse_dots=True)
-    while value and value != '/':
-        if value in roots:
-            yield value
-        value = value.rpartition('/')[0]
+    indexed = roots if isinstance(roots, _RootSet) else _RootSet(roots)
+    node = indexed.tree
+    matches = []
+    for part in value.split('/'):
+        node = node.get(part)
+        if node is None:
+            break
+        if None in node:
+            matches.append(node[None])
+    yield from reversed(matches)
 
 
 def _read_process_file(path):
@@ -188,7 +207,7 @@ def _read_process_file(path):
 
 
 def inspect_processes(roots, *, ignore_own_arguments=False):
-    roots = {str(root) for root in roots}
+    roots = _RootSet(str(root) for root in roots)
     if not roots:
         return {'blocked': {}, 'uninspected_processes': 0}
     unknown = 0

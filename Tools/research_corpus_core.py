@@ -21,9 +21,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote
 import uuid
 
 SCHEMA = 'agency/research-corpus/1'
+JOURNALED_SCHEMA = 'agency/research-corpus/2'
 RECORD_SCHEMA = 'agency/research-record/1'
 SANITIZER_VERSION = 'agency/export-sanitizer/1'
 MAX_BYTES = 16 * 1024 * 1024
+INLINE_RECORD_LIMIT = 8
+INLINE_MANIFEST_BYTES = 1024 * 1024
 _LOCKS = threading.local()
 _RUNTIME_IDENTITY = None
 SECRET = re.compile(r'(?:token|secret|password|passwd|authorization|cookie|signature|credential|api.?key|access.?key|session|^auth$|^sig$|^key$|^policy$)', re.I)
@@ -91,7 +94,10 @@ def _atomic_bytes(path, data):
 
 
 def atomic_json(path, value):
-    _atomic_bytes(path, canonical_bytes(value))
+    data = canonical_bytes(value)
+    if Path(path).name == 'manifest.json' and len(data) > MAX_BYTES * 4:
+        raise CorpusError('response-too-large', 'Manifest exceeds bounded input size; publication was not replaced', 'publish')
+    _atomic_bytes(path, data)
 
 
 @contextmanager
@@ -122,28 +128,86 @@ def _json(path):
         raise CorpusError('invalid-checkpoint', 'Cannot read valid corpus JSON', 'read') from exc
 
 
-def read_manifest(root):
+def read_manifest(root, expand=True):
+    """Read legacy or journaled metadata; publication can request only its header."""
     result = _json(safe_path(root, 'manifest.json'))
-    if result.get('schema') != SCHEMA:
+    if result.get('schema') not in (SCHEMA, JOURNALED_SCHEMA):
         raise CorpusError('unsupported-version', 'Unsupported corpus schema', 'manifest')
     for key, expected in [('corpus_id', str), ('protocol', dict), ('active_run', str), ('runs', list), ('sources', dict), ('records', list)]:
         if not isinstance(result.get(key), expected):
             raise CorpusError('invalid-checkpoint', 'Manifest has invalid required field: ' + key, 'manifest')
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', result['corpus_id']):
         raise CorpusError('invalid-checkpoint', 'Invalid corpus identity', 'manifest')
+    head = result.get('publication_head')
+    if expand and result.get('publication_base'):
+        header = result
+        result = _json(safe_path(root, header['publication_base']))
+        if result.get('publication_head') or result.get('publication_base'):
+            raise CorpusError('invalid-checkpoint', 'Publication base must be a materialized checkpoint', 'manifest')
+        result['schema'] = JOURNALED_SCHEMA
+        result['_attempt_counts'] = header['_attempt_counts']
+    if expand and head:
+        run_lookup = {run['run_id']: run for run in result['runs']}
+        result.pop('publication_head', None)
+        seen = set()
+        commits = []
+        while head:
+            if head in seen:
+                raise CorpusError('invalid-checkpoint', 'Publication history contains a cycle', 'manifest')
+            seen.add(head)
+            commit = _json(safe_path(root, 'publications/' + head + '.json'))
+            if commit.get('schema') != 'agency/research-publication/1' or commit['entry']['record_id'] != head:
+                raise CorpusError('invalid-checkpoint', 'Invalid publication history identity', 'manifest')
+            commits.append(commit)
+            head = commit.get('previous')
+        for commit in reversed(commits):
+            _apply_publication(result, commit, run_lookup)
     return result
+
+
+def _apply_publication(manifest, commit, run_lookup=None):
+    entry = commit['entry']
+    manifest['records'].append(entry)
+    for sid, source in commit.get('sources', {}).items():
+        old = manifest['sources'].get(sid, {})
+        if old and old['url'] != source['url']:
+            raise CorpusError('source-identity-mismatch', 'Source identity belongs to another URL', 'manifest')
+        manifest['sources'][sid] = {**source, 'aliases': sorted(set(old.get('aliases', []) + source.get('aliases', [])))}
+    if commit.get('operation_key'):
+        manifest.setdefault('operations', {})[commit['operation_key']] = {'record_id': entry['record_id'], 'request_hash': commit['request_hash']}
+    run = run_lookup[entry['run_id']] if run_lookup is not None else next(run for run in manifest['runs'] if run['run_id'] == entry['run_id'])
+    if commit.get('recipe'):
+        run['recipe']['queries'].append(commit['recipe'])
+    if entry['source_id']:
+        run['recipe']['selections'].append({'source_id': entry['source_id'], 'url': commit['url'], 'record_id': entry['record_id']})
 
 
 def committed_records(root):
     return read_manifest(root)['records']
 
 
-def load_record(root, entry):
-    for path, digest in entry['hashes'].items():
-        file = safe_path(root, path)
-        if not file.is_file() or sha256(file.read_bytes()) != digest:
-            raise CorpusError('artifact-integrity', 'Artifact missing or hash mismatch', 'verify', artifact=path)
-    record = _json(safe_path(root, entry['paths']['json']))
+def load_record(root, entry, verified=None):
+    record_path = safe_path(root, entry['paths']['json'])
+    if not record_path.is_file():
+        raise CorpusError('artifact-integrity', 'Record artifact is missing', 'verify', artifact=entry['paths']['json'])
+    if record_path.stat().st_size > MAX_BYTES * 4:
+        raise CorpusError('response-too-large', 'JSON exceeds bounded input size', 'read')
+    if verified is None:
+        for path, digest in entry['hashes'].items():
+            file = safe_path(root, path)
+            if not file.is_file():
+                raise CorpusError('artifact-integrity', 'Artifact missing or hash mismatch', 'verify', artifact=path)
+            digest_state = hashlib.sha256()
+            with file.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(65536), b''):
+                    digest_state.update(chunk)
+            actual = digest_state.hexdigest()
+            if actual != digest:
+                raise CorpusError('artifact-integrity', 'Artifact missing or hash mismatch', 'verify', artifact=path)
+        record = _json(record_path)
+    else:
+        # The auditing caller has checked these exact immutable sibling bytes.
+        record = json.loads(verified[entry['paths']['json']])
     if record.get('schema') != RECORD_SCHEMA or record.get('record_id') != entry['record_id']:
         raise CorpusError('unsupported-version', 'Invalid record schema or identity', 'verify')
     return record
@@ -448,22 +512,64 @@ def _publish(root, pending):
         os.rename(stage, destination)
         _fsync_dir(destination.parent)
     _crash('rename')
-    manifest = read_manifest(root)
+    manifest = read_manifest(root, expand=False)
+    counts = manifest.setdefault('_attempt_counts', {'length': 0, 'runs': {}})
+    if counts['length'] == 0:
+        for existing in manifest['records']:
+            totals = counts['runs'].setdefault(existing['run_id'], {})
+            totals[existing['kind']] = totals.get(existing['kind'], 0) + 1
+        counts['length'] = len(manifest['records'])
+    already_inline = any(item['record_id'] == record['record_id'] for item in manifest['records'])
+    if not already_inline and not manifest.get('publication_head') and not manifest.get('publication_base') and (len(manifest['records']) > INLINE_RECORD_LIMIT or len(canonical_bytes(manifest)) >= INLINE_MANIFEST_BYTES):
+        checkpoint_data = canonical_bytes({key: value for key, value in manifest.items() if key != '_attempt_counts'})
+        checkpoint = 'publication-bases/' + sha256(checkpoint_data) + '.json'
+        checkpoint_path = safe_path(root, checkpoint)
+        if not checkpoint_path.exists():
+            _atomic_bytes(checkpoint_path, checkpoint_data)
+        for sid, source in manifest['sources'].items():
+            identity_path = safe_path(root, 'source-identities/' + sha256(sid.encode()) + '.json')
+            if not identity_path.exists():
+                atomic_json(identity_path, {'url': source['url']})
+        manifest = {'schema': JOURNALED_SCHEMA, 'corpus_id': manifest['corpus_id'],
+                    'active_run': manifest['active_run'], 'protocol': {}, 'records': [],
+                    'sources': {}, 'operations': {}, 'runs': [], '_attempt_counts': counts,
+                    'publication_base': checkpoint, 'publication_run_ids': [run['run_id'] for run in manifest['runs']]}
+    if manifest.get('publication_base') and record['run_id'] not in manifest['publication_run_ids']:
+        raise CorpusError('unknown-run', 'Publication references an unknown run', 'publish')
     entry = {'record_id': record['record_id'], 'kind': record['kind'], 'run_id': record['run_id'], 'source_id': record['source_id'], 'paths': paths, 'hashes': {paths[kind]: sha256(content) for kind, content in data.items()}}
-    if not any(item['record_id'] == record['record_id'] for item in manifest['records']):
-        manifest['records'].append(entry)
-        for sid, source in pending.get('sources', {}).items():
-            if sid in manifest['sources'] and manifest['sources'][sid]['url'] != source['url']:
-                raise CorpusError('source-identity-mismatch', 'Source identity already belongs to another URL', 'publish')
-            old_aliases = manifest['sources'].get(sid, {}).get('aliases', [])
-            manifest['sources'][sid] = {**source, 'aliases': sorted(set(old_aliases + source.get('aliases', [])))}
-        if pending.get('operation_key'):
-            manifest['operations'][pending['operation_key']] = {'record_id': record['record_id'], 'request_hash': pending['request_hash']}
-        run = next(run for run in manifest['runs'] if run['run_id'] == record['run_id'])
-        if pending.get('recipe'):
-            run['recipe']['queries'].append(pending['recipe'])
-        if record['source_id']:
-            run['recipe']['selections'].append({'source_id': record['source_id'], 'url': record['url'], 'record_id': record['record_id']})
+    if not already_inline:
+        commit = {'schema': 'agency/research-publication/1', 'entry': entry,
+                  'sources': pending.get('sources', {}), 'url': record.get('url', ''),
+                  'operation_key': pending.get('operation_key'), 'request_hash': pending.get('request_hash'),
+                  'recipe': pending.get('recipe')}
+        fresh = manifest.get('publication_head') != record['record_id']
+        inline_bytes = len(canonical_bytes(manifest)) + len(canonical_bytes(commit))
+        if len(manifest['records']) < INLINE_RECORD_LIMIT and inline_bytes < INLINE_MANIFEST_BYTES and not manifest.get('publication_head') and not manifest.get('publication_base'):
+            _apply_publication(manifest, commit)
+        else:
+            for sid, source in commit['sources'].items():
+                identity_path = safe_path(root, 'source-identities/' + sha256(sid.encode()) + '.json')
+                old = _json(identity_path) if identity_path.exists() else manifest['sources'].get(sid)
+                if old and old['url'] != source['url']:
+                    raise CorpusError('source-identity-mismatch', 'Source identity already belongs to another URL', 'publish')
+                if not identity_path.exists():
+                    atomic_json(identity_path, {'url': source['url']})
+            commit_path = safe_path(root, 'publications/' + record['record_id'] + '.json')
+            if manifest.get('publication_head') != record['record_id']:
+                commit['previous'] = manifest.get('publication_head')
+                if commit_path.exists():
+                    if _json(commit_path) != commit:
+                        raise CorpusError('invalid-checkpoint', 'Publication history differs from pending checkpoint', 'publish')
+                else:
+                    if len(canonical_bytes(commit)) > MAX_BYTES * 4:
+                        raise CorpusError('response-too-large', 'Publication delta exceeds bounded input size', 'publish')
+                    atomic_json(commit_path, commit)
+                manifest['publication_head'] = record['record_id']
+                manifest['schema'] = JOURNALED_SCHEMA
+        if fresh:
+            totals = counts['runs'].setdefault(record['run_id'], {})
+            totals[record['kind']] = totals.get(record['kind'], 0) + 1
+            counts['length'] += 1
         _crash('before-manifest')
         atomic_json(safe_path(root, 'manifest.json'), manifest)
     _crash('manifest')
@@ -543,7 +649,16 @@ def _enforce_budget(root, manifest, category):
     if limit is None:
         return
     kind = 'discovery' if category == 'queries' else 'source'
-    count = sum(entry['run_id'] == manifest['active_run'] and entry['kind'] == kind for entry in manifest['records'])
+    records = manifest['records']
+    cached = manifest.setdefault('_attempt_counts', {'length': 0, 'runs': {}})
+    if cached['length'] > len(records):
+        cached = manifest['_attempt_counts'] = {'length': 0, 'runs': {}}
+    for entry in records[cached['length']:]:
+        run_counts = cached['runs'].setdefault(entry['run_id'], {})
+        entry_kind = entry['kind']
+        run_counts[entry_kind] = run_counts.get(entry_kind, 0) + 1
+    cached['length'] = len(records)
+    count = cached['runs'].get(manifest['active_run'], {}).get(kind, 0)
     if count >= limit:
         decisions = _run(manifest)['recipe']['stopping_decisions']
         if not any(item.get('kind') == 'budget-exhausted' and item.get('category') == category for item in decisions):

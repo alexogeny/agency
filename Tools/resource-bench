@@ -12,6 +12,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agency_streams import file_digest, load_json
+
 import tomllib
 
 
@@ -159,7 +163,7 @@ def file_revision(path):
 
 
 def temporary_path(prefix, suffix):
-    scratch = Path.home() / "Scratch"
+    scratch = Path(os.environ.get("AGENCY_SCRATCH_ROOT", tempfile.gettempdir()))
     scratch.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
         prefix=prefix, suffix=suffix, dir=scratch, delete=False
@@ -295,15 +299,17 @@ def run_command(arm, spec_root, cpu, metrics, measured, sample_interval_ms):
             fail(f"command failed ({returncode}): {' '.join(command)}\n{message}")
         evidence = stdout
         evidence_source = "stdout"
+        evidence_hash = hashlib.sha256(evidence).hexdigest()
+        evidence_size = len(evidence)
         if result_path:
             if file_revision(result_path) == result_revision:
                 fail(f"result_file {result_path} did not change during the run")
             try:
-                evidence = result_path.read_bytes()
+                evidence_hash, evidence_size = file_digest(result_path)
             except OSError as error:
                 fail(f"cannot read result_file {result_path}: {error}")
             evidence_source = str(result_path)
-        if not evidence and not arm.get("allow_empty_output", False):
+        if not evidence_size and not arm.get("allow_empty_output", False):
             fail(
                 f"{' '.join(command)} produced empty equivalence evidence; "
                 "set result_file or explicitly allow_empty_output"
@@ -330,8 +336,8 @@ def run_command(arm, spec_root, cpu, metrics, measured, sample_interval_ms):
             values.update(read_json_metrics(arm, cwd, metrics))
         observation = {
             "metrics": values,
-            "output_sha256": hashlib.sha256(evidence).hexdigest(),
-            "output_bytes": len(evidence),
+            "output_sha256": evidence_hash,
+            "output_bytes": evidence_size,
             "output_source": evidence_source,
         }
         if memory and memory["samples"]:
@@ -343,9 +349,14 @@ def run_command(arm, spec_root, cpu, metrics, measured, sample_interval_ms):
 
 
 def parse_perf(path, metrics):
+    with path.open() as source:
+        return parse_perf_lines(source, metrics)
+
+
+def parse_perf_lines(lines, metrics):
     events = {metric["event"]: metric["name"] for metric in metrics}
     values = {}
-    for line in path.read_text().splitlines():
+    for line in lines:
         fields = line.split("\t")
         if len(fields) < 3 or fields[2].strip() not in events:
             continue
@@ -374,7 +385,8 @@ def read_json_metrics(arm, cwd, metrics):
         return {}
     path = resolve_path(cwd, arm["metrics_file"])
     try:
-        payload = json.loads(path.read_text())
+        with path.open() as stream:
+            payload = load_json(stream, fields={metric["key"].split(".")[0] for metric in selected})
     except (OSError, json.JSONDecodeError) as error:
         fail(f"cannot read metrics_file {path}: {error}")
     values = {}

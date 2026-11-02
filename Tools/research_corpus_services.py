@@ -73,10 +73,14 @@ def index_lock(db, exclusive):
 def documents(root):
     api = core()
     manifest = api.read_manifest(root)
-    entries = api.committed_records(root)
+    entries = manifest['records']
     if not entries:
         raise error('empty-selection', 'Corpus has no committed records.')
-    docs = []
+    return manifest, _iter_documents(root, sorted(entries, key=lambda e: (e['paths']['text'], e['record_id'])))
+
+
+def _iter_documents(root, entries):
+    api = core()
     for entry in entries:
         record = api.load_record(root, entry)
         if api.sanitize(record) != record:
@@ -90,9 +94,7 @@ def documents(root):
             raise error('unsanitized-input', f'Text artifact violates sanitization policy: {relative}')
         extraction = record.get('extraction') or {}
         retrieval = record.get('retrieval') or {}
-        docs.append({'record_id': entry['record_id'], 'source_id': entry.get('source_id'), 'run_id': entry['run_id'], 'path': relative, 'kind': entry['kind'], 'title': record.get('title') or '', 'url': record.get('url') or '', 'body': body, 'sha256': api.sha256(body.encode('utf-8')), 'coverage': extraction.get('coverage', 'unknown'), 'access': retrieval.get('access', 'unknown'), 'observations': extraction.get('quality_observations', []), 'limitations': extraction.get('limitations', []), 'line_start': 1, 'line_end': max(1, len(body.splitlines()))})
-    docs.sort(key=lambda row: (row['path'], row['record_id']))
-    return manifest, docs
+        yield {'record_id': entry['record_id'], 'source_id': entry.get('source_id'), 'run_id': entry['run_id'], 'path': relative, 'kind': entry['kind'], 'title': record.get('title') or '', 'url': record.get('url') or '', 'body': body, 'sha256': api.sha256(body.encode('utf-8')), 'coverage': extraction.get('coverage', 'unknown'), 'access': retrieval.get('access', 'unknown'), 'observations': extraction.get('quality_observations', []), 'limitations': extraction.get('limitations', []), 'line_start': 1, 'line_end': max(1, len(body.splitlines()))}
 
 
 def build_index(root, db, manifest_path=None):
@@ -102,25 +104,27 @@ def build_index(root, db, manifest_path=None):
     sidecar = external_path(root, manifest_path or db.with_suffix(db.suffix + '.manifest.json'), runtime=True)
     if sidecar in (db, db.with_suffix(db.suffix + '.lock')):
         raise error('unsafe-path', 'Database, sidecar and lifecycle lock must be distinct.')
-    # Load and validate every input before touching the last usable generation.
-    with api.corpus_lock(root):
-        manifest, docs = documents(root)
-    descriptors = [{k: v for k, v in d.items() if k != 'body'} for d in docs]
-    generation = api.sha256(api.canonical_bytes({'corpus_id': manifest['corpus_id'], 'documents': descriptors}))
-    meta = {'schema': 'agency/research-index/1', 'corpus_id': manifest['corpus_id'], 'generation': generation, 'document_count': len(docs), 'documents': descriptors, 'included': [d['path'] for d in docs], 'excluded': [], 'sidecar': str(sidecar)}
     db.parent.mkdir(parents=True, exist_ok=True)
     sidecar.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix='.' + db.name + '.', dir=db.parent)
     os.close(descriptor)
     temp = Path(temporary)
     try:
-        with closing(sqlite3.connect(temp)) as connection, connection:
+        with api.corpus_lock(root), closing(sqlite3.connect(temp)) as connection, connection:
+            manifest, docs = documents(root)
+            descriptors = []
             connection.execute('CREATE TABLE metadata (generation TEXT, corpus_id TEXT, sidecar TEXT)')
-            connection.execute('INSERT INTO metadata VALUES (?, ?, ?)', (generation, manifest['corpus_id'], str(sidecar)))
             connection.execute('CREATE TABLE documents (record_id TEXT PRIMARY KEY, metadata TEXT NOT NULL)')
             connection.execute('CREATE VIRTUAL TABLE evidence USING fts5(record_id UNINDEXED, title, body)')
-            connection.executemany('INSERT INTO documents VALUES (?, ?)', [(d['record_id'], json.dumps({k: v for k, v in d.items() if k != 'body'}, sort_keys=True)) for d in docs])
-            connection.executemany('INSERT INTO evidence VALUES (?, ?, ?)', [(d['record_id'], d['title'], d['body']) for d in docs])
+            for document in docs:
+                descriptor = {k: v for k, v in document.items() if k != 'body'}
+                descriptors.append(descriptor)
+                connection.execute('INSERT INTO documents VALUES (?, ?)', (document['record_id'], json.dumps(descriptor, sort_keys=True)))
+                connection.execute('INSERT INTO evidence VALUES (?, ?, ?)', (document['record_id'], document['title'], document['body']))
+            del document
+            generation = api.sha256(api.canonical_bytes({'corpus_id': manifest['corpus_id'], 'documents': descriptors}))
+            meta = {'schema': 'agency/research-index/1', 'corpus_id': manifest['corpus_id'], 'generation': generation, 'document_count': len(descriptors), 'documents': descriptors, 'included': [d['path'] for d in descriptors], 'excluded': [], 'sidecar': str(sidecar)}
+            connection.execute('INSERT INTO metadata VALUES (?, ?, ?)', (generation, manifest['corpus_id'], str(sidecar)))
         with temp.open('rb') as stream:
             os.fsync(stream.fileno())
         with index_lock(db, True):
@@ -160,7 +164,23 @@ def build_index(root, db, manifest_path=None):
         raise error('index-unavailable', f'Unable to build FTS5 index: {exc}', next_action='Use Python with SQLite FTS5 support and check output permissions.') from exc
     finally:
         temp.unlink(missing_ok=True)
-    return {'ok': True, 'generation': generation, 'document_count': len(docs), 'db': str(db), 'manifest': str(sidecar)}
+    return {'ok': True, 'generation': generation, 'document_count': len(descriptors), 'db': str(db), 'manifest': str(sidecar)}
+
+
+def _match_lines(highlighted):
+    first = highlighted.find(chr(1))
+    if first < 0:
+        return None
+    last = highlighted.rfind(chr(2))
+    return json.dumps([highlighted.count('\n', 0, first) + 1, highlighted.count('\n', 0, last) + 1])
+
+
+class _QueryConnection(sqlite3.Connection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Project each highlighted body immediately; fetched rows retain only
+        # line numbers, snippets and metadata, rather than all matching bodies.
+        self.create_function('match_lines', 1, _match_lines, deterministic=True)
 
 
 def query_index(root, db, expression, prefix=None, kind='source', limit=20):
@@ -175,7 +195,7 @@ def query_index(root, db, expression, prefix=None, kind='source', limit=20):
     if not db.is_file():
         raise error('index-unavailable', f'Index does not exist: {db}', next_action='Run research-corpus index build with an external --db path.')
     try:
-        with index_lock(db, False), closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)) as connection:
+        with index_lock(db, False), closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True, factory=_QueryConnection)) as connection:
             identity = connection.execute('SELECT generation, corpus_id, sidecar FROM metadata').fetchone()
             if not identity:
                 raise error('index-unavailable', 'Index metadata is empty; rebuild the index.')
@@ -199,18 +219,15 @@ def query_index(root, db, expression, prefix=None, kind='source', limit=20):
                 clauses.append("substr(json_extract(documents.metadata, '$.path'), 1, ?) = ?")
                 values.extend([len(prefix), prefix])
             values.append(limit)
-            rows = connection.execute('SELECT documents.metadata, snippet(evidence, 2, \'[\', \']\', \' … \', 32), bm25(evidence), highlight(evidence, 2, char(1), char(2)) FROM evidence JOIN documents USING(record_id) WHERE ' + ' AND '.join(clauses) + ' ORDER BY bm25(evidence), evidence.record_id LIMIT ?', values).fetchall()
+            rows = connection.execute('SELECT documents.metadata, snippet(evidence, 2, \'[\', \']\', \' … \', 32), bm25(evidence), match_lines(highlight(evidence, 2, char(1), char(2))) FROM evidence JOIN documents USING(record_id) WHERE ' + ' AND '.join(clauses) + ' ORDER BY bm25(evidence), evidence.record_id LIMIT ?', values).fetchall()
     except sqlite3.Error as exc:
         code = 'invalid-query' if 'fts5' in str(exc).lower() or 'syntax' in str(exc).lower() or 'unterminated' in str(exc).lower() else 'index-unavailable'
         raise error(code, f'Index query failed: {exc}', next_action='Check the FTS5 expression or rebuild an incompatible index.') from exc
     hits = []
-    for row, snippet, rank, highlighted in rows:
+    for row, snippet, rank, lines in rows:
         hit = dict(json.loads(row), snippet=snippet, rank=rank)
-        first = highlighted.find(chr(1))
-        if first >= 0:
-            hit['line_start'] = highlighted[:first].count('\n') + 1
-            last = highlighted.rfind(chr(2))
-            hit['line_end'] = highlighted[:last].count('\n') + 1
+        if lines is not None:
+            hit['line_start'], hit['line_end'] = json.loads(lines)
         hits.append(hit)
     return {'ok': True, 'generation': generation, 'kind': kind, 'hits': hits, 'limit': limit}
 
@@ -228,6 +245,7 @@ def _audit_corpus(root):
     if not entries:
         issues.append({'check': 'empty-selection', 'message': 'No committed records'})
     runs = {r.get('run_id'): r for r in manifest.get('runs', [])}
+    checked_artifacts = set()
     for run_id, run in runs.items():
         for field in ('recipe', 'software'):
             if not run.get(field):
@@ -240,6 +258,10 @@ def _audit_corpus(root):
         for relative, digest in software.get('hashes', {}).items():
             try:
                 path = api.safe_path(root, str(Path(software.get('path', '')) / relative))
+                identity = (str(path), digest)
+                if identity in checked_artifacts:
+                    continue
+                checked_artifacts.add(identity)
                 if api.sha256(path.read_bytes()) != digest:
                     raise ValueError('Software hash differs')
             except (OSError, ValueError, api.CorpusError) as exc:
@@ -259,6 +281,7 @@ def _audit_corpus(root):
         seen.add(rid)
         if set(entry.get('hashes', {})) != set(entry.get('paths', {}).values()):
             issues.append({'check': 'artifact-hash-selection', 'record_id': rid})
+        verified = {}
         for key in ('json', 'text', 'markdown'):
             relative = entry.get('paths', {}).get(key)
             try:
@@ -268,10 +291,11 @@ def _audit_corpus(root):
                 data.decode('utf-8', errors='strict')
                 if api.sha256(data) != entry.get('hashes', {}).get(relative):
                     raise ValueError('Artifact hash differs')
+                verified[relative] = data
             except (OSError, ValueError, api.CorpusError) as exc:
                 issues.append({'check': 'artifact', 'record_id': rid, 'path': relative, 'message': str(exc)})
         try:
-            record = api.load_record(root, entry)
+            record = api.load_record(root, entry, verified=verified) if len(verified) == 3 else api.load_record(root, entry)
         except (OSError, ValueError, api.CorpusError) as exc:
             issues.append({'check': 'record', 'record_id': rid, 'message': str(exc)})
             continue
@@ -285,6 +309,10 @@ def _audit_corpus(root):
                 for name, digest in processor['hashes'].items():
                     relative = str(Path(processor.get('path', '')) / name)
                     try:
+                        artifact = (str(api.safe_path(root, relative)), digest)
+                        if artifact in checked_artifacts:
+                            continue
+                        checked_artifacts.add(artifact)
                         if api.sha256(api.safe_path(root, relative).read_bytes()) != digest:
                             raise ValueError('Observation processor hash differs')
                     except (OSError, ValueError, api.CorpusError) as exc:
@@ -331,7 +359,9 @@ def _audit_corpus(root):
         counts['coverage_unknown'] += coverage == 'unknown'
         for field, kind in [('text', 'text'), ('markdown', 'markdown')]:
             try:
-                retained = api.safe_path(root, entry['paths'][kind]).read_bytes()
+                retained = verified.get(entry['paths'][kind])
+                if retained is None:
+                    retained = api.safe_path(root, entry['paths'][kind]).read_bytes()
                 if retained != (record.get(field, '') + '\n').encode('utf-8'):
                     issues.append({'check': 'sibling-consistency', 'record_id': rid, 'path': entry['paths'][kind]})
             except OSError:
@@ -363,16 +393,18 @@ def compare_runs(root, old, new):
                 continue
             record = api.load_record(root, entry)
             key = (entry['kind'], entry.get('source_id') or record.get('payload', {}).get('query') or record.get('title', ''))
-            result.setdefault(key, []).append(record)
+            group = result.setdefault(key, {'ids': [], 'latest': None})
+            group['ids'].append(record['record_id'])
+            group['latest'] = record
         return result
     before, after = selected(old), selected(new)
     changes = []
     for key in sorted(before.keys() | after.keys(), key=str):
         left, right = before.get(key, []), after.get(key, [])
         if not left or not right:
-            changes.append({'identity': list(key), 'change': 'added' if right else 'removed', 'record_ids': [r['record_id'] for r in right or left]})
+            changes.append({'identity': list(key), 'change': 'added' if right else 'removed', 'record_ids': (right or left)['ids']})
             continue
-        a, b = left[-1], right[-1]
+        a, b = left['latest'], right['latest']
         fields = {}
         for name, av, bv in [('body', a.get('text'), b.get('text')), ('access', a.get('retrieval'), b.get('retrieval')), ('coverage', a.get('extraction'), b.get('extraction')), ('rankings', a.get('payload', {}).get('results'), b.get('payload', {}).get('results'))]:
             if av != bv:
@@ -437,15 +469,30 @@ def reconcile_screening(root, ledger, output):
             if value:
                 candidates.setdefault((kind, value), []).append(sid)
     duplicates = {sid: set() for sid in rows}
-    for group in candidates.values():
-        if len(group) > 1:
+    group_refs = {sid: set() for sid in rows}
+    groups = {}
+    for (kind, value), group in candidates.items():
+        if len(group) <= 1:
+            continue
+        members = set(group)
+        if len(group) <= 32:
             for sid in group:
-                duplicates[sid].update(set(group) - {sid})
+                duplicates[sid].update(members - {sid})
+        else:
+            identity = 'group-' + api.sha256(api.canonical_bytes(sorted(members)))
+            groups.setdefault(identity, {'members': sorted(members), 'matches': []})['matches'].append({'kind': kind, 'value': value})
+            for sid in group:
+                group_refs[sid].add(identity)
     for sid, row in rows.items():
-        row['duplicate_candidates'] = ';'.join(sorted(duplicates[sid]))
+        row['duplicate_candidates'] = ';'.join(sorted(duplicates[sid]) + ['@' + identity for identity in sorted(group_refs[sid])])
     fields = list(dict.fromkeys(SCREENING_FIELDS + old_fields))
+    group_path = output.with_suffix(output.suffix + '.duplicates.json')
+    if groups and group_path.exists():
+        raise error('screening-output-exists', 'Duplicate group output already exists.', 'screening')
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, tempname = tempfile.mkstemp(prefix='.' + output.name, dir=output.parent)
+    group_created = False
+    published = False
     try:
         with os.fdopen(fd, 'w', encoding='utf-8', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)
@@ -453,11 +500,28 @@ def reconcile_screening(root, ledger, output):
             writer.writerows(rows[sid] for sid in sorted(rows))
             stream.flush()
             os.fsync(stream.fileno())
+        # The optional group dictionary is durable before its referring CSV.
+        if groups:
+            group_fd, group_temp = tempfile.mkstemp(prefix='.' + group_path.name, dir=output.parent)
+            try:
+                with os.fdopen(group_fd, 'wb') as stream:
+                    stream.write(api.canonical_bytes({'schema': 'agency/screening-duplicate-groups/1', 'groups': groups}))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.link(group_temp, group_path)
+                group_created = True
+                api._fsync_dir(output.parent)
+            finally:
+                Path(group_temp).unlink(missing_ok=True)
         # Hard link publishes exclusively, preventing a concurrent overwrite.
         os.link(tempname, output)
+        published = True
+        api._fsync_dir(output.parent)
     finally:
         Path(tempname).unlink(missing_ok=True)
-    return {'ok': True, 'output': str(output), 'record_count': len(rows), 'preserved_count': len(old), 'duplicate_candidate_count': sum(bool(v) for v in duplicates.values())}
+        if group_created and not published:
+            group_path.unlink(missing_ok=True)
+    return {'ok': True, 'output': str(output), 'record_count': len(rows), 'preserved_count': len(old), 'duplicate_candidate_count': sum(bool(duplicates[sid] or group_refs[sid]) for sid in rows), 'duplicate_groups': str(group_path) if groups else None}
 
 
 def add_parsers(subparsers):

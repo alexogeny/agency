@@ -38,27 +38,55 @@ def authorization(request, execution):
     return auth
 
 
+def _arguments(stream):
+    token = bytearray()
+    oversized = False
+    while chunk := stream.read(65536):
+        start = 0
+        while start < len(chunk):
+            end = chunk.find(b'\0', start)
+            boundary = len(chunk) if end < 0 else end
+            if not oversized:
+                if len(token) + boundary - start > 4096:
+                    token.clear()
+                    oversized = True
+                else:
+                    token.extend(chunk[start:boundary])
+            if end < 0:
+                break
+            yield None if oversized else bytes(token)
+            token.clear()
+            oversized = False
+            start = end + 1
+    if token or oversized:
+        yield None if oversized else bytes(token)
+
+
 def active_processes(profile):
     # Check exact Firefox argv even when an external launch omitted Agency's lock.
     proc = Path('/proc')
     if not proc.is_dir():
         fail('profile-inspection-unavailable', 'Exact task cleanup currently requires Linux process inspection; preserve the profile')
+    encoded = os.fsencode(profile)
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
         try:
             if entry.stat().st_uid != os.getuid():
                 continue
-            args = (entry / 'cmdline').read_bytes().split(b'\0')
+            with (entry / 'cmdline').open('rb') as stream:
+                arguments = _arguments(stream)
+                executable = next(arguments, b'')
+                if executable is None:
+                    fail('profile-active', 'Cannot inspect an owned process executable; preserve the profile')
+                if b'firefox' not in os.path.basename(executable).lower():
+                    continue
+                if any(argument in (encoded, b'--profile=' + encoded) for argument in arguments):
+                    fail('profile-active', 'Firefox still references the selected profile')
         except FileNotFoundError:
             continue
         except PermissionError:
             fail('profile-active', 'Cannot inspect an owned process; preserve the profile')
-        if not args or b'firefox' not in os.path.basename(args[0]).lower():
-            continue
-        encoded = os.fsencode(profile)
-        if encoded in args or b'--profile=' + encoded in args:
-            fail('profile-active', 'Firefox still references the selected profile')
 
 
 def create(request, data_root):

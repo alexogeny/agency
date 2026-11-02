@@ -25,7 +25,7 @@ def perf() -> str:
 
 
 def command_output(command: list[str]) -> str | None:
-    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=10)
     return result.stdout.strip() if result.returncode == 0 else None
 
 
@@ -51,8 +51,13 @@ def numeric(value: str) -> int | float | None:
 
 
 def parse_stat(path: Path) -> list[dict[str, str | int | float | None]]:
+    with path.open() as source:
+        return parse_stat_lines(source)
+
+
+def parse_stat_lines(lines):
     events = []
-    for line in path.read_text().splitlines():
+    for line in lines:
         fields = line.split(";")
         if len(fields) < 3:
             continue

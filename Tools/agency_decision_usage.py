@@ -89,17 +89,16 @@ def receipts(value):
             if decoded is not None:
                 pending.append((iter((decoded,)), depth + 1))
             else:
-                decoded_lines = []
-                for line in item.splitlines():
-                    if MARKER not in line or not line.lstrip().startswith(('{', '[')):
-                        continue
-                    try:
-                        decoded = json.loads(line)
-                    except (ValueError, RecursionError):
-                        complete = False
-                        continue
-                    decoded_lines.append(decoded)
-                pending.append((reversed(decoded_lines), depth + 1))
+                def decoded_lines(text=item):
+                    nonlocal complete
+                    for line in reversed(text.splitlines()):
+                        if MARKER not in line or not line.lstrip().startswith(('{', '[')):
+                            continue
+                        try:
+                            yield json.loads(line)
+                        except (ValueError, RecursionError):
+                            complete = False
+                pending.append((iter(decoded_lines()), depth + 1))
     return found, complete
 
 

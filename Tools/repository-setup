@@ -9,6 +9,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agency_streams import file_digest
+
 
 SCHEMA = "agency/repository-setup-bundle/1"
 ASSET_ROOT = (
@@ -329,7 +333,11 @@ def load_bundle(bundle):
     if manifest.get("schema") != SCHEMA:
         fail(f"unsupported bundle schema: {manifest.get('schema')!r}", 2)
     sources = []
+    seen = set()
     for record in manifest.get("files", []):
+        if record.get("path") in seen:
+            fail("duplicate bundle path: " + str(record.get("path")), 2)
+        seen.add(record.get("path"))
         path = Path(record.get("path", ""))
         if path.is_absolute() or ".." in path.parts or not path.parts:
             fail(f"unsafe bundle path: {path}", 2)
@@ -398,16 +406,17 @@ def classify_destination(target, relative, data, conflict_policy):
             "risk": "critical",
             "reason": "destination is not a regular file",
         }
-    current_data = destination.read_bytes()
-    if current_data == data:
+    current_hash, current_size = file_digest(destination)
+    proposed_hash = hashlib.sha256(data).hexdigest()
+    if current_size == len(data) and current_hash == proposed_hash:
         return {
             "action": "unchanged",
             "path": relative.as_posix(),
             "risk": "none",
         }
     hashes = {
-        "current_sha256": hashlib.sha256(current_data).hexdigest(),
-        "proposed_sha256": hashlib.sha256(data).hexdigest(),
+        "current_sha256": current_hash,
+        "proposed_sha256": proposed_hash,
     }
     if conflict_policy == "abort":
         return {

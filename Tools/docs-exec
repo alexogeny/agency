@@ -31,37 +31,29 @@ def digest(data: bytes) -> str:
 
 
 def fences(path: Path) -> dict[str, bytes]:
-    lines = path.read_text().splitlines(keepends=True)
-    found: dict[str, bytes] = {}
-    index = 0
-    while index < len(lines):
-        match = FENCE_START.match(lines[index].rstrip("\r\n"))
-        if match is None:
-            index += 1
-            continue
-        marker = match.group(1)
-        attributes = match.group(2)
-        title_match = TITLE.search(attributes)
-        title = (
-            next((value for value in title_match.groups() if value), None)
-            if title_match
-            else None
-        )
-        body = []
-        index += 1
-        closing = re.compile(rf"^\s*{re.escape(marker[0])}{{{len(marker)},}}\s*$")
-        while index < len(lines) and not closing.match(
-            lines[index].rstrip("\r\n")
-        ):
-            body.append(lines[index])
-            index += 1
-        if index == len(lines):
-            fail(f"unclosed code fence in {path}")
-        if title:
-            if title in found:
-                fail(f"duplicate fenced block title {title!r} in {path}")
-            found[title] = "".join(body).encode()
-        index += 1
+    found = {}
+    with path.open() as stream:
+        lines = iter(stream)
+        for line in lines:
+            match = FENCE_START.match(line.rstrip('\r\n'))
+            if match is None:
+                continue
+            marker, attributes = match.groups()
+            title_match = TITLE.search(attributes)
+            title = next((value for value in title_match.groups() if value), None) if title_match else None
+            closing = re.compile(rf"^\s*{re.escape(marker[0])}{{{len(marker)},}}\s*$")
+            body = [] if title else None
+            for line in lines:
+                if closing.match(line.rstrip('\r\n')):
+                    break
+                if body is not None:
+                    body.append(line)
+            else:
+                fail(f'unclosed code fence in {path}')
+            if title:
+                if title in found:
+                    fail(f'duplicate fenced block title {title!r} in {path}')
+                found[title] = ''.join(body).encode()
     return found
 
 

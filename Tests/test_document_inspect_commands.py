@@ -51,7 +51,7 @@ class DocumentCommandTests(unittest.TestCase):
                     self.assertEqual(run.call_count, 1)
                     self.assertEqual(run.call_args.args[0][0], '/fake bin/' + executable)
                     self.assertEqual(run.call_args.kwargs,
-                                     {'check': False, 'text': True, 'capture_output': True})
+                                     {'check': False, 'text': True, 'capture_output': True, 'timeout': 300})
 
     def test_missing_executables_fail_before_launch(self):
         for name, arguments, executable, _ in self.stages():

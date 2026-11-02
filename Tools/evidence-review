@@ -11,6 +11,10 @@ import sys
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agency_streams import iter_json_records
 from typing import Iterable
 
 
@@ -107,7 +111,8 @@ def iter_records(path: Path, records_key: str | None) -> Iterable[dict]:
                     fail(f"{path}:{number} is not a JSON object", 2)
                 yield value
     elif suffix == ".json":
-        yield from json_records(json.loads(path.read_text()), records_key)
+        with path.open() as stream:
+            yield from iter_json_records(stream, records_key)
     else:
         fail(f"unsupported evidence input: {path}", 2)
 
@@ -205,8 +210,16 @@ def audit(arguments: argparse.Namespace) -> None:
     ledger = arguments.ledger.resolve()
     with ledger.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle, restval="")
-        rows = list(reader)
+        identifiers = [row.get("source_id", "") for row in reader]
         fields = set(reader.fieldnames or ())
+    class Rows:
+        def __len__(self):
+            return len(identifiers)
+
+        def __iter__(self):
+            with ledger.open(newline="", encoding="utf-8-sig") as stream:
+                yield from csv.DictReader(stream, restval="")
+    rows = Rows()
     issues = []
     missing = set(FIELDS) - fields
     if missing:
@@ -217,7 +230,6 @@ def audit(arguments: argparse.Namespace) -> None:
                 "message": f"missing fields: {', '.join(sorted(missing))}",
             }
         )
-    identifiers = [row.get("source_id", "") for row in rows]
     known = set(identifiers)
     for source_id, count in Counter(identifiers).items():
         if not source_id:

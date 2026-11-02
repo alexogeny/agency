@@ -24,7 +24,7 @@ def required_command(name: str) -> str:
 
 
 def checked_output(command: list[str], failure_message: str) -> str:
-    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=300)
     if result.returncode:
         fail(result.stderr.strip() or failure_message)
     return result.stdout
@@ -131,34 +131,52 @@ def extract_text(document: Path, destination: Path, first: int, last: int) -> No
 
 
 def make_contact_sheet(pages: list[tuple[int, Path]], destination: Path) -> None:
-    checked_output(
-        [
-            required_command("montage"),
-            *[str(path) for _, path in pages],
-            "-thumbnail",
-            "320x",
-            "-tile",
-            "4x",
-            "-geometry",
-            "+12+12",
-            str(destination),
-        ],
-        "montage could not build the contact sheet",
-    )
+    command = required_command('montage')
+    if len(pages) <= 32:
+        checked_output([command, *[str(path) for _, path in pages], '-thumbnail', '320x',
+                        '-tile', '4x', '-geometry', '+12+12', str(destination)],
+                       'montage could not build the contact sheet')
+        return
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='.contact-sheet-', dir=destination.parent) as temporary:
+        thumbnails = []
+        for index, (_, page) in enumerate(pages):
+            target = Path(temporary) / f'{index:06d}.png'
+            checked_output([command, str(page), '-thumbnail', '320x', '-geometry', '+0+0', str(target)],
+                           'montage could not thumbnail the page')
+            thumbnails.append(target)
+        level = 0
+        while len(thumbnails) > 32:
+            grouped = []
+            for start in range(0, len(thumbnails), 32):
+                target = Path(temporary) / f'group-{level}-{start}.png'
+                checked_output([command, *map(str, thumbnails[start:start + 32]), '-tile', '4x' if level == 0 else '1x',
+                                '-geometry', '+12+12' if level == 0 else '+0+0', str(target)], 'montage could not group pages')
+                grouped.append(target)
+            thumbnails = grouped
+            level += 1
+        checked_output([command, *map(str, thumbnails), '-tile', '1x', '-geometry', '+0+0', str(destination)],
+                       'montage could not build the contact sheet')
 
 
-def extract_ocr(
-    pages: list[tuple[int, Path]], destination: Path, language: str
-) -> None:
-    command = required_command("tesseract")
-    page_text = []
-    for number, page in pages:
-        text = checked_output(
-            [command, str(page), "stdout", "-l", language],
-            f"tesseract failed on page {number}",
-        )
-        page_text.append(text.rstrip())
-    destination.write_text("\n\f\n".join(page_text) + "\n")
+def extract_ocr(pages: list[tuple[int, Path]], destination: Path, language: str) -> None:
+    command = required_command('tesseract')
+    import tempfile
+    descriptor, temporary = tempfile.mkstemp(prefix='.ocr-', dir=destination.parent)
+    import os
+    try:
+        with os.fdopen(descriptor, 'w') as output:
+            for index, (number, page) in enumerate(pages):
+                if index:
+                    output.write('\n\f\n')
+                text = checked_output([command, str(page), 'stdout', '-l', language],
+                                      f'tesseract failed on page {number}')
+                output.write(text.rstrip())
+                del text
+            output.write('\n')
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def relative_artifact(path: Path, root: Path) -> dict[str, str | int]:

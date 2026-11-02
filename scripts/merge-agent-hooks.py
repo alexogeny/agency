@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import copy
 import json
 import os
 import tempfile
@@ -14,8 +15,8 @@ def load_json(path, default=None):
         return json.load(source)
 
 
-def merged_config(target, fragment):
-    result = load_json(target, {})
+def merged_config(target, fragment, existing=None):
+    result = load_json(target, {}) if existing is None else existing
     additions = load_json(fragment)
     if not isinstance(result, dict) or not isinstance(additions, dict):
         raise ValueError("hook configuration must be a JSON object")
@@ -38,9 +39,12 @@ def merged_config(target, fragment):
             for handler in group.get("hooks", [])
             if isinstance(handler, dict) and handler.get("command")
         }
+        def group_key(group):
+            return json.dumps(group, sort_keys=True, separators=(",", ":"))
+        addition_keys = {group_key(group) for group in groups}
         retained_groups = []
         for target_group in target_groups:
-            if target_group in groups or not isinstance(target_group, dict):
+            if group_key(target_group) in addition_keys or not isinstance(target_group, dict):
                 retained_groups.append(target_group)
                 continue
             target_handlers = target_group.get("hooks")
@@ -57,7 +61,12 @@ def merged_config(target, fragment):
                 retained_group = dict(target_group)
                 retained_group["hooks"] = retained_handlers
                 retained_groups.append(retained_group)
-        retained_groups.extend(group for group in groups if group not in retained_groups)
+        retained_keys = {group_key(group) for group in retained_groups}
+        for group in groups:
+            key = group_key(group)
+            if key not in retained_keys:
+                retained_groups.append(group)
+                retained_keys.add(key)
         target_hooks[event] = retained_groups
     return result
 
@@ -84,7 +93,7 @@ def main():
     parser.add_argument("fragment", type=Path)
     arguments = parser.parse_args()
     existing = load_json(arguments.target, {})
-    merged = merged_config(arguments.target, arguments.fragment)
+    merged = merged_config(arguments.target, arguments.fragment, copy.deepcopy(existing))
     if arguments.check:
         raise SystemExit(0 if merged != existing else 1)
     if merged != existing:

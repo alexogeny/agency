@@ -183,29 +183,28 @@ def read_file(root, relative, max_bytes=None):
         digest = hashlib.sha256(data)
         if size <= max_bytes:
             return relative.as_posix(), data, "file", digest.hexdigest(), size
-        # Oversized files need only the first line for suffix-free shebang detection.
-        first_line = (
-            [data]
-            if relative.suffix.lower() not in SOURCE_SUFFIXES and data.startswith(b"#!")
-            else None
-        )
-        data = b""
-        if first_line is not None:
-            boundary = re.search(b"[\r\n]", first_line[0])
-            if boundary:
-                data = first_line[0][:boundary.start()]
-                first_line = None
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        shebang = relative.suffix.lower() not in SOURCE_SUFFIXES and data.startswith(b'#!')
+        prefix = b''
+
+        def retain_prefix(chunk):
+            nonlocal prefix, shebang
+            if not shebang:
+                return
+            boundary = re.search(b'[\r\n]', chunk)
+            part = chunk[:boundary.start()] if boundary else chunk
+            part = re.sub(rb'[ \t]+', b' ', part)
+            if prefix.endswith(b' '):
+                part = part.lstrip(b' ')
+            prefix = (prefix + part)[:max_bytes]
+            if boundary or len(prefix) >= max_bytes:
+                shebang = False
+
+        retain_prefix(data)
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
             size += len(chunk)
             digest.update(chunk)
-            if first_line is not None:
-                boundary = re.search(b"[\r\n]", chunk)
-                first_line.append(chunk[:boundary.start()] if boundary else chunk)
-                if boundary:
-                    data = b"".join(first_line)
-                    first_line = None
-        if first_line is not None:
-            data = b"".join(first_line)
+            retain_prefix(chunk)
+        data = prefix
     return relative.as_posix(), data, "file", digest.hexdigest(), size
 
 

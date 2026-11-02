@@ -81,13 +81,13 @@ class ReferenceStore<T> {
     if (!existsSync(path)) return undefined;
     const serialized = readFileSync(path, "utf8");
     const value = this.decode(JSON.parse(serialized));
-    this.retain(key, value, Buffer.byteLength(serialized) * 2 + Buffer.byteLength(key) * 2 + 512);
+    this.retain(key, value, Buffer.byteLength(serialized) * 2 + Buffer.byteLength(key) * 2 + 512, serialized, true);
     return value;
   }
-  private retain(key: string, value: T, bytes: number) {
+  private retain(key: string, value: T, bytes: number, serialized?: string, persisted = false) {
     const previous = this.entries.get(key);
     if (previous) { this.retainedBytes -= previous.bytes; this.entries.delete(key); }
-    if (bytes > this.budget) { this.spill(key, value); return; }
+    if (bytes > this.budget) { if (!persisted) this.spill(key, value, serialized); return; }
     this.entries.set(key, { value, bytes });
     this.retainedBytes += bytes;
     while (this.retainedBytes > this.budget || this.entries.size > 4096) {
@@ -97,12 +97,12 @@ class ReferenceStore<T> {
       this.entries.delete(oldest[0]);
     }
   }
-  private spill(key: string, value: T) {
-    writeFileSync(referencePath(this.prefix + key), JSON.stringify(this.encode(value)), { mode: 0o600 });
+  private spill(key: string, value: T, serialized?: string) {
+    writeFileSync(referencePath(this.prefix + key), serialized ?? JSON.stringify(this.encode(value)), { mode: 0o600 });
   }
   set(key: string, value: T) {
     const serialized = JSON.stringify(this.encode(value));
-    this.retain(key, value, Buffer.byteLength(serialized) * 2 + Buffer.byteLength(key) * 2 + 512);
+    this.retain(key, value, Buffer.byteLength(serialized) * 2 + Buffer.byteLength(key) * 2 + 512, serialized);
     return this;
   }
 }
@@ -346,6 +346,9 @@ async function boundedStream(stream: ReadableStream<Uint8Array>, maximum: number
       parts.push(value);
     }
     return Buffer.concat(parts).toString("utf8");
+  } catch (error) {
+    try { await reader.cancel(error); } catch { /* Keep the original stream failure. */ }
+    throw error;
   } finally { reader.releaseLock(); }
 }
 

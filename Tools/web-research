@@ -3653,12 +3653,13 @@ function storedCapture(
     evidence_sources: [...new Set(page.sources || [])],
     truncation: page.truncated,
   };
+  const identity = `${evidenceJson(core)}\n${globalThis.crypto.randomUUID()}`;
   let suffix = 0;
   let id = "";
   let manifestPath = "";
   do {
     id = createHash("sha256")
-      .update(`${evidenceJson(core)}\n${suffix}`)
+      .update(`${identity}\n${suffix}`)
       .digest("hex");
     manifestPath = join(directories.manifests, `${id}.json`);
     suffix += 1;
@@ -3682,13 +3683,31 @@ function checkedCaptureId(value: string) {
 }
 
 function loadedCapture(idValue: string) {
+  const readCaptureFile = (path: string) => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const descriptor = fs.openSync(path, "r");
+    const parts: string[] = [];
+    const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+    const hash = createHash("sha256");
+    try {
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let length: number;
+      while ((length = fs.readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
+        const chunk = buffer.subarray(0, length);
+        hash.update(chunk);
+        parts.push(decoder.decode(chunk, { stream: true }));
+      }
+      parts.push(decoder.decode());
+      return { text: parts.join(""), sha256: hash.digest("hex") };
+    } finally { fs.closeSync(descriptor); }
+  };
   const id = checkedCaptureId(idValue);
   const directories = captureDirectories();
   const manifestPath = join(directories.manifests, `${id}.json`);
   if (!existsSync(manifestPath)) fail(`capture manifest not found: ${id}`);
   let manifest: any;
   try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest = JSON.parse(readCaptureFile(manifestPath).text);
   } catch {
     fail(`capture manifest is invalid JSON: ${id}`);
   }
@@ -3709,14 +3728,15 @@ function loadedCapture(idValue: string) {
   if (!existsSync(objectPath)) {
     fail(`capture object is missing: ${manifest.object_sha256}`);
   }
-  const serialized = readFileSync(objectPath);
-  const actualSha256 = createHash("sha256").update(serialized).digest("hex");
+  const object = readCaptureFile(objectPath);
+  const serialized = object.text;
+  const actualSha256 = object.sha256;
   if (actualSha256 !== manifest.object_sha256) {
     fail(`capture object hash mismatch: ${manifest.object_sha256}`);
   }
   let input: any;
   try {
-    input = JSON.parse(serialized.toString("utf8"));
+    input = JSON.parse(serialized);
   } catch {
     fail(`capture object is invalid JSON: ${manifest.object_sha256}`);
   }
@@ -5222,7 +5242,7 @@ function batchQueries(value: string) {
   }
   const queries: string[] = [];
   const seen = new Set<string>();
-  for (const raw of utf8FileLines(input)) {
+  for (const raw of utf8FileLines(input, 1000, "search-batch queries must be at most 1000 characters")) {
     const query = raw.trim();
     if (!query || seen.has(query)) continue;
     if (query.length > 1000) fail("search-batch queries must be at most 1000 characters");
@@ -5525,31 +5545,51 @@ function fileDigest(path: string, maximum = Infinity, prefixBytes?: number) {
   }
 }
 
-function* utf8FileLines(path: string) {
+function* utf8FileLines(path: string, maximumTrimmedCharacters = Infinity,
+  limitMessage = "input line exceeds its character limit") {
   const fd = openSync(path, "r");
   try {
     const buffer = Buffer.allocUnsafe(64 * 1024);
     const decoder = new StringDecoder("utf8");
     let parts: string[] = [];
+    let characters = 0;
+    let trailing = "";
+    const limited = Number.isFinite(maximumTrimmedCharacters);
+    const append = (piece: string) => {
+      if (!limited) { parts.push(piece); return; }
+      if (!characters) piece = piece.trimStart();
+      const content = piece.trimEnd();
+      if (content) {
+        const next = characters + trailing.length + content.length;
+        if (next > maximumTrimmedCharacters) fail(limitMessage);
+        if (trailing) parts.push(trailing);
+        parts.push(content);
+        characters = next;
+        trailing = "";
+      }
+      trailing = (trailing + piece.slice(content.length)).slice(0, maximumTrimmedCharacters + 1);
+    };
+    const finish = (newline = true) => {
+      const line = parts.join("");
+      parts = [];
+      characters = 0;
+      trailing = "";
+      return newline && line.endsWith("\r") ? line.slice(0, -1) : line;
+    };
     let length: number;
     while ((length = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
       const chunk = decoder.write(buffer.subarray(0, length));
       let start = 0;
       let end: number;
       while ((end = chunk.indexOf("\n", start)) !== -1) {
-        let line = chunk.slice(start, end);
-        if (parts.length) {
-          parts.push(line);
-          line = parts.join("");
-          parts = [];
-        }
-        yield line.endsWith("\r") ? line.slice(0, -1) : line;
+        append(chunk.slice(start, end));
+        yield finish();
         start = end + 1;
       }
-      if (start < chunk.length) parts.push(chunk.slice(start));
+      if (start < chunk.length) append(chunk.slice(start));
     }
-    parts.push(decoder.end());
-    yield parts.join("");
+    append(decoder.end());
+    yield finish(false);
   } finally {
     closeSync(fd);
   }
