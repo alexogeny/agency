@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -73,7 +72,21 @@ async function websocketRpc(url: string, tokenFile?: string): Promise<{ rpc: Rpc
     }
     const headers: Record<string, string> = {};
     if (tokenFile) {
-        const token = readFileSync(tokenFile, "utf8").trim();
+        const { openSync, readSync, closeSync, fstatSync, constants } = await import("node:fs");
+        const descriptor = openSync(tokenFile, constants.O_RDONLY | constants.O_NONBLOCK);
+        const bytes = Buffer.allocUnsafe(4097);
+        let length = 0;
+        try {
+            const info = fstatSync(descriptor);
+            if (!info.isFile() || info.size > bytes.length) throw new Error("Invalid app-server token file");
+            while (length < bytes.length) {
+                const count = readSync(descriptor, bytes, length, bytes.length - length, null);
+                if (!count) break;
+                length += count;
+            }
+            if (fstatSync(descriptor).size > bytes.length) throw new Error("Invalid app-server token file");
+        } finally { closeSync(descriptor); }
+        const token = bytes.subarray(0, length).toString("utf8").trim();
         if (!token || token.length > 4096 || /[\r\n]/.test(token)) throw new Error("Invalid app-server token file");
         headers.Authorization = `Bearer ${token}`;
     }
@@ -174,18 +187,41 @@ async function main(): Promise<void> {
     process.on("SIGINT", shutdown);
     const input = createInterface({ input: process.stdin });
     input.on("line", (line) => {
+        if (Buffer.byteLength(line) > 64 * 1024) {
+            console.error("Agency bridge: client frame exceeds 64 KiB; frame rejected");
+            return;
+        }
         try { forward(JSON.parse(line)); }
         catch { console.error("Agency bridge: stdin expects client JSONL"); }
     });
     input.on("close", shutdown);
     let queue = Promise.resolve();
-    createInterface({ input: watcher.stdout }).on("line", (line) => {
+    let queued = 0;
+    const maximumQueued = 16;
+    const inbox = createInterface({ input: watcher.stdout });
+    inbox.on("line", (line) => {
+        if (Buffer.byteLength(line) > 1024 * 1024 || queued >= maximumQueued) {
+            console.error("Agency bridge: inbox queue or frame exceeds its limit; delivery remains retryable");
+            return;
+        }
+        queued++;
+        if (queued >= maximumQueued) {
+            inbox.pause();
+            watcher.stdout.pause();
+        }
         queue = queue.then(async () => {
             const batch = JSON.parse(line);
             if (batch.event !== "messages" || stopped) return;
             await deliver(batch.context);
             watcher.stdin.write(JSON.stringify({ delivered: batch.id }) + "\n");
-        }).catch((error) => console.error(`Agency bridge: ${error.message}; delivery remains retryable`));
+        }).catch((error) => console.error(`Agency bridge: ${error.message}; delivery remains retryable`))
+            .finally(() => {
+                queued--;
+                if (!stopped && queued <= maximumQueued / 2) {
+                    inbox.resume();
+                    watcher.stdout.resume();
+                }
+            });
     });
     watcher.stdin.on("error", shutdown);
     watcher.on("error", shutdown);

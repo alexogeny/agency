@@ -364,9 +364,21 @@ class MCPClient:
             raise BrowserError('JSON request is outside the explicit allowed URL prefix.')
         expression = ('async () => {if(location.origin !== '+json.dumps(origin(url))+') '
                       'return {scope_error:true}; const r=await fetch('+json.dumps(url)+', '
-                      '{credentials:"same-origin"}); const raw=await r.text(); return {status:r.status, '
-                      'retry_after:r.headers.get("Retry-After"),link:r.headers.get("Link"), '
-                      'data:r.ok ? JSON.parse(raw) : null};}')
+                      '{credentials:"same-origin"}); const metadata={status:r.status, '
+                      'retry_after:r.headers.get("Retry-After"),link:r.headers.get("Link")}; '
+                      'if(!r.ok){if(r.body)try{await r.body.cancel();}catch{} return {...metadata,data:null};} '
+                      'const maximum='+str(MAX_RESPONSE)+'; '
+                      'if(Number(r.headers.get("Content-Length"))>maximum){'
+                      'if(r.body)try{await r.body.cancel();}catch{} throw new Error("JSON response exceeds its size limit");} '
+                      'if(!r.body)throw new Error("JSON response has no body"); '
+                      'const reader=r.body.getReader(); const decoder=new TextDecoder(); '
+                      'const parts=[]; let bytes=0; try{while(true){const {value,done}=await reader.read(); '
+                      'if(done)break; bytes+=value.byteLength; '
+                      'if(bytes>maximum)throw new Error("JSON response exceeds its size limit"); '
+                      'parts.push(decoder.decode(value,{stream:true}));} parts.push(decoder.decode()); '
+                      'return {...metadata,data:JSON.parse(parts.join(""))}; '
+                      '}catch(error){try{await reader.cancel(error);}catch{} throw error;} '
+                      'finally{reader.releaseLock();}}')
         def operation():
             text = tool_text(self.call('browser_evaluate',{'function':expression}))
             try:

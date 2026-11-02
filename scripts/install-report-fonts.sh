@@ -9,7 +9,7 @@ scratch_dir=$(mktemp -d "$HOME/Scratch/report-fonts.XXXXXX")
 trap 'rm -rf -- "$scratch_dir"' EXIT
 url="https://downloads.sourceforge.net/project/cm-unicode/cm-unicode/$version/$archive"
 
-curl --fail --location --silent --show-error "$url" --output "$scratch_dir/$archive"
+curl --fail --location --silent --show-error --connect-timeout 30 --max-time 300 --max-filesize 134217728 "$url" --output "$scratch_dir/$archive"
 if command -v shasum >/dev/null 2>&1; then
   printf '%s  %s\n' "$checksum" "$scratch_dir/$archive" | shasum -a 256 -c
 else

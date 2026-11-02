@@ -434,6 +434,9 @@ def evaluate(state, profile, api_key=None, timeout=10):
 def prepare_batch(manifest):
     if type(manifest) is not dict or set(manifest) - {'items', 'max_calls', 'concurrency', 'deadline_seconds'}:
         raise DecisionError('Batch accepts items, max_calls, concurrency, and deadline_seconds only.')
+    items = manifest.get('items')
+    if type(items) is not list or not 1 <= len(items) <= 32:
+        raise DecisionError('Batch requires 1 to 32 items.')
     _check_json(manifest)
     try:
         size = len(json.dumps(manifest, ensure_ascii=False, allow_nan=False).encode('utf-8'))

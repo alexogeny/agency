@@ -2707,15 +2707,22 @@ class TrueTypeFont:
             return 0
         if codepoint > 0xFFFF:
             return 0
-        for start, end, delta, range_value, range_offset, selected in self.cmap:
-            if not start <= codepoint <= end:
+        low, high = 0, len(self.cmap)
+        while low < high:
+            middle = (low + high) // 2
+            start, end, delta, range_value, range_offset, selected = self.cmap[middle]
+            if codepoint < start:
+                high = middle
+                continue
+            if codepoint > end:
+                low = middle + 1
                 continue
             if range_value == 0:
                 return (codepoint + delta) & 0xFFFF
             glyph_offset = range_offset + range_value + 2 * (codepoint - start)
             if glyph_offset + 2 > len(selected):
                 return 0
-            glyph = struct.unpack_from(">H", selected, glyph_offset)[0]
+            glyph = struct.unpack_from('>H', selected, glyph_offset)[0]
             return (glyph + delta) & 0xFFFF if glyph else 0
         return 0
 
@@ -2861,23 +2868,32 @@ class ReportHtmlParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.root = HtmlNode("document", {})
         self.stack = [self.root]
+        self.open_tags = {}
 
     def handle_starttag(self, tag, attrs):
         node = HtmlNode(tag, dict(attrs))
         self.stack[-1].children.append(node)
         if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "wbr"}:
             self.stack.append(node)
+            self.open_tags.setdefault(tag, []).append(len(self.stack) - 1)
 
     def handle_startendtag(self, tag, attrs):
+        depth = len(self.stack)
         self.handle_starttag(tag, attrs)
-        if self.stack[-1].tag == tag:
-            self.stack.pop()
+        if len(self.stack) > depth:
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag):
-        for position in range(len(self.stack) - 1, 0, -1):
-            if self.stack[position].tag == tag:
-                del self.stack[position:]
-                return
+        positions = self.open_tags.get(tag)
+        if not positions:
+            return
+        position = positions[-1]
+        for node in reversed(self.stack[position:]):
+            key = str(node.tag)
+            self.open_tags[key].pop()
+            if not self.open_tags[key]:
+                del self.open_tags[key]
+        del self.stack[position:]
 
     def handle_data(self, data):
         self.stack[-1].children.append(data)
@@ -2916,6 +2932,8 @@ class PdfImage:
             raise ValueError(
                 f"native PDF supports non-interlaced 8-bit PNG figures: {self.path.name}"
             )
+        if self.width * self.height > 16_777_216:
+            raise ValueError(f'PNG figure exceeds 16777216 pixel budget: {self.path.name}')
         channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(colour_type)
         if not channels:
             raise ValueError(f"unsupported PNG colour type: {self.path.name}")
@@ -2963,7 +2981,7 @@ class PdfImage:
             return b"".join(parts)
 
         def reconstructed_rows():
-            previous = bytearray(stride)
+            previous = bytearray(stride) if self.height else bytearray()
             for _ in range(self.height):
                 encoded = read_row()
                 filter_type = encoded[0]
@@ -3282,12 +3300,22 @@ class NativePdfRenderer:
         return units
 
     def append_line_span(self, line, span):
-        if line and all(
-            line[-1].get(key) == span.get(key) for key in ("style", "link")
-        ):
-            line[-1]["text"] += span["text"]
-        else:
-            line.append(dict(span))
+        line.append(dict(span))
+
+    def merged_line(self, line):
+        result = []
+        parts = []
+        for span in line:
+            if result and all(result[-1].get(key) == span.get(key) for key in ('style', 'link')):
+                parts.append(span['text'])
+            else:
+                if result:
+                    result[-1]['text'] = ''.join(parts)
+                result.append(dict(span))
+                parts = [span['text']]
+        if result:
+            result[-1]['text'] = ''.join(parts)
+        return result
 
     def wrapped_lines(self, spans, size, first_width, later_width):
         lines = []
@@ -3304,6 +3332,7 @@ class NativePdfRenderer:
                     continue
                 carry = []
                 if line[-1]["text"].endswith(("(", "[", "{", "“")):
+                    line = self.merged_line(line)
                     opener = line[-1]["text"][-1]
                     carry.append({**line[-1], "text": opener})
                     line[-1]["text"] = line[-1]["text"][:-1].rstrip()
@@ -3333,7 +3362,7 @@ class NativePdfRenderer:
         if line:
             line[-1]["text"] = line[-1]["text"].rstrip()
             lines.append(line)
-        return lines
+        return [self.merged_line(line) for line in lines]
 
     def write_spans(
         self,

@@ -8,7 +8,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agency_streams import load_json
 
 
 LAPTOP_CHASSIS_TYPES = {8, 9, 10, 11, 14, 30, 31, 32}
@@ -204,7 +208,8 @@ def nvidia_runtime(nvidia_smi, nvidia_settings):
 
 def read_accelerator_cache(path, fingerprint):
     try:
-        payload = json.loads(path.read_text())
+        with path.open() as stream:
+            payload = load_json(stream, fields={'fingerprint', 'value'})
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
     value = payload.get("value")

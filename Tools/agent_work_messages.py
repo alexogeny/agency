@@ -1,7 +1,6 @@
 """Durable coordination messages and transactional claim negotiation."""
 
 import datetime as dt
-from bisect import bisect_left
 from functools import lru_cache
 from contextlib import closing, contextmanager
 import argparse
@@ -30,6 +29,8 @@ MAX_NOTE = 4096
 
 
 def schema(connection):
+    had_participants = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='request_participants'").fetchone()
     statements = """
         CREATE TABLE IF NOT EXISTS task_auth (
             task_id TEXT PRIMARY KEY REFERENCES tasks(id), token_hash TEXT NOT NULL,
@@ -80,6 +81,12 @@ def schema(connection):
         CREATE TABLE IF NOT EXISTS legacy_auth_pending (
             task_id TEXT PRIMARY KEY REFERENCES tasks(id)
         );
+        CREATE TABLE IF NOT EXISTS request_participants (
+            request_id TEXT NOT NULL, task_id TEXT NOT NULL,
+            PRIMARY KEY(request_id,task_id)
+        );
+        CREATE INDEX IF NOT EXISTS participants_task ON request_participants(task_id,request_id);
+        CREATE INDEX IF NOT EXISTS requests_requester ON claim_requests(requester);
         CREATE INDEX IF NOT EXISTS requests_status ON claim_requests(status);
         CREATE INDEX IF NOT EXISTS responses_owner_decision ON claim_responses(owner,decision,request_id,revision);
     """
@@ -88,6 +95,22 @@ def schema(connection):
             connection.execute(statement)
     if "legacy" not in {row[1] for row in connection.execute("PRAGMA table_info(task_auth)")}:
         connection.execute("ALTER TABLE task_auth ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS participants_insert AFTER INSERT ON claim_requests
+        BEGIN INSERT OR IGNORE INTO request_participants
+            SELECT NEW.id,json_extract(value,'$.task_id') FROM json_each(NEW.snapshot_json)
+            WHERE json_extract(value,'$.task_id') IS NOT NULL; END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS participants_update AFTER UPDATE OF snapshot_json ON claim_requests
+        BEGIN DELETE FROM request_participants WHERE request_id=NEW.id;
+            INSERT OR IGNORE INTO request_participants
+            SELECT NEW.id,json_extract(value,'$.task_id') FROM json_each(NEW.snapshot_json)
+            WHERE json_extract(value,'$.task_id') IS NOT NULL; END""")
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS participants_delete AFTER DELETE ON claim_requests
+        BEGIN DELETE FROM request_participants WHERE request_id=OLD.id; END""")
+    if not had_participants:
+        connection.execute("""INSERT OR IGNORE INTO request_participants
+            SELECT request.id,json_extract(owner.value,'$.task_id')
+            FROM claim_requests request,json_each(request.snapshot_json) owner
+            WHERE json_extract(owner.value,'$.task_id') IS NOT NULL""")
 
 
 def now(h):
@@ -177,29 +200,46 @@ def contains(parent, child):
 
 
 class ScopeIndex:
-    """Find overlapping requested scopes while retaining caller order/duplicates."""
+    """Index path components while retaining caller order and duplicates."""
 
     def __init__(self, scopes):
         self.positions = {}
+        self.roots = {False: {}, True: {}}
         for index, scope in enumerate(scopes):
             self.positions.setdefault(scope, []).append(index)
-        self.relative = sorted(scope for scope in self.positions if not scope.startswith('/'))
-        self.absolute = sorted(scope for scope in self.positions if scope.startswith('/'))
+            node = self.roots[scope.startswith('/')]
+            for part in self.parts(scope):
+                node = node.setdefault(part, {})
+            node.setdefault(None, []).append(index)
+
+    @staticmethod
+    def parts(path):
+        return () if path == '.' else path.split('/')
+
+    def ancestors(self, path):
+        node = self.roots[path.startswith('/')]
+        matches = list(node.get(None, ()))
+        for part in self.parts(path):
+            node = node.get(part)
+            if node is None:
+                break
+            matches.extend(node.get(None, ()))
+        return sorted(matches)
 
     def overlapping(self, claim):
-        paths = self.absolute if claim.startswith('/') else self.relative
-        if claim == '.':
-            matches = paths
-        else:
-            prefixes = [claim[:index] for index, char in enumerate(claim) if char == '/' and index]
-            prefixes.append(claim)
-            if not claim.startswith('/'):
-                prefixes.append('.')
-            matches = [path for path in prefixes if path in self.positions]
-            # '/' and '0' are adjacent code points, so these bisect bounds
-            # select exactly descendants, excluding lexical siblings like src2.
-            matches.extend(paths[bisect_left(paths, claim + '/'):bisect_left(paths, claim + '0')])
-        return sorted(index for path in matches for index in self.positions[path])
+        node = self.roots[claim.startswith('/')]
+        matches = []
+        for part in self.parts(claim):
+            matches.extend(node.get(None, ()))
+            node = node.get(part)
+            if node is None:
+                return sorted(matches)
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            matches.extend(current.get(None, ()))
+            pending.extend(child for part, child in current.items() if part is not None)
+        return sorted(matches)
 
 
 def ownership_exclusions(connection, repo_id, exclude_task=None):
@@ -517,7 +557,8 @@ def paused(connection, task_id):
 
 
 def assert_not_paused(h, connection, task_id, requested):
-    if any(h.claims_overlap(path, scope) for item in paused(connection, task_id) for scope in item["paths"] for path in requested):
+    requested_index = ScopeIndex(requested)
+    if any(requested_index.overlapping(scope) for item in paused(connection, task_id) for scope in item["paths"]):
         h.fail("scope is paused for an accepted claim request; cancel or resolve that request before writing", 3)
 
 
@@ -531,9 +572,12 @@ def can_write(h, connection, task, requested):
     for item in holes:
         holes_by_claim.setdefault(item["claim"], []).append(item["path"])
 
+    claim_index = ScopeIndex(claims)
+
     @lru_cache(maxsize=None)
     def covered(path):
-        for claim in claims:
+        for index in claim_index.ancestors(path):
+            claim = claims[index]
             if not contains(claim, path):
                 continue
             missing = holes_by_claim.get(claim, ())
@@ -545,16 +589,23 @@ def can_write(h, connection, task, requested):
                 return True
         return False
 
-    return all(covered(path) for path in requested) and not any(
-        h.claims_overlap(path, scope) for item in paused(connection, task["id"]) for scope in item["paths"] for path in requested)
+    if not all(covered(path) for path in requested):
+        return False
+    requested_index = ScopeIndex(requested)
+    return not any(requested_index.overlapping(scope)
+                   for item in paused(connection, task["id"]) for scope in item["paths"])
 
 
 def finish_requests(h, connection, task):
-    for row in connection.execute("SELECT * FROM claim_requests WHERE repo_id=? AND status IN ('pending','needs-review')", (task["repo_id"],)).fetchall():
-        owners = {item["task_id"] for item in json.loads(row["snapshot_json"])}
-        if task["id"] == row["requester"] or task["id"] in owners:
-            connection.execute("UPDATE claim_requests SET status='cancelled' WHERE id=?", (row["id"],))
-            request_notice(h, connection, task, request_record(h, connection, row["id"]), "request-cancelled")
+    rows = connection.execute("""SELECT request.* FROM
+        (SELECT request_id FROM request_participants WHERE task_id=?
+         UNION SELECT id AS request_id FROM claim_requests WHERE requester=?) participant
+        CROSS JOIN claim_requests request ON request.id=participant.request_id
+        WHERE request.repo_id=? AND request.status IN ('pending','needs-review')""",
+        (task["id"], task["id"], task["repo_id"]))
+    for row in rows.fetchall():
+        connection.execute("UPDATE claim_requests SET status='cancelled' WHERE id=?", (row["id"],))
+        request_notice(h, connection, task, request_record(h, connection, row["id"]), "request-cancelled")
     connection.execute("DELETE FROM work_sessions WHERE task_id=?", (task["id"],))
 
 

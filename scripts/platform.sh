@@ -29,7 +29,7 @@ agency_bootstrap_homebrew() (
   installer="$scratch/install.sh"
 
   printf 'Installing Homebrew with its verified official installer. This may install Apple Command Line Tools and request sudo.\n'
-  if ! curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+  if ! curl --fail --location --silent --show-error --connect-timeout 30 --max-time 300 --max-filesize 134217728 --proto '=https' --proto-redir '=https' \
     "https://raw.githubusercontent.com/Homebrew/install/$revision/install.sh" --output "$installer"; then
     printf 'Could not download the Homebrew installer; setup stopped.\n' >&2
     exit 1

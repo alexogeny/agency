@@ -41,14 +41,20 @@ def _clip(text, width):
 
 
 def _middle(text, width):
-    if sum(_width(character) for character in text) <= width:
+    used = 0
+    for character in text:
+        used += _width(character)
+        if used > width:
+            break
+    else:
         return text
     if width < 5:
         return _clip(text, width)
     left = (width - 3) // 2
     right = width - 3 - left
     prefix = _clip(text, left).rstrip('~')
-    suffix = _clip(text[::-1], right).rstrip('~')[::-1]
+    # Each character occupies at least one column, so only this suffix can fit.
+    suffix = _clip(text[-right:][::-1], right).rstrip('~')[::-1]
     return prefix + '...' + suffix
 
 

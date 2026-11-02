@@ -69,7 +69,10 @@ def fstab_plan(content, uuid, mount, fstype):
 
 
 def mount_info(path, include_automount=False):
-    result = subprocess.run(['findmnt', '--json', '--nocanonicalize', '--direction', 'backward', '--first-only', '--mountpoint', str(path), '--output', 'TARGET,UUID,FSTYPE,OPTIONS'], text=True, capture_output=True)
+    try:
+        result = subprocess.run(['findmnt', '--json', '--nocanonicalize', '--direction', 'backward', '--first-only', '--mountpoint', str(path), '--output', 'TARGET,UUID,FSTYPE,OPTIONS'], text=True, capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError('Mount inspection timed out; retry when findmnt is responsive') from error
     if result.returncode == 1:
         return None
     if result.returncode:
@@ -327,22 +330,39 @@ def active_users(paths, all_users=False):
     exact = {str(path).rstrip('/') for path in paths}
     blockers = []
     own = os.getpid()
+
+    def matches(target):
+        return process_helpers['normalize_path'](target) in exact or target.startswith(roots)
+
     for process in Path('/proc').iterdir():
         if not process.name.isdigit() or int(process.name) == own:
             continue
         try:
             if not all_users and process.stat().st_uid != os.getuid():
                 continue
-            name = process_helpers['read_process_file'](process / 'comm', text=True).strip()
-            targets = []
-            for entry in [process / 'cwd', *list((process / 'fd').iterdir())]:
-                try:
-                    targets.append(process_helpers['read_link'](entry))
-                except FileNotFoundError:
-                    continue
-            targets.extend(process_helpers['mapped_paths'](
-                process_helpers['read_process_file'](process / 'maps', text=True)))
-            if any(process_helpers['normalize_path'](target) in exact or target.startswith(roots) for target in targets):
+            name = process_helpers['read_process_file'](process / 'comm', limit=65536, text=True).strip()
+            # A vanished maps file means this process exited, even when its
+            # earlier cwd observation matched a migration root.
+            try:
+                process_helpers['read_process_file'](process / 'maps', limit=0, text=True)
+            except process_helpers['ProcessReadLimit']:
+                pass
+            blocked = False
+            try:
+                blocked = matches(process_helpers['read_link'](process / 'cwd'))
+            except FileNotFoundError:
+                pass
+            if not blocked:
+                for entry in (process / 'fd').iterdir():
+                    try:
+                        if matches(process_helpers['read_link'](entry)):
+                            blocked = True
+                            break
+                    except FileNotFoundError:
+                        continue
+            if not blocked:
+                blocked = any(matches(target) for target in process_helpers['mapped_process_paths'](process / 'maps'))
+            if blocked:
                 blockers.append(f'{process.name} {name}')
         except (FileNotFoundError, ProcessLookupError):
             continue

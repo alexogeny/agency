@@ -65,8 +65,10 @@ def validate_manifest(manifest):
         # Bind resume records to the resource path while allowing signed query refreshes.
         items.append({**item, 'resource': site + parsed.path})
         ids.add(item['id']); paths.add(item['path'])
-    for path in paths:
-        if any('/'.join(path.split('/')[:i]) in paths for i in range(1, len(path.split('/')))):
+    # Component order places a destination just before its first descendant.
+    destinations = sorted(tuple(path.split('/')) for path in paths)
+    for parent, child in zip(destinations, destinations[1:]):
+        if len(parent) < len(child) and child[:len(parent)] == parent:
             raise BrowserError('A manifest destination is also another destination\'s parent.')
     return items
 
