@@ -9,8 +9,10 @@ import subprocess
 import sys
 import tempfile
 
-from agency_streams import load_json
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agency_streams import load_json
 
 
 LAPTOP_CHASSIS_TYPES = {8, 9, 10, 11, 14, 30, 31, 32}
